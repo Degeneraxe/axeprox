@@ -1,0 +1,160 @@
+# ==============================================================================
+# ArbSense Master Configuration
+# AI-Powered Cross-Exchange Arbitrage Intelligence Engine
+# ==============================================================================
+
+system:
+  project_name: "ArbSense"
+  version: "1.0.0"
+  env: "development"
+  log_level: "INFO"
+  random_seed: 42
+
+# Time Synchronization & Stale Book Safeguards (Amendments 2 & 3)
+time_sync:
+  ntp_server: "pool.ntp.org"
+  ntp_timeout_sec: 3.0
+  fallback_rest_url: "https://api.binance.com/api/v3/time"
+  max_quote_age_ms: 1500           # Stale quote threshold: quotes older than 1.5s are discarded
+  heartbeat_interval_sec: 15.0
+  reconnect_backoff:
+    initial_delay_sec: 1.0
+    max_delay_sec: 30.0
+    multiplier: 2.0
+    jitter: true
+
+# Target Assets & Quote Basis Handling (Amendment 4)
+markets:
+  primary_quote: "USDT"            # Normalized quote basis across all exchanges
+  supported_pairs:
+    - "BTC/USDT"
+    - "ETH/USDT"
+    - "XRP/USDT"
+    - "ADA/USDT"
+    - "SOL/USDT"
+    - "DOGE/USDT"
+  exchange_symbols:
+    binance:
+      "BTC/USDT": "btcusdt"
+      "ETH/USDT": "ethusdt"
+      "XRP/USDT": "xrpusdt"
+      "ADA/USDT": "adausdt"
+      "SOL/USDT": "solusdt"
+      "DOGE/USDT": "dogeusdt"
+    coinbase:
+      "BTC/USDT": "BTC-USDT"
+      "ETH/USDT": "ETH-USDT"
+      "XRP/USDT": "XRP-USD"
+      "ADA/USDT": "ADA-USDT"
+      "SOL/USDT": "SOL-USDT"
+      "DOGE/USDT": "DOGE-USDT"
+      "BTC/USD": "BTC-USD"
+      "ETH/USD": "ETH-USD"
+      "XRP/USD": "XRP-USD"
+      "ADA/USD": "ADA-USD"
+      "SOL/USD": "SOL-USD"
+      "DOGE/USD": "DOGE-USD"
+    kraken:
+      "BTC/USDT": "XBT/USDT"
+      "ETH/USDT": "ETH/USDT"
+      "XRP/USDT": "XRP/USDT"
+      "ADA/USDT": "ADA/USDT"
+      "SOL/USDT": "SOL/USDT"
+      "DOGE/USDT": "DOGE/USDT"
+      "BTC/USD": "XBT/USD"
+      "ETH/USD": "ETH/USD"
+      "XRP/USD": "XRP/USD"
+      "ADA/USD": "ADA/USD"
+      "SOL/USD": "SOL/USD"
+  basis_tracking:
+    enabled: true
+    usdt_usd_peg_threshold_bps: 10.0 # Alert if USDT/USD deviates by > 10 bps (0.10%)
+
+# Fee Schedules by Scenario (Amendment 1)
+# Gross threshold triggers detection; net viability is evaluated per fee tier scenario
+detection:
+  gross_spread_threshold_bps: 1.0  # Detect at low gross threshold (1 basis point = 0.01%)
+  min_order_book_depth_levels: 10   # Top 10 levels maintained
+  depth_snapshot_throttle_ms: 100   # Throttle full L2 snapshots (Amendment 6)
+
+fee_scenarios:
+  active_scenario: "retail"        # Options: retail, vip1, vip3, zero_maker
+  scenarios:
+    retail:
+      binance:
+        maker_bps: 10.0            # 0.10%
+        taker_bps: 10.0            # 0.10%
+      coinbase:
+        maker_bps: 40.0            # 0.40%
+        taker_bps: 60.0            # 0.60%
+      kraken:
+        maker_bps: 25.0            # 0.25%
+        taker_bps: 40.0            # 0.40%
+    vip1:
+      binance:
+        maker_bps: 8.0
+        taker_bps: 9.0
+      coinbase:
+        maker_bps: 20.0
+        taker_bps: 40.0
+      kraken:
+        maker_bps: 14.0
+        taker_bps: 24.0
+    vip3:
+      binance:
+        maker_bps: 4.0
+        taker_bps: 6.0
+      coinbase:
+        maker_bps: 10.0
+        taker_bps: 20.0
+      kraken:
+        maker_bps: 8.0
+        taker_bps: 16.0
+    zero_maker:
+      binance:
+        maker_bps: 0.0
+        taker_bps: 7.5
+      coinbase:
+        maker_bps: 0.0
+        taker_bps: 25.0
+      kraken:
+        maker_bps: 0.0
+        taker_bps: 20.0
+
+# Dynamic Volatility Hurdle
+dynamic_hurdle:
+  rolling_window_ticks: 50
+  volatility_multiplier_k: 1.5      # k * sigma added to hurdle
+
+# Event Tracking & Machine Learning (Amendments 5 & 6)
+labeling:
+  execution_latency_assumption_ms: 85.0 # Measured empirical round-trip threshold for viability
+  right_censored_max_window_ms: 30000   # Max tracking duration before flagging right-censored
+  use_log_duration: true                # Target = log(1 + duration_ms)
+
+dataset:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  purge_gap_events: 5                   # Purge gap between train, val, and test splits (Amendment 6)
+  sequence_length: 20                   # LSTM lookback window
+
+# Execution Simulator (Amendment 7)
+simulation:
+  initial_capital_usdt: 10000.0
+  trade_sizes:
+    "BTC/USDT": 0.05                    # 0.05 BTC (~$3,400)
+    "ETH/USDT": 0.50                    # 0.50 ETH (~$1,300)
+    "SOL/USDT": 10.0                    # 10 SOL (~$1,000)
+    "XRP/USDT": 1000.0                  # 1,000 XRP (~$1,300)
+    "ADA/USDT": 5000.0                  # 5,000 ADA (~$1,025)
+    "DOGE/USDT": 5000.0                 # 5,000 DOGE (~$750)
+  pre_funded_balance_assumption: true   # Assumes inventory pre-allocated across venues
+  depth_walking_slippage: true          # VWAP calculated from real order book levels (no double-count)
+
+# Storage
+storage:
+  backend: "auto"                       # "timescaledb", "sqlite", or "auto" (tries TimescaleDB, falls back)
+  sqlite_path: "data/arbsense.db"
+  batch_size: 50
+  flush_interval_ms: 500

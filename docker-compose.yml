@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: arbsense-timescaledb
+    restart: always
+    environment:
+      POSTGRES_USER: ${TIMESCALEDB_USER:-postgres}
+      POSTGRES_PASSWORD: ${TIMESCALEDB_PASSWORD:-postgres}
+      POSTGRES_DB: ${TIMESCALEDB_NAME:-arbsense}
+    ports:
+      - "${TIMESCALEDB_PORT:-5432}:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./data/storage/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d arbsense"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  timescaledb_data:
+    driver: local

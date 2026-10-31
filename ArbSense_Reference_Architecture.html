@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ArbSense: Layer-by-Layer Reference Architecture</title>
+<style>
+    @page {
+        size: A4;
+        margin: 2.2cm 2.0cm;
+    }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        color: #1a1a1a;
+        background-color: #ffffff;
+        line-height: 1.55;
+        font-size: 10.5pt;
+        max-width: 850px;
+        margin: 0 auto;
+        padding: 40px 30px;
+    }
+    
+    /* Header & Running Title */
+    .doc-header {
+        font-size: 8pt;
+        color: #888888;
+        border-bottom: 1px solid #e5e5e5;
+        padding-bottom: 6px;
+        margin-bottom: 25px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    
+    /* Headings */
+    h1 {
+        font-family: "Georgia", serif;
+        font-size: 26pt;
+        font-weight: 500;
+        color: #0f172a;
+        margin-top: 0;
+        margin-bottom: 8px;
+        line-height: 1.2;
+    }
+    .doc-subtitle {
+        font-size: 11pt;
+        color: #64748b;
+        margin-bottom: 30px;
+    }
+    h2 {
+        font-size: 14pt;
+        font-weight: 600;
+        color: #0f172a;
+        border-bottom: 1px solid #e2e8f0;
+        padding-bottom: 6px;
+        margin-top: 36px;
+        margin-bottom: 14px;
+    }
+    h3 {
+        font-size: 11.5pt;
+        font-weight: 600;
+        color: #1e293b;
+        margin-top: 22px;
+        margin-bottom: 8px;
+    }
+    
+    /* Paragraphs and Lists */
+    p {
+        margin-top: 0;
+        margin-bottom: 12px;
+        text-align: justify;
+    }
+    ul, ol {
+        margin-top: 0;
+        margin-bottom: 14px;
+        padding-left: 20px;
+    }
+    li {
+        margin-bottom: 6px;
+    }
+    
+    /* Tables matching Reference Architecture PDF */
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 9.5pt;
+        margin: 16px 0 24px 0;
+    }
+    th {
+        background-color: #f8fafc;
+        color: #334155;
+        font-weight: 600;
+        text-align: left;
+        padding: 8px 10px;
+        border: 1px solid #cbd5e1;
+    }
+    td {
+        padding: 8px 10px;
+        border: 1px solid #cbd5e1;
+        vertical-align: top;
+    }
+    tr:nth-child(even) td {
+        background-color: #fafafa;
+    }
+    
+    /* Verdict Badges */
+    .badge-rec {
+        font-weight: 600;
+        color: #059669;
+    }
+    .badge-alt {
+        font-weight: 600;
+        color: #0284c7;
+    }
+    .badge-not {
+        font-weight: 600;
+        color: #dc2626;
+    }
+    
+    /* Architecture Diagram Box (Matching Page 3) */
+    .arch-container {
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        padding: 16px 20px;
+        margin: 20px 0 25px 0;
+        background-color: #ffffff;
+    }
+    .arch-layer {
+        display: flex;
+        align-items: stretch;
+        margin-bottom: 10px;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        background-color: #ffffff;
+        overflow: hidden;
+    }
+    .arch-layer-core {
+        border: 1.5px solid #2563eb;
+        background-color: #eff6ff;
+    }
+    .layer-label {
+        width: 140px;
+        padding: 10px 12px;
+        font-weight: 600;
+        font-size: 8.5pt;
+        background-color: #f1f5f9;
+        border-right: 1px solid #cbd5e1;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+    }
+    .layer-label-core {
+        background-color: #dbeafe;
+        color: #1e40af;
+        border-right: 1px solid #93c5fd;
+    }
+    .layer-components {
+        flex: 1;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 8px 12px;
+        align-items: center;
+    }
+    .comp-pill {
+        border: 1px solid #cbd5e1;
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 8.5pt;
+        background-color: #ffffff;
+    }
+    .comp-pill-core {
+        border-color: #93c5fd;
+        background-color: #ffffff;
+        font-weight: 500;
+    }
+    .arch-flow-arrow {
+        text-align: center;
+        font-size: 8pt;
+        color: #64748b;
+        margin: 2px 0;
+    }
+    
+    /* Code / Monospace */
+    code, pre {
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 8.5pt;
+    }
+    pre {
+        background-color: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        padding: 12px;
+        overflow-x: auto;
+        margin: 14px 0;
+    }
+    
+    /* Footer */
+    .doc-footer {
+        font-size: 8pt;
+        color: #94a3b8;
+        border-top: 1px solid #e5e5e5;
+        padding-top: 8px;
+        margin-top: 40px;
+        display: flex;
+        justify-content: space-between;
+    }
+</style>
+</head>
+<body>
+
+<div class="doc-header">
+    M V S R Engineering College · Department of Computer Science & Engineering · Major Project Review-2
+</div>
+
+<h1>ArbSense: Cross-Exchange Arbitrage & Duration Prediction</h1>
+<div class="doc-subtitle">
+    Layer-by-layer reference architecture · System Design Document · October 2026<br>
+    <strong>Team:</strong> Akshara (2451-23-733-050), Keerthana (2451-23-733-056), Kusmitha (2451-23-733-060) | <strong>Guide:</strong> Mrs. P. Subhashini
+</div>
+
+<h2>1. Purpose and scope</h2>
+<p>
+    This document defines the <strong>ArbSense</strong> architecture as five functional layers (public market feeds, order book normalization and dual storage, spread detection and dynamic cost hurdles, deep learning duration forecasting, and execution simulation/paper trading) plus supporting cross-cutting planes. Every element traces to concrete engineering specifications and acceptance tests.
+</p>
+<p>
+    <strong>Goal.</strong> To construct an autonomous, high-throughput market microstructure engine that ingests concurrent Level 2 order books from premier cryptocurrency exchanges (Binance, Coinbase, Kraken); synchronizes arrival clocks via SNTP (RFC 4330) to eliminate host skew; predicts the temporal persistence duration and net viability of price dislocations using a PyTorch Multi-Head LSTM; and executes paper trades with depth-walking VWAP slippage while enforcing strict fee-hurdle gatekeepers.
+</p>
+<p>
+    <strong>Scope.</strong> Cryptocurrency spot markets (<code>BTC/USDT</code>, <code>ETH/USDT</code>, <code>ADA/USDT</code>, <code>XRP/USDT</code>, <code>SOL/USDT</code>). Mode: Paper trading and simulation only; no live money, zero private API keys.
+</p>
+
+<h2>2. Architecture at a glance</h2>
+<div class="arch-container">
+    <div style="font-size: 9pt; font-weight: 600; color: #475569; margin-bottom: 12px; text-align: center;">
+        The order book is the ground truth; everything downstream is an event projection
+    </div>
+    
+    <!-- L1 -->
+    <div class="arch-layer">
+        <div class="layer-label">
+            L1 · MARKET FEEDS<br>
+            <span style="font-weight: 400; font-size: 7.5pt; color: #64748b;">Public WebSockets</span>
+        </div>
+        <div class="layer-components">
+            <span class="comp-pill">Binance (depth10@100ms, bookTicker)</span>
+            <span class="comp-pill">Coinbase (level2_batch, ticker)</span>
+            <span class="comp-pill">Kraken (book-10 L2 diffs)</span>
+            <span class="comp-pill">RFC 4330 SNTP Skew Sync</span>
+        </div>
+    </div>
+    <div class="arch-flow-arrow">▼ raw JSON diffs + dual timestamps (exchange_ts, local_ts)</div>
+
+    <!-- L2 -->
+    <div class="arch-layer">
+        <div class="layer-label">
+            L2 · NORMALIZER & STORAGE<br>
+            <span style="font-weight: 400; font-size: 7.5pt; color: #64748b;">State & Persistence</span>
+        </div>
+        <div class="layer-components">
+            <span class="comp-pill">OrderBookNormalizer</span>
+            <span class="comp-pill">Stale Filter (&lt;1500ms)</span>
+            <span class="comp-pill">OBI 5 / 10 Calculator</span>
+            <span class="comp-pill">SQLite WAL Engine (3.8M Ticks)</span>
+            <span class="comp-pill">BatchWriter Worker</span>
+        </div>
+    </div>
+    <div class="arch-flow-arrow">▼ synchronized L2 order book snapshots</div>
+
+    <!-- L3 CORE -->
+    <div class="arch-layer arch-layer-core">
+        <div class="layer-label layer-label-core">
+            L3 · DETECTION & COST<br>
+            <span style="font-weight: 400; font-size: 7.5pt; color: #1d4ed8;">Statistical Core</span>
+        </div>
+        <div class="layer-components">
+            <span class="comp-pill comp-pill-core">CrossExchangeDetector</span>
+            <span class="comp-pill comp-pill-core">Dynamic Hurdle: H = Fees + k·σ</span>
+            <span class="comp-pill comp-pill-core">Multi-Tier Schedules (Retail, VIP1, VIP3, Zero-Maker)</span>
+            <span class="comp-pill comp-pill-core">Lifecycle Tracker (Open → Peak → Close)</span>
+        </div>
+    </div>
+    <div class="arch-flow-arrow">▼ candidate spread event sequences (20 timesteps)</div>
+
+    <!-- L4 -->
+    <div class="arch-layer">
+        <div class="layer-label">
+            L4 · PREDICTION LAYER<br>
+            <span style="font-weight: 400; font-size: 7.5pt; color: #64748b;">Deep Learning</span>
+        </div>
+        <div class="layer-components">
+            <span class="comp-pill">14 Microstructure Signals</span>
+            <span class="comp-pill">PyTorch Multi-Head BiLSTM</span>
+            <span class="comp-pill">Viability Head P(Y=1)</span>
+            <span class="comp-pill">Duration Head ln(1+ms)</span>
+            <span class="comp-pill">Purged Walk-Forward Splits</span>
+        </div>
+    </div>
+    <div class="arch-flow-arrow">▼ inferred viability probability & predicted persistence duration</div>
+
+    <!-- L5 -->
+    <div class="arch-layer">
+        <div class="layer-label">
+            L5 · VALIDATION & GUI<br>
+            <span style="font-weight: 400; font-size: 7.5pt; color: #64748b;">Execution & Telemetry</span>
+        </div>
+        <div class="layer-components">
+            <span class="comp-pill">Strict Gatekeeper (Gross &gt; Fees)</span>
+            <span class="comp-pill">Depth-Walking VWAP Simulator</span>
+            <span class="comp-pill">Empirical Latency Injector</span>
+            <span class="comp-pill">Streamlit Dashboard (:8501)</span>
+            <span class="comp-pill">Paper Trading Ledger (67 Trades, +$60.06)</span>
+        </div>
+    </div>
+    
+    <!-- Cross cutting -->
+    <div style="margin-top: 10px; padding: 6px 12px; background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 4px; font-size: 8pt; color: #475569;">
+        <strong>Cross-cutting planes:</strong> RFC 4330 Atomic Clock Sync · Capital Preservation Gatekeeper · Zero Lookahead Purge Gaps · Real-Time Telemetry & Observability
+    </div>
+</div>
+
+<h2>3. Layer 1: Market Feeds & Ingestion</h2>
+<p>
+    Layer 1 maintains asynchronous WebSocket connections across 3 global crypto venues. Because each venue uses proprietary schemas, Layer 1 maps them into a uniform internal format:
+</p>
+<table>
+    <thead>
+        <tr>
+            <th>Venue</th>
+            <th>Stream Channels</th>
+            <th>Timestamp Extraction</th>
+            <th>Resilience Mechanics</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Binance</strong></td>
+            <td><code>&lt;sym&gt;@depth10@100ms</code><br><code>&lt;sym&gt;@bookTicker</code></td>
+            <td>Event time <code>E</code> (server ms) and book ticker event time <code>T</code></td>
+            <td>Auto-reconnect with exponential backoff; heartbeat ping frames.</td>
+        </tr>
+        <tr>
+            <td><strong>Coinbase</strong></td>
+            <td><code>level2_batch</code><br><code>ticker</code></td>
+            <td>ISO 8601 server timestamp parsed to epoch milliseconds</td>
+            <td>In-memory order book cache maintaining bids/asks across diffs.</td>
+        </tr>
+        <tr>
+            <td><strong>Kraken</strong></td>
+            <td><code>book</code> (depth 10)</td>
+            <td>Sub-millisecond float timestamps on order book entry tuples</td>
+            <td>Handles snapshot <code>as</code>/<code>bs</code> and incremental updates <code>a</code>/<code>b</code>.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2>4. Layer 2: Storage Selection (Decision Record)</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Option</th>
+            <th>Strengths</th>
+            <th>Weaknesses</th>
+            <th>Verdict</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>SQLite WAL Engine</strong> (Primary)</td>
+            <td>Zero-dependency; embedded local file; single-digit ms writes; 64MB cache; perfectly suited for local paper trading and academic defense demo.</td>
+            <td>Not distributed across multiple network servers without shared network filesystem.</td>
+            <td><span class="badge-rec">Recommended (Deployed)</span></td>
+        </tr>
+        <tr>
+            <td><strong>TimescaleDB / PostgreSQL</strong></td>
+            <td>Native SQL hypertables; automated chunk partitioning; multi-node distributed scaling.</td>
+            <td>Requires running external Docker container / daemon process.</td>
+            <td><span class="badge-alt">Alternative (Production)</span></td>
+        </tr>
+        <tr>
+            <td><strong>MongoDB / InfluxDB</strong></td>
+            <td>Schemaless document store; fast simple appends.</td>
+            <td>Weak relational joins between spread events and executed trades; poor SQL tooling.</td>
+            <td><span class="badge-not">Not recommended</span></td>
+        </tr>
+    </tbody>
+</table>
+
+<h2>5. Latency Budget & End-to-End Pipeline Timing</h2>
+<p>
+    In high-frequency cryptocurrency arbitrage, executing a trade requires beating the physical round-trip transit latency between exchanges. The empirical budget is detailed below:
+</p>
+<table>
+    <thead>
+        <tr>
+            <th>Processing Step</th>
+            <th>Typical Latency</th>
+            <th>Budget Limit</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>WebSocket packet transit (Exchange matching engine to client)</td>
+            <td>15–40 ms</td>
+            <td>50 ms</td>
+        </tr>
+        <tr>
+            <td>RFC 4330 SNTP clock offset correction & JSON parsing</td>
+            <td>0.5–1.0 ms</td>
+            <td>2 ms</td>
+        </tr>
+        <tr>
+            <td>Order book level sorting & Order Book Imbalance (OBI) calculation</td>
+            <td>0.5–1.0 ms</td>
+            <td>2 ms</td>
+        </tr>
+        <tr>
+            <td>Cross-exchange spread scan & dynamic hurdle check</td>
+            <td>0.2–0.5 ms</td>
+            <td>1 ms</td>
+        </tr>
+        <tr>
+            <td>14-feature vector extraction across 20 rolling timesteps</td>
+            <td>1.0–2.0 ms</td>
+            <td>5 ms</td>
+        </tr>
+        <tr>
+            <td>PyTorch Multi-Head LSTM forward inference pass</td>
+            <td>2.0–4.0 ms</td>
+            <td>10 ms</td>
+        </tr>
+        <tr>
+            <td>Profitability gatekeeper check & Depth-Walking VWAP calculation</td>
+            <td>0.5–1.5 ms</td>
+            <td>5 ms</td>
+        </tr>
+        <tr>
+            <td>SQLite WAL transaction insert & batch flush</td>
+            <td>0.5–1.0 ms</td>
+            <td>5 ms</td>
+        </tr>
+        <tr>
+            <td><strong>Total End-to-End Pipeline Latency</strong></td>
+            <td><strong>20.2–51.0 ms</strong></td>
+            <td><strong>80.0 ms</strong></td>
+        </tr>
+    </tbody>
+</table>
+
+<h2>6. Requirements Traceability Matrix</h2>
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Requirement Description</th>
+            <th>Layer</th>
+            <th>Implementation Mechanism</th>
+            <th>Empirical Acceptance Test</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>1</strong></td>
+            <td>Multi-exchange real-time ingestion</td>
+            <td>L1</td>
+            <td>Binance, Coinbase, Kraken native WebSocket feeds</td>
+            <td>Over 3.8+ Million real ticks accumulated in database.</td>
+        </tr>
+        <tr>
+            <td><strong>2</strong></td>
+            <td>RFC 4330 SNTP clock sync</td>
+            <td>L1</td>
+            <td>SNTP UDP queries to pool.ntp.org + REST fallback</td>
+            <td>Measured and calibrated +13.28s host machine clock skew.</td>
+        </tr>
+        <tr>
+            <td><strong>3</strong></td>
+            <td>Stale quote filtering</td>
+            <td>L1, L2</td>
+            <td>Quote age threshold (max_quote_age_ms = 1500)</td>
+            <td>Quotes older than 1.5s discarded before detection.</td>
+        </tr>
+        <tr>
+            <td><strong>4</strong></td>
+            <td>Dynamic volatility cost hurdle</td>
+            <td>L3</td>
+            <td>H = Total Fees + k * sigma_rolling</td>
+            <td>Hurdle expands during volatility spikes; verified in test suite.</td>
+        </tr>
+        <tr>
+            <td><strong>5</strong></td>
+            <td>Multi-tiered fee schedules</td>
+            <td>L3</td>
+            <td>Retail, VIP 1, VIP 3, Zero-Maker schedules</td>
+            <td>Fee hurdles update live in Tab 1 Arbitrage Matrix.</td>
+        </tr>
+        <tr>
+            <td><strong>6</strong></td>
+            <td>Depth-walking VWAP simulation</td>
+            <td>L2, L5</td>
+            <td>Order book ladder volume accumulation</td>
+            <td>Exact VWAP slippage computed; zero double counting.</td>
+        </tr>
+        <tr>
+            <td><strong>7</strong></td>
+            <td>PyTorch LSTM duration prediction</td>
+            <td>L4</td>
+            <td>Multi-Head BiLSTM on 14 microstructure features</td>
+            <td>F1 = 0.812 (+25.3%), MAE = 142.3 ms (-63.5% error).</td>
+        </tr>
+        <tr>
+            <td><strong>8</strong></td>
+            <td>Purged walk-forward validation</td>
+            <td>L4</td>
+            <td>70/15/15 chronological split with 5-event purge gap</td>
+            <td>Zero future data leakage across train, val, and test folds.</td>
+        </tr>
+        <tr>
+            <td><strong>9</strong></td>
+            <td>Strict capital preservation gatekeeper</td>
+            <td>L5</td>
+            <td>Rejects trade if Gross Spread &lt;= Total Fees</td>
+            <td>Over 490,000 loss-making calm market trades blocked.</td>
+        </tr>
+        <tr>
+            <td><strong>10</strong></td>
+            <td>Paper trading execution ledger</td>
+            <td>L5</td>
+            <td>In-memory balance tracking + SQLite trade ledger</td>
+            <td>67 trades executed on ADA/USDT with +$60.06 USDT net P&L.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2>7. Reference Technology Stack</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Subsystem</th>
+            <th>Primary Technology</th>
+            <th>Alternative Technology</th>
+            <th>Selection Justification</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Core Engine</strong></td>
+            <td>Python 3.10+ AsyncIO</td>
+            <td>Go / Rust</td>
+            <td>Native asynchronous I/O, seamless PyTorch / NumPy ML integration.</td>
+        </tr>
+        <tr>
+            <td><strong>Deep Learning</strong></td>
+            <td>PyTorch 2.2</td>
+            <td>TensorFlow / Keras</td>
+            <td>Dynamic computational graph, lower inference latency for single tensors.</td>
+        </tr>
+        <tr>
+            <td><strong>Database Engine</strong></td>
+            <td>SQLite 3 (WAL Mode)</td>
+            <td>TimescaleDB / Redis</td>
+            <td>Zero operational overhead; 3.8M ticks stored with 64MB cache.</td>
+        </tr>
+        <tr>
+            <td><strong>Analytics UI</strong></td>
+            <td>Streamlit 1.32</td>
+            <td>FastAPI + React</td>
+            <td>Rapid interactive data rendering; instant auto-refresh with no dimming.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2>8. United Nations Sustainable Development Goals (SDG) Alignment</h2>
+<ul>
+    <li>
+        <strong>SDG 9: Industry, Innovation, and Infrastructure (Primary — Targets 9.1 &amp; 9.c):</strong> ArbSense builds resilient, open-source algorithmic infrastructure on standard consumer hardware. It eliminates the barrier to entry for financial microstructure research, democratizing tools historically restricted to billion-dollar proprietary HFT firms.
+    </li>
+    <li>
+        <strong>SDG 8: Decent Work and Economic Growth (Secondary — Target 8.10):</strong> Cross-exchange arbitrage enforces the Law of One Price across fragmented international cryptocurrency venues, mitigating predatory cross-border price disparities and enhancing global market transparency.
+    </li>
+</ul>
+
+<div class="doc-footer">
+    <span>ArbSense: Layer-by-Layer Reference Architecture</span>
+    <span>M V S R Engineering College · CSE Major Project Review-2</span>
+    <span>Page 1 of 1</span>
+</div>
+
+</body>
+</html>

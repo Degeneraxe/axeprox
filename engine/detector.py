@@ -1,0 +1,127 @@
+"""Cross-exchange spread detection and anomaly evaluation engine.
+
+Implements Amendments 1, 2, and 4:
+- Directional spread matrix computation across all exchange pairs (Binance, Coinbase, Kraken)
+- Enforces strict stale quote filtering on both legs
+- Explicit quote currency basis handling
+- Evaluates low gross spread detection and calculates net viability per fee tier
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+from config.settings import AppConfig
+from data.normalizer import OrderBookNormalizer, OrderBookSnapshot
+from engine.cost_model import CostModel
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SpreadCandidate:
+    """Represents a directional cross-exchange arbitrage spread."""
+    symbol: str
+    buy_exchange: str
+    sell_exchange: str
+    buy_ask: float
+    sell_bid: float
+    gross_spread_bps: float
+    net_spread_bps: float
+    total_hurdle_bps: float
+    fee_bps: float
+    vol_buffer_bps: float
+    is_gross_candidate: bool
+    is_net_profitable: bool
+    timestamp_ms: float
+    quote_age_buy_ms: float
+    quote_age_sell_ms: float
+
+
+class CrossExchangeDetector:
+    """Detects spatial arbitrage opportunities across synchronized order books."""
+
+    def __init__(
+        self,
+        normalizer: OrderBookNormalizer,
+        cost_model: Optional[CostModel] = None,
+        config: Optional[AppConfig] = None,
+    ):
+        self.normalizer = normalizer
+        self.config = config or AppConfig.load()
+        self.cost_model = cost_model or CostModel(self.config)
+        self.gross_threshold_bps = float(self.config.detection.gross_spread_threshold_bps)
+        self.exchanges = ["binance", "coinbase", "kraken"]
+
+    def scan_symbol(self, symbol: str, current_time_ms: float) -> List[SpreadCandidate]:
+        """Scans all directed exchange pairs for a symbol and returns detected spreads."""
+        candidates: List[SpreadCandidate] = []
+
+        # Retrieve snapshots for all venues
+        snaps: Dict[str, OrderBookSnapshot] = {}
+        for exch in self.exchanges:
+            s = self.normalizer.get_snapshot(exch, symbol, current_time_ms)
+            if not s:
+                # Fallback to USD quote if USDT is not directly present
+                s = self.normalizer.get_snapshot(exch, symbol.replace("USDT", "USD"), current_time_ms)
+            if s and not s.is_stale and s.best_bid and s.best_ask:
+                snaps[exch] = s
+                # Update volatility tracker with mid price
+                self.cost_model.update_price(symbol, s.mid_price)
+
+        # Iterate all directed pairs (A -> B: Buy on A, Sell on B)
+        for buy_exch in self.exchanges:
+            for sell_exch in self.exchanges:
+                if buy_exch == sell_exch:
+                    continue
+                if buy_exch not in snaps or sell_exch not in snaps:
+                    continue
+
+                snap_buy = snaps[buy_exch]
+                snap_sell = snaps[sell_exch]
+
+                # Stale quote check (Amendment 2)
+                if snap_buy.is_stale or snap_sell.is_stale:
+                    continue
+
+                p_buy_ask = snap_buy.best_ask.price
+                p_sell_bid = snap_sell.best_bid.price
+
+                if p_buy_ask <= 0:
+                    continue
+
+                # Gross Spread in basis points: (Bid_B - Ask_A) / Ask_A * 10,000
+                gross_spread_bps = ((p_sell_bid - p_buy_ask) / p_buy_ask) * 10000.0
+
+                # Compute dynamic cost hurdle and net spread (Amendment 1)
+                hurdle_bps, fee_bps, vol_buf_bps = self.cost_model.get_hurdle_bps(
+                    buy_exch, sell_exch, symbol
+                )
+                net_spread_bps = gross_spread_bps - fee_bps
+
+                is_gross = gross_spread_bps >= self.gross_threshold_bps
+                is_net = gross_spread_bps >= hurdle_bps
+
+                candidate = SpreadCandidate(
+                    symbol=symbol,
+                    buy_exchange=buy_exch,
+                    sell_exchange=sell_exch,
+                    buy_ask=p_buy_ask,
+                    sell_bid=p_sell_bid,
+                    gross_spread_bps=gross_spread_bps,
+                    net_spread_bps=net_spread_bps,
+                    total_hurdle_bps=hurdle_bps,
+                    fee_bps=fee_bps,
+                    vol_buffer_bps=vol_buf_bps,
+                    is_gross_candidate=is_gross,
+                    is_net_profitable=is_net,
+                    timestamp_ms=current_time_ms,
+                    quote_age_buy_ms=snap_buy.quote_age_ms,
+                    quote_age_sell_ms=snap_sell.quote_age_ms,
+                )
+
+                if is_gross:
+                    candidates.append(candidate)
+
+        return candidates
