@@ -200,23 +200,42 @@ class DatabaseManager:
         if self.backend_type == "sqlite" and self._sqlite_conn:
             rows = []
             for t in ticks:
-                rows.append((
-                    t.get("time", datetime.now(timezone.utc).isoformat()),
-                    t["exchange"],
-                    t["symbol"],
-                    t.get("quote_currency", "USDT"),
-                    float(t["best_bid"]),
-                    float(t["best_ask"]),
-                    float(t["mid_price"]),
-                    float(t["top_spread"]),
-                    float(t.get("imbalance", 0.0)),
-                    json.dumps(t.get("bid_depth", [])),
-                    json.dumps(t.get("ask_depth", [])),
-                    float(t.get("exchange_ts_ms", 0.0)),
-                    float(t.get("local_ts_ms", 0.0)),
-                    float(t.get("transit_latency_ms", 0.0)),
-                    1 if t.get("is_stale", False) else 0,
-                ))
+                if isinstance(t, dict):
+                    rows.append((
+                        t.get("time", datetime.now(timezone.utc).isoformat()),
+                        t["exchange"],
+                        t["symbol"],
+                        t.get("quote_currency", "USDT"),
+                        float(t["best_bid"]),
+                        float(t["best_ask"]),
+                        float(t["mid_price"]),
+                        float(t["top_spread"]),
+                        float(t.get("imbalance", 0.0)),
+                        json.dumps(t.get("bid_depth", [])),
+                        json.dumps(t.get("ask_depth", [])),
+                        float(t.get("exchange_ts_ms", 0.0)),
+                        float(t.get("local_ts_ms", 0.0)),
+                        float(t.get("transit_latency_ms", 0.0)),
+                        1 if t.get("is_stale", False) else 0,
+                    ))
+                else:
+                    rows.append((
+                        datetime.now(timezone.utc).isoformat(),
+                        t.exchange,
+                        t.symbol,
+                        t.quote_currency,
+                        float(t.best_bid.price if t.best_bid else 0.0),
+                        float(t.best_ask.price if t.best_ask else 0.0),
+                        float(t.mid_price),
+                        float(t.top_spread),
+                        float(t.compute_imbalance(5)),
+                        json.dumps([{"p": l.price, "a": l.amount} for l in t.bids[:10]]),
+                        json.dumps([{"p": l.price, "a": l.amount} for l in t.asks[:10]]),
+                        float(t.exchange_ts_ms),
+                        float(t.local_ts_ms),
+                        float(t.transit_latency_ms),
+                        1 if t.is_stale else 0,
+                    ))
 
             cur = self._sqlite_conn.cursor()
             cur.executemany("""
@@ -378,6 +397,21 @@ class DatabaseManager:
             cur = self._sqlite_conn.cursor()
             cur.execute("SELECT COUNT(*) FROM orderbook_ticks")
             return cur.fetchone()[0]
+        return 0
+
+    def get_cumulative_tick_count(self) -> int:
+        """Returns cumulative total ticks ingested since DB inception (survives rolling tick pruning)."""
+        if self._sqlite_conn:
+            cur = self._sqlite_conn.cursor()
+            cur.execute("SELECT COALESCE(MAX(id), 0) FROM orderbook_ticks")
+            max_id = cur.fetchone()[0] or 0
+            try:
+                cur.execute("SELECT seq FROM sqlite_sequence WHERE name = 'orderbook_ticks'")
+                row = cur.fetchone()
+                seq = row[0] if row else 0
+            except Exception:
+                seq = 0
+            return max(int(max_id), int(seq))
         return 0
 
     def get_empirical_latency_stats(self, exchange: Optional[str] = None) -> Dict[str, float]:

@@ -62,6 +62,7 @@ class BaseExchangeFeed(ABC):
         self._task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._last_msg_local_ts = 0.0
+        self.reconnect_count = 0
 
         # Transit latency metrics (ms)
         self.transit_latencies: List[float] = []
@@ -167,6 +168,7 @@ class BaseExchangeFeed(ABC):
             except (websockets.ConnectionClosed, asyncio.CancelledError, Exception) as e:
                 if not self._running:
                     break
+                self.reconnect_count += 1
                 self.state = ConnectionState.RECONNECTING
                 jitter = random.uniform(0.8, 1.2)
                 sleep_sec = min(backoff * jitter, self.max_backoff_sec)

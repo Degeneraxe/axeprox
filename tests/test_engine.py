@@ -49,6 +49,12 @@ def test_spread_tracker_lifecycle_and_labeling():
     tracker = SpreadTracker()
     now_ms = 5000.0
 
+    # Populate ring buffers with required >= 20 ticks so tracker can open events
+    for i in range(25):
+        t = 1000.0 + i * 100.0
+        tracker.record_tick(OrderBookSnapshot("binance", "BTC/USDT", "USDT", t, t, 10.0, [OrderBookLevel(81490.0, 1.0)], [OrderBookLevel(81500.0, 1.0)]))
+        tracker.record_tick(OrderBookSnapshot("kraken", "BTC/USDT", "USDT", t, t, 10.0, [OrderBookLevel(81560.0, 1.0)], [OrderBookLevel(81570.0, 1.0)]))
+
     from engine.detector import SpreadCandidate
     cand = SpreadCandidate(
         symbol="BTC/USDT",
@@ -252,6 +258,154 @@ def test_live_and_training_feature_vectors_equal():
 
     # Live feature vector equals training feature vector for the same ticks
     np.testing.assert_allclose(np.array(live_win), np.array(train_win), rtol=1e-5, atol=1e-5)
+
+
+def test_no_event_persisted_without_complete_window(tmp_path):
+    """Verifies that no event is persisted without a complete 20-step feature window (Task 2 & 5)."""
+    import json
+    from data.normalizer import OrderBookNormalizer
+    from data.storage.db_manager import DatabaseManager
+    from engine.detector import SpreadCandidate
+    from engine.tracker import SpreadTracker
+
+    db_file = tmp_path / "test_window.db"
+    db = DatabaseManager(sqlite_path=str(db_file), migrations_dir="data/storage/migrations")
+    db.initialize()
+
+    norm = OrderBookNormalizer()
+    tracker = SpreadTracker(db_manager=db, normalizer=norm)
+
+    candidate = SpreadCandidate(
+        symbol="BTC/USDT",
+        buy_exchange="binance",
+        sell_exchange="kraken",
+        buy_ask=81500.0,
+        sell_bid=81600.0,
+        gross_spread_bps=12.27,
+        net_spread_bps=5.0,
+        total_hurdle_bps=7.27,
+        fee_bps=7.0,
+        vol_buffer_bps=0.27,
+        is_gross_candidate=True,
+        is_net_profitable=True,
+        timestamp_ms=1000.0,
+        quote_age_buy_ms=10.0,
+        quote_age_sell_ms=10.0,
+    )
+
+    # 1. Under-populated buffer: only 5 ticks (less than seq_len=20)
+    for i in range(5):
+        norm.update_book("binance", "btcusdt", [(81490.0, 1.0)], [(81500.0, 1.0)], 1000.0 + i, 1000.0 + i)
+        norm.update_book("kraken", "XBT/USDT", [(81600.0, 1.0)], [(81610.0, 1.0)], 1000.0 + i, 1000.0 + i)
+
+    res = tracker.process_candidate(candidate)
+    assert res is None  # Must NOT open event
+    cur = db._sqlite_conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM spread_events")
+    assert cur.fetchone()[0] == 0  # Nothing persisted
+
+    # 2. Add 20 more ticks so ring buffers have >= 20 ticks
+    for i in range(5, 25):
+        t = 1000.0 + i * 10.0
+        norm.update_book("binance", "btcusdt", [(81490.0, 1.0)], [(81500.0, 1.0)], t, t)
+        norm.update_book("kraken", "XBT/USDT", [(81600.0, 1.0)], [(81610.0, 1.0)], t, t)
+
+    candidate.timestamp_ms = 1250.0
+    res2 = tracker.process_candidate(candidate)
+    assert res2 is not None
+    assert len(res2.feature_window) == 20
+
+    cur.execute("SELECT event_id, feature_window_json FROM spread_events")
+    row = cur.fetchone()
+    assert row is not None
+    assert row[1] is not None
+    parsed_win = json.loads(row[1])
+    assert len(parsed_win) == 20
+    db.close()
+
+
+def test_minimum_depth_filter():
+    """Verifies that candidates with insufficient top-N depth liquidity are filtered out (Task 3 & 5)."""
+    from data.normalizer import OrderBookNormalizer
+    from engine.detector import CrossExchangeDetector
+
+    norm = OrderBookNormalizer()
+    detector = CrossExchangeDetector(normalizer=norm)
+
+    now_ms = 10000.0
+    # Configured trade size for BTC/USDT is 0.05 BTC (~$4,000 notional)
+    # 1. Thin book: Binance has only 0.001 BTC on ask (insufficient depth)
+    norm.update_book("binance", "btcusdt", [(81490.0, 1.0)], [(81500.0, 0.001)], now_ms - 10, now_ms)
+    norm.update_book("kraken", "XBT/USDT", [(81600.0, 1.0)], [(81610.0, 1.0)], now_ms - 10, now_ms)
+
+    candidates = detector.scan_symbol("BTC/USDT", now_ms)
+    # The spread 81600 vs 81500 is ~12.27 bps gross, but depth is only 0.001 BTC -> must be filtered
+    assert len(candidates) == 0
+
+    # 2. Liquid book: Binance has 0.10 BTC on ask (exceeds 0.05 BTC requirement)
+    norm.update_book("binance", "btcusdt", [(81490.0, 1.0)], [(81500.0, 0.10)], now_ms - 5, now_ms)
+    candidates_liquid = detector.scan_symbol("BTC/USDT", now_ms)
+    assert len(candidates_liquid) == 1
+    assert candidates_liquid[0].buy_exchange == "binance"
+    assert candidates_liquid[0].sell_exchange == "kraken"
+
+
+def test_cumulative_tick_counter(tmp_path):
+    """Verifies that cumulative tick counter survives pruning and tracks total ingested ticks (Task 4 & 5)."""
+    from data.normalizer import OrderBookLevel, OrderBookSnapshot
+    from data.storage.db_manager import DatabaseManager
+
+    db_file = tmp_path / "test_cumul.db"
+    db = DatabaseManager(sqlite_path=str(db_file), migrations_dir="data/storage/migrations")
+    db.initialize()
+
+    # Ingest 10 ticks
+    ticks = []
+    for i in range(10):
+        snap = OrderBookSnapshot(
+            exchange="binance",
+            symbol="BTC/USDT",
+            quote_currency="USDT",
+            exchange_ts_ms=1000.0 + i,
+            local_ts_ms=1010.0 + i,
+            transit_latency_ms=10.0,
+            bids=[OrderBookLevel(81500.0, 1.0)],
+            asks=[OrderBookLevel(81510.0, 1.0)],
+        )
+        ticks.append(snap)
+    db.insert_ticks_batch(ticks)
+
+    assert db.get_tick_count() == 10
+    assert db.get_cumulative_tick_count() == 10
+
+    # Prune down to 3 ticks
+    pruned = db.prune_old_ticks(keep_latest_per_symbol=3)
+    assert pruned == 7
+    # Active buffer decreased to 3
+    assert db.get_tick_count() == 3
+    # Cumulative counter survives and remains 10
+    assert db.get_cumulative_tick_count() == 10
+
+    # Ingest 5 more ticks
+    more_ticks = []
+    for i in range(10, 15):
+        snap = OrderBookSnapshot(
+            exchange="binance",
+            symbol="BTC/USDT",
+            quote_currency="USDT",
+            exchange_ts_ms=1000.0 + i,
+            local_ts_ms=1010.0 + i,
+            transit_latency_ms=10.0,
+            bids=[OrderBookLevel(81500.0, 1.0)],
+            asks=[OrderBookLevel(81510.0, 1.0)],
+        )
+        more_ticks.append(snap)
+    db.insert_ticks_batch(more_ticks)
+
+    assert db.get_tick_count() == 8  # 3 retained + 5 new
+    assert db.get_cumulative_tick_count() == 15  # 15 cumulative
+    db.close()
+
 
 
 

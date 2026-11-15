@@ -151,15 +151,28 @@ def main():
     auto_refresh = st.sidebar.checkbox("Auto-Refresh (10s)", value=False, help="Automatically refreshes every 10s without screen dimming")
 
     # --------------------------------------------------------------------------
-    # Top KPI Metrics Bar
+    # Top KPI Metrics Bar (Task 4: Cumulative Counter & Spread Event Metrics)
     # --------------------------------------------------------------------------
-    ticks_count = db.get_tick_count()
+    cumul_ticks = db.get_cumulative_tick_count()
+    active_ticks = db.get_tick_count()
     cur = db._sqlite_conn.cursor()
 
-    cur.execute("SELECT COUNT(*), SUM(is_viable) FROM spread_events")
-    total_events, viable_events = cur.fetchone()
-    total_events = total_events or 0
-    viable_events = viable_events or 0
+    cur.execute("""
+        SELECT 
+            COUNT(*),
+            SUM(feature_window_json IS NOT NULL),
+            SUM(is_viable = 1),
+            SUM(is_right_censored = 1)
+        FROM spread_events
+    """)
+    row_ev = cur.fetchone()
+    total_events = row_ev[0] or 0
+    events_with_windows = row_ev[1] or 0
+    viable_events = row_ev[2] or 0
+    censored_events = row_ev[3] or 0
+
+    viable_fraction = (viable_events / total_events) if total_events > 0 else 0.0
+    censored_fraction = (censored_events / total_events) if total_events > 0 else 0.0
 
     cur.execute("SELECT COUNT(*), SUM(net_pnl) FROM simulated_trades WHERE status = 'FILLED'")
     total_trades, total_net_pnl = cur.fetchone()
@@ -170,11 +183,11 @@ def main():
     st.caption("Empirical Market Microstructure Spread Detection & PyTorch LSTM Duration Forecasting")
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Live Ticks Ingested", f"{ticks_count:,}")
-    col2.metric("Tracked Events", f"{total_events:,}")
-    col3.metric("Viable Opportunities", f"{viable_events:,}", delta=f"{(viable_events / max(1, total_events) * 100):.1f}% rate")
-    col4.metric("Simulated Trades", f"{total_trades:,}")
-    col5.metric("Cumulative Net P&L", f"${total_net_pnl:+.2f} USDT", delta=f"{total_net_pnl:+.2f}")
+    col1.metric("Cumulative Ticks Ingested", f"{cumul_ticks:,}", delta=f"{active_ticks:,} active buffer")
+    col2.metric("Total Spread Events", f"{total_events:,}")
+    col3.metric("Events with Windows", f"{events_with_windows:,}", delta=f"{(events_with_windows / max(1, total_events) * 100):.1f}% complete")
+    col4.metric("Viable Fraction", f"{viable_fraction:.1%}", delta=f"{viable_events:,} viable")
+    col5.metric("Censored Fraction", f"{censored_fraction:.1%}", delta=f"{censored_events:,} censored")
 
     # Tabs
     tab1, tab2, tab3, tab4 = st.tabs([

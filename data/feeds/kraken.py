@@ -30,7 +30,8 @@ class KrakenFeed(BaseExchangeFeed):
     ):
         target_symbols = symbols or [
             "XBT/USDT", "ETH/USDT", "XRP/USDT", "ADA/USDT", "SOL/USDT",
-            "XBT/USD", "ETH/USD", "XRP/USD", "ADA/USD", "SOL/USD"
+            "XBT/USD", "ETH/USD", "XRP/USD", "ADA/USD", "SOL/USD",
+            "USDT/USD"
         ]
         super().__init__(
             exchange_name="kraken",

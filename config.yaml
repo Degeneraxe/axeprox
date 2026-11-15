@@ -74,8 +74,10 @@ markets:
 # Gross threshold triggers detection; net viability is evaluated per fee tier scenario
 detection:
   gross_spread_threshold_bps: 1.0  # Detect at low gross threshold (1 basis point = 0.01%)
-  min_order_book_depth_levels: 10   # Top 10 levels maintained
+  min_order_book_depth_levels: 5   # Top N levels maintained
   depth_snapshot_throttle_ms: 100   # Throttle full L2 snapshots (Amendment 6)
+  min_depth_filter_enabled: true    # Top-N-levels notional must exceed configured trade size
+  min_depth_levels: 5               # Top N levels evaluated for liquidity filter
 
 fee_scenarios:
   active_scenario: "retail"        # Options: retail, vip1, vip3, zero_maker

@@ -82,6 +82,16 @@ class OrderBookSnapshot:
             return 0.0
         return (bid_vol - ask_vol) / total_vol
 
+    def compute_top_notional(self, side: str, depth: int = 5) -> float:
+        """Computes total depth notional (price * amount) across top k levels in quote units."""
+        levels = self.asks[:depth] if side.lower() == "buy" else self.bids[:depth]
+        return sum(lvl.price * lvl.amount for lvl in levels)
+
+    def compute_top_quantity(self, side: str, depth: int = 5) -> float:
+        """Computes total base quantity across top k levels."""
+        levels = self.asks[:depth] if side.lower() == "buy" else self.bids[:depth]
+        return sum(lvl.amount for lvl in levels)
+
     def compute_vwap(self, side: str, target_volume: float) -> Tuple[float, float, bool]:
         """Performs order-book depth walking to calculate volume-weighted average price (VWAP).
         
@@ -135,9 +145,9 @@ class OrderBookNormalizer:
             "BTC-USD": "BTC/USD",
             "ETH-USD": "ETH/USD",
             "XRP-USD": "XRP/USD",
-            "ADA-USD": "ADA-USD",
-            "SOL-USD": "SOL-USD",
-            "DOGE-USD": "DOGE-USD",
+            "ADA-USD": "ADA/USD",
+            "SOL-USD": "SOL/USD",
+            "DOGE-USD": "DOGE/USD",
         },
         "kraken": {
             "XBT/USDT": "BTC/USDT",
@@ -153,6 +163,7 @@ class OrderBookNormalizer:
             "ADA/USD": "ADA/USD",
             "SOL/USD": "SOL/USD",
             "DOGE/USD": "DOGE/USD",
+            "USDT/USD": "USDT/USD",
         },
     }
 

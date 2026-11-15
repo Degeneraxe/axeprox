@@ -124,8 +124,16 @@ class SpreadTracker:
         b_key = (buy_exch.lower(), symbol)
         s_key = (sell_exch.lower(), symbol)
 
-        b_ticks = [t for t in self.ring_buffers.get(b_key, []) if _extract_ts(t) <= open_time_ms]
-        s_ticks = [t for t in self.ring_buffers.get(s_key, []) if _extract_ts(t) <= open_time_ms]
+        b_ticks_raw = self.ring_buffers.get(b_key, [])
+        if not b_ticks_raw and "USDT" in symbol:
+            b_ticks_raw = self.ring_buffers.get((buy_exch.lower(), symbol.replace("USDT", "USD")), [])
+
+        s_ticks_raw = self.ring_buffers.get(s_key, [])
+        if not s_ticks_raw and "USDT" in symbol:
+            s_ticks_raw = self.ring_buffers.get((sell_exch.lower(), symbol.replace("USDT", "USD")), [])
+
+        b_ticks = [t for t in b_ticks_raw if _extract_ts(t) <= open_time_ms]
+        s_ticks = [t for t in s_ticks_raw if _extract_ts(t) <= open_time_ms]
 
         # 50-tick rolling volatility calculation per exchange
         b_prices = [(t.mid_price if hasattr(t, "mid_price") else t["mid_price"]) for t in b_ticks[-50:]] if b_ticks else []
@@ -214,6 +222,21 @@ class SpreadTracker:
 
         # 2. No ongoing event -> open a new one if candidate meets detection criteria
         elif candidate.is_gross_candidate:
+            seq_len = int(self.config.raw.get("dataset", {}).get("sequence_length", 20))
+
+            # Ring buffer check: wait until ring buffers hold at least seq_len ticks per leg
+            b_key = (candidate.buy_exchange.lower(), candidate.symbol)
+            s_key = (candidate.sell_exchange.lower(), candidate.symbol)
+            b_buf = self.ring_buffers.get(b_key, [])
+            if not b_buf and "USDT" in candidate.symbol:
+                b_buf = self.ring_buffers.get((candidate.buy_exchange.lower(), candidate.symbol.replace("USDT", "USD")), [])
+            s_buf = self.ring_buffers.get(s_key, [])
+            if not s_buf and "USDT" in candidate.symbol:
+                s_buf = self.ring_buffers.get((candidate.sell_exchange.lower(), candidate.symbol.replace("USDT", "USD")), [])
+
+            if len(b_buf) < seq_len or len(s_buf) < seq_len:
+                return None
+
             event_id = f"evt_{uuid.uuid4().hex[:12]}"
 
             # Build 20-step feature window directly from in-memory ring buffer (Requirement 1, 2, 3)
@@ -223,8 +246,12 @@ class SpreadTracker:
                 v_sell = vol_sell_bps if vol_sell_bps is not None else 1.0
             else:
                 feat_win, v_buy, v_sell = self._build_point_in_time_feature_window(
-                    candidate.symbol, candidate.buy_exchange, candidate.sell_exchange, now_ms
+                    candidate.symbol, candidate.buy_exchange, candidate.sell_exchange, now_ms, seq_len=seq_len
                 )
+
+            # Never persist an event with an empty/incomplete window (Task 2)
+            if not feat_win or len(feat_win) < seq_len:
+                return None
 
             new_event = ActiveSpreadEvent(
                 event_id=event_id,

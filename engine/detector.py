@@ -62,9 +62,11 @@ class CrossExchangeDetector:
         snaps: Dict[str, OrderBookSnapshot] = {}
         for exch in self.exchanges:
             s = self.normalizer.get_snapshot(exch, symbol, current_time_ms)
-            if not s:
-                # Fallback to USD quote if USDT is not directly present
-                s = self.normalizer.get_snapshot(exch, symbol.replace("USDT", "USD"), current_time_ms)
+            if not s or s.is_stale:
+                # Fallback to USD quote if USDT is not directly present or is stale
+                s_usd = self.normalizer.get_snapshot(exch, symbol.replace("USDT", "USD"), current_time_ms)
+                if s_usd and not s_usd.is_stale:
+                    s = s_usd
             if s and not s.is_stale and s.best_bid and s.best_ask:
                 snaps[exch] = s
                 # Update volatility tracker with mid price
@@ -91,7 +93,26 @@ class CrossExchangeDetector:
                 if p_buy_ask <= 0:
                     continue
 
-                # Defect 8: Map Coinbase / USD pairs with explicit basis adjustment or exclude them
+                # Minimum depth liquidity filter (Task 3):
+                # Top-N-levels notional/quantity must exceed configured trade size for both legs
+                det_cfg = self.config.raw.get("detection", {})
+                if det_cfg.get("min_depth_filter_enabled", True):
+                    top_n = int(det_cfg.get("min_depth_levels", 5))
+                    trade_sizes = self.config.raw.get("simulation", {}).get("trade_sizes", {})
+                    min_qty = float(trade_sizes.get(symbol, 0.0))
+                    if min_qty > 0:
+                        buy_qty = snap_buy.compute_top_quantity("buy", depth=top_n)
+                        sell_qty = snap_sell.compute_top_quantity("sell", depth=top_n)
+                        buy_notional = snap_buy.compute_top_notional("buy", depth=top_n)
+                        sell_notional = snap_sell.compute_top_notional("sell", depth=top_n)
+                        min_buy_notional = min_qty * p_buy_ask
+                        min_sell_notional = min_qty * p_sell_bid
+
+                        if buy_qty < min_qty or sell_qty < min_qty or buy_notional < min_buy_notional or sell_notional < min_sell_notional:
+                            # Discard illiquid/thin candidate
+                            continue
+
+                # Defect 8 & Task 3: Map Coinbase / USD pairs with explicit basis adjustment or exclude them
                 if snap_buy.quote_currency != snap_sell.quote_currency:
                     basis_cfg = self.config.raw.get("markets", {}).get("basis_tracking", {})
                     if not basis_cfg.get("enabled", True):
@@ -100,9 +121,9 @@ class CrossExchangeDetector:
                     # Explicit basis adjustment: adjust USD quotes to USDT equivalent
                     rate = getattr(self.normalizer, "usdt_usd_basis_rate", 1.0000)
                     if snap_buy.quote_currency == "USD":
-                        p_buy_ask = p_buy_ask * rate
+                        p_buy_ask = snap_buy.get_adjusted_price(p_buy_ask, target_quote="USDT", basis_rate=rate)
                     if snap_sell.quote_currency == "USD":
-                        p_sell_bid = p_sell_bid * rate
+                        p_sell_bid = snap_sell.get_adjusted_price(p_sell_bid, target_quote="USDT", basis_rate=rate)
 
                 # Gross Spread in basis points: (Bid_B - Ask_A) / Ask_A * 10,000
                 gross_spread_bps = ((p_sell_bid - p_buy_ask) / p_buy_ask) * 10000.0
