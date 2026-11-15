@@ -8,6 +8,7 @@ Implements Amendments 1, 5, and 6:
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import uuid
@@ -18,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from config.settings import AppConfig
 from data.storage.db_manager import DatabaseManager
 from engine.detector import SpreadCandidate
+from models.features import asof_join_ticks, compute_rolling_volatility_bps, extract_step_features
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,10 @@ class ActiveSpreadEvent:
     last_seen_ms: float
     tick_count: int = 1
     features_at_open: Dict[str, float] = field(default_factory=dict)
+    feature_window: List[List[float]] = field(default_factory=list)
+    vol_buy_bps: float = 1.0
+    vol_sell_bps: float = 1.0
+    latency_threshold_ms: float = 85.0
     is_closed: bool = False
     is_right_censored: bool = False
     close_time_ms: Optional[float] = None
@@ -61,21 +67,103 @@ class SpreadTracker:
         # Pair key: (symbol, buy_exchange, sell_exchange) -> ActiveSpreadEvent
         self.active_events: Dict[Tuple[str, str, str], ActiveSpreadEvent] = {}
 
-        # Labeling parameters: derive viability latency threshold from measured transit_latency_ms in DB
-        lat_stats = self.db.get_empirical_latency_stats() if self.db else {}
+        # Fixed viability latency threshold per dataset version (Requirement 3: never recompute at startup)
+        ds_cfg = self.config.raw.get("dataset", {})
         lbl_cfg = self.config.raw.get("labeling", {})
-        if lat_stats and lat_stats.get("count", 0) >= 10:
-            self.latency_hurdle_ms = float(lat_stats["viability_threshold_ms"])
-        else:
-            self.latency_hurdle_ms = float(lbl_cfg.get("execution_latency_assumption_ms", 50.0))
+        self.dataset_version = ds_cfg.get("version", "v1.0")
+        self.latency_hurdle_ms = float(
+            ds_cfg.get("viability_latency_threshold_ms", lbl_cfg.get("execution_latency_assumption_ms", 85.0))
+        )
 
         self.max_window_ms = float(lbl_cfg.get("right_censored_max_window_ms", 30000.0))
         self.use_log_duration = bool(lbl_cfg.get("use_log_duration", True))
 
         self.completed_events: List[ActiveSpreadEvent] = []
 
+    def _build_point_in_time_feature_window(
+        self,
+        symbol: str,
+        buy_exch: str,
+        sell_exch: str,
+        open_time_iso: str,
+        seq_len: int = 20,
+    ) -> Tuple[List[List[float]], float, float]:
+        """Builds a 20-step point-in-time feature window aligned by timestamp using as-of join (Requirement 1 & 2)."""
+        if not self.db:
+            return [], 1.0, 1.0
+
+        cur = self.db._sqlite_conn.cursor()
+        cur.execute("""
+            SELECT * FROM orderbook_ticks
+            WHERE symbol = ? AND time <= ? AND exchange IN (?, ?)
+            ORDER BY time ASC
+        """, (symbol, open_time_iso, buy_exch.lower(), sell_exch.lower()))
+        preceding = [dict(r) for r in cur.fetchall()]
+
+        b_ticks = [t for t in preceding if t["exchange"].lower() == buy_exch.lower()]
+        s_ticks = [t for t in preceding if t["exchange"].lower() == sell_exch.lower()]
+
+        # 50-tick rolling volatility calculation
+        b_prices = [t["mid_price"] for t in b_ticks[-50:]] if b_ticks else []
+        s_prices = [t["mid_price"] for t in s_ticks[-50:]] if s_ticks else []
+        vol_b = compute_rolling_volatility_bps(b_prices) if b_prices else 1.0
+        vol_s = compute_rolling_volatility_bps(s_prices) if s_prices else 1.0
+
+        # As-of join by timestamp with max staleness (Requirement 2)
+        aligned_pairs = asof_join_ticks(b_ticks, s_ticks, max_staleness_ms=1500.0, seq_len=seq_len)
+        if len(aligned_pairs) < seq_len:
+            return [], vol_b, vol_s
+
+        seq: List[List[float]] = []
+        prev_spread = None
+        prev_vel = None
+
+        for b_tick, s_tick in aligned_pairs:
+            ask_buy = float(b_tick["best_ask"])
+            bid_sell = float(s_tick["best_bid"])
+            gross_bps = ((bid_sell - ask_buy) / ask_buy * 10000.0) if ask_buy > 0 else 0.0
+
+            vel = (gross_bps - prev_spread) if prev_spread is not None else 0.0
+            acc = (vel - prev_vel) if prev_vel is not None else 0.0
+            prev_spread = gross_bps
+            prev_vel = vel
+
+            obi_b = float(b_tick["imbalance"])
+            obi_s = float(s_tick["imbalance"])
+            lat_b = float(b_tick["transit_latency_ms"])
+            lat_s = float(s_tick["transit_latency_ms"])
+            top_b = float(b_tick["top_spread"])
+            top_s = float(s_tick["top_spread"])
+            mp_b = float(b_tick["mid_price"])
+            mp_s = float(s_tick["mid_price"])
+            mp_diff = ((mp_s - mp_b) / mp_b * 10000.0) if mp_b > 0 else 0.0
+
+            seq.append([
+                float(gross_bps),
+                float(vel),
+                float(acc),
+                float(obi_b),
+                float(obi_s),
+                float(obi_b - obi_s),
+                float(vol_b),
+                float(vol_s),
+                float(lat_b),
+                float(lat_s),
+                float(lat_b - lat_s),
+                float(top_b),
+                float(top_s),
+                float(mp_diff),
+            ])
+
+        return seq, vol_b, vol_s
+
     def process_candidate(
-        self, candidate: SpreadCandidate, features: Optional[Dict[str, float]] = None
+        self,
+        candidate: SpreadCandidate,
+        features: Optional[Dict[str, float]] = None,
+        feature_window: Optional[List[List[float]]] = None,
+        vol_buy_bps: Optional[float] = None,
+        vol_sell_bps: Optional[float] = None,
     ) -> Optional[ActiveSpreadEvent]:
         """Updates active spread state machine with newly scanned candidate."""
         key = (candidate.symbol, candidate.buy_exchange, candidate.sell_exchange)
@@ -104,6 +192,17 @@ class SpreadTracker:
         elif candidate.is_gross_candidate:
             event_id = f"evt_{uuid.uuid4().hex[:12]}"
             open_iso = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc).isoformat()
+
+            # Build or extract 20-step feature window and volatility (Requirement 1 & 2)
+            if feature_window is not None:
+                feat_win = feature_window
+                v_buy = vol_buy_bps if vol_buy_bps is not None else 1.0
+                v_sell = vol_sell_bps if vol_sell_bps is not None else 1.0
+            else:
+                feat_win, v_buy, v_sell = self._build_point_in_time_feature_window(
+                    candidate.symbol, candidate.buy_exchange, candidate.sell_exchange, open_iso
+                )
+
             new_event = ActiveSpreadEvent(
                 event_id=event_id,
                 symbol=candidate.symbol,
@@ -117,10 +216,14 @@ class SpreadTracker:
                 last_seen_ms=now_ms,
                 tick_count=1,
                 features_at_open=features or {},
+                feature_window=feat_win,
+                vol_buy_bps=v_buy,
+                vol_sell_bps=v_sell,
+                latency_threshold_ms=self.latency_hurdle_ms,
             )
             self.active_events[key] = new_event
 
-            # Record open in database
+            # Persist event at open with complete 20-step feature window and threshold (Requirement 1 & 3)
             if self.db:
                 self.db.insert_spread_event({
                     "event_id": new_event.event_id,
@@ -131,8 +234,15 @@ class SpreadTracker:
                     "open_spread_bps": new_event.open_spread_bps,
                     "cost_hurdle_bps": new_event.cost_hurdle_bps,
                     "peak_spread_bps": new_event.peak_spread_bps,
+                    "feature_window_json": json.dumps(new_event.feature_window) if new_event.feature_window else None,
+                    "vol_buy_bps": new_event.vol_buy_bps,
+                    "vol_sell_bps": new_event.vol_sell_bps,
+                    "latency_threshold_ms": new_event.latency_threshold_ms,
                 })
             return new_event
+
+        return None
+
 
         return None
 
@@ -172,9 +282,9 @@ class SpreadTracker:
         event.duration_ms = duration
         event.log_duration = math.log(1.0 + duration) if self.use_log_duration else duration
 
-        # Ground truth viability label:
-        # Viable = Stays open longer than empirical execution latency AND peak spread exceeded total hurdle
-        event.is_viable = (duration >= self.latency_hurdle_ms) and (event.peak_spread_bps >= event.cost_hurdle_bps)
+        # Ground truth viability label (Requirement 3):
+        # Viable = Stays open longer than the event's fixed dataset threshold AND peak spread exceeded total hurdle
+        event.is_viable = (duration >= event.latency_threshold_ms) and (event.peak_spread_bps >= event.cost_hurdle_bps)
 
         self.completed_events.append(event)
 
@@ -188,6 +298,7 @@ class SpreadTracker:
                 "log_duration": event.log_duration,
                 "is_viable": event.is_viable,
                 "is_right_censored": event.is_right_censored,
+                "latency_threshold_ms": event.latency_threshold_ms,
             })
 
         if self.on_event_closed:

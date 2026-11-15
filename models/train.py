@@ -41,13 +41,13 @@ def build_dataset_from_db(
     seq_len: int = 20,
     min_events: Optional[int] = None,
 ) -> Tuple[List[np.ndarray], List[int], List[float], List[bool]]:
-    """Constructs sequential feature vectors and targets strictly from real stored point-in-time ticks and events.
+    """Constructs sequential feature vectors and targets directly from persisted spread events in DB.
     
-    Zero fabrication guarantee (Defect 1):
-    - Synthetic feature decay windows and tick-stride fallbacks are deleted.
-    - Samples are constructed strictly from point-in-time orderbook ticks preceding event open_time.
-    - Labels (is_viable, log_duration, is_right_censored) are taken strictly from tracker records.
-    - If fewer than min_events real events with complete point-in-time windows exist, raises ValueError.
+    Requirement 1:
+    - Reads persisted 20-step point-in-time feature windows (feature_window_json) directly from spread_events.
+    - Does NOT query raw orderbook_ticks for training samples.
+    - Preserves training data permanently even when raw ticks are pruned.
+    - If fewer than min_events persisted feature windows exist, raises ValueError (Zero Fabrication Guarantee).
     """
     config = AppConfig.load()
     if min_events is None:
@@ -57,95 +57,34 @@ def build_dataset_from_db(
     db.initialize()
     cur = db._sqlite_conn.cursor()
 
-    # Query completed real spread events from tracker
+    # Query completed real spread events from tracker with persisted feature windows
     cur.execute("""
         SELECT * FROM spread_events 
-        WHERE duration_ms IS NOT NULL AND open_time IS NOT NULL
+        WHERE duration_ms IS NOT NULL AND feature_window_json IS NOT NULL
         ORDER BY open_time ASC
     """)
     events = [dict(r) for r in cur.fetchall()]
+    db.close()
 
     samples_X: List[np.ndarray] = []
     labels_cls: List[int] = []
     targets_reg: List[float] = []
     censored_flags: List[bool] = []
 
-    # Build point-in-time sequences preceding each spread event's open_time
+    import json
     for evt in events:
-        open_time = evt["open_time"]
-        sym = evt["symbol"]
-        buy_exch = evt["buy_exchange"].lower()
-        sell_exch = evt["sell_exchange"].lower()
-
-        # Query real point-in-time ticks recorded strictly before or at event open_time
-        cur.execute("""
-            SELECT * FROM orderbook_ticks
-            WHERE symbol = ? AND time <= ? AND exchange IN (?, ?)
-            ORDER BY time ASC
-        """, (sym, open_time, buy_exch, sell_exch))
-        preceding_ticks = [dict(r) for r in cur.fetchall()]
-
-        buy_ticks = [t for t in preceding_ticks if t["exchange"].lower() == buy_exch]
-        sell_ticks = [t for t in preceding_ticks if t["exchange"].lower() == sell_exch]
-
-        # Require at least seq_len ticks to construct full point-in-time window without synthesis
-        if len(buy_ticks) < seq_len or len(sell_ticks) < seq_len:
+        win_str = evt.get("feature_window_json")
+        if not win_str:
+            continue
+        try:
+            raw_seq = json.loads(win_str)
+        except Exception:
             continue
 
-        # Take the exact seq_len ticks preceding the event
-        buy_window = buy_ticks[-seq_len:]
-        sell_window = sell_ticks[-seq_len:]
+        if not raw_seq or len(raw_seq) < seq_len:
+            continue
 
-        # Extract real prices for shared rolling volatility calculation
-        buy_prices = [b["mid_price"] for b in buy_ticks]
-        sell_prices = [s["mid_price"] for s in sell_ticks]
-        from models.features import compute_rolling_volatility_bps
-        vol_buy = compute_rolling_volatility_bps(buy_prices)
-        vol_sell = compute_rolling_volatility_bps(sell_prices)
-
-        seq = []
-        prev_spread = None
-        prev_vel = None
-        for step in range(seq_len):
-            b_tick = buy_window[step]
-            s_tick = sell_window[step]
-
-            # Cross-exchange spread at this historical point in time
-            ask_buy = float(b_tick["best_ask"])
-            bid_sell = float(s_tick["best_bid"])
-            gross_bps = ((bid_sell - ask_buy) / ask_buy * 10000.0) if ask_buy > 0 else 0.0
-
-            vel = (gross_bps - prev_spread) if prev_spread is not None else 0.0
-            acc = (vel - prev_vel) if prev_vel is not None else 0.0
-            prev_spread = gross_bps
-            prev_vel = vel
-
-            obi_b = float(b_tick["imbalance"])
-            obi_s = float(s_tick["imbalance"])
-            lat_b = float(b_tick["transit_latency_ms"])
-            lat_s = float(s_tick["transit_latency_ms"])
-            top_b = float(b_tick["top_spread"])
-            top_s = float(s_tick["top_spread"])
-            mp_diff = float(((s_tick["mid_price"] - b_tick["mid_price"]) / b_tick["mid_price"]) * 10000.0) if b_tick["mid_price"] > 0 else 0.0
-
-            step_feat = [
-                float(gross_bps),
-                float(vel),
-                float(acc),
-                float(obi_b),
-                float(obi_s),
-                float(obi_b - obi_s),
-                float(vol_buy),
-                float(vol_sell),
-                float(lat_b),
-                float(lat_s),
-                float(lat_b - lat_s),
-                float(top_b),
-                float(top_s),
-                float(mp_diff),
-            ]
-            seq.append(step_feat)
-
+        seq = raw_seq[-seq_len:]
         dur = float(evt["duration_ms"])
         log_dur = float(evt.get("log_duration") or math.log(1.0 + max(1.0, dur)))
         is_viable = int(evt.get("is_viable", 0))
@@ -156,12 +95,10 @@ def build_dataset_from_db(
         targets_reg.append(log_dur)
         censored_flags.append(is_censored)
 
-    db.close()
-
     # Zero fabrication check: strictly fail if fewer than min_events exist
     if len(samples_X) < min_events:
         msg = (
-            f"Insufficient real events with point-in-time orderbook history "
+            f"Insufficient real events with persisted feature windows in DB "
             f"(found {len(samples_X)} complete sample windows, required minimum {min_events}). "
             f"Never fabricating synthetic or stride samples."
         )
@@ -169,6 +106,7 @@ def build_dataset_from_db(
         raise ValueError(msg)
 
     return samples_X, labels_cls, targets_reg, censored_flags
+
 
 
 

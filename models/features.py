@@ -116,3 +116,78 @@ def extract_step_features(
         float(top_spread_sell),
         float(mp_diff_bps),
     ]
+
+
+def _extract_ts(tick: Any) -> float:
+    """Helper to extract millisecond timestamp from snapshot or dict."""
+    if hasattr(tick, "local_ts_ms"):
+        return float(tick.local_ts_ms)
+    if isinstance(tick, dict):
+        if "local_ts_ms" in tick and tick["local_ts_ms"] is not None:
+            return float(tick["local_ts_ms"])
+        if "time" in tick and tick["time"] is not None:
+            from datetime import datetime
+            try:
+                dt_str = str(tick["time"]).replace("Z", "+00:00")
+                return datetime.fromisoformat(dt_str).timestamp() * 1000.0
+            except Exception:
+                pass
+    return 0.0
+
+
+def asof_join_ticks(
+    buy_ticks: List[Any],
+    sell_ticks: List[Any],
+    max_staleness_ms: float = 1500.0,
+    seq_len: int = 20,
+) -> List[Tuple[Any, Any]]:
+    """Aligns buy and sell ticks by timestamp using an as-of join with max staleness (Requirement 2).
+    
+    Never aligns by arbitrary array index. For every distinct event observation timestamp,
+    matches the most recent tick on both venues that arrived at or before T, strictly enforcing
+    that neither venue's quote age exceeds max_staleness_ms.
+    
+    Returns:
+        List of (buy_tick, sell_tick) pairs, truncated to the most recent seq_len steps.
+    """
+    if not buy_ticks or not sell_ticks:
+        return []
+
+    import bisect
+
+    b_sorted = sorted(buy_ticks, key=_extract_ts)
+    s_sorted = sorted(sell_ticks, key=_extract_ts)
+
+    b_ts = [_extract_ts(t) for t in b_sorted]
+    s_ts = [_extract_ts(t) for t in s_sorted]
+
+    # All observation timestamps across both streams
+    all_ts = sorted(list(set(b_ts + s_ts)))
+
+    aligned_pairs: List[Tuple[Any, Any]] = []
+    seen_keys = set()
+
+    for t in all_ts:
+        # Find latest buy tick <= t
+        b_idx = bisect.bisect_right(b_ts, t) - 1
+        # Find latest sell tick <= t
+        s_idx = bisect.bisect_right(s_ts, t) - 1
+
+        if b_idx < 0 or s_idx < 0:
+            continue
+
+        b_tick = b_sorted[b_idx]
+        s_tick = s_sorted[s_idx]
+
+        b_age = t - b_ts[b_idx]
+        s_age = t - s_ts[s_idx]
+
+        if b_age <= max_staleness_ms and s_age <= max_staleness_ms:
+            # Avoid duplicate consecutive pairs if neither side changed
+            pair_key = (id(b_tick), id(s_tick))
+            if pair_key not in seen_keys:
+                seen_keys.add(pair_key)
+                aligned_pairs.append((b_tick, s_tick))
+
+    return aligned_pairs[-seq_len:]
+

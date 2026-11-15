@@ -143,9 +143,29 @@ class DatabaseManager:
             duration_ms REAL,
             log_duration REAL,
             is_viable INTEGER NOT NULL DEFAULT 0,
-            is_right_censored INTEGER NOT NULL DEFAULT 0
+            is_right_censored INTEGER NOT NULL DEFAULT 0,
+            feature_window_json TEXT,
+            vol_buy_bps REAL,
+            vol_sell_bps REAL,
+            latency_threshold_ms REAL
         );
         """)
+
+        # Migration guard: ensure new feature persistence columns exist in existing spread_events tables
+        cur.execute("PRAGMA table_info(spread_events);")
+        existing_cols = {row[1] for row in cur.fetchall()}
+        for col_name, col_type in [
+            ("feature_window_json", "TEXT"),
+            ("vol_buy_bps", "REAL"),
+            ("vol_sell_bps", "REAL"),
+            ("latency_threshold_ms", "REAL"),
+        ]:
+            if col_name not in existing_cols:
+                try:
+                    cur.execute(f"ALTER TABLE spread_events ADD COLUMN {col_name} {col_type};")
+                except Exception:
+                    pass
+
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS simulated_trades (
@@ -212,15 +232,16 @@ class DatabaseManager:
         return 0
 
     def insert_spread_event(self, event: Dict[str, Any]) -> None:
-        """Inserts a newly opened spread event."""
+        """Inserts a newly opened spread event with persisted point-in-time feature window (Requirement 1 & 3)."""
         if self._sqlite_conn:
             cur = self._sqlite_conn.cursor()
             cur.execute("""
                 INSERT OR REPLACE INTO spread_events (
                     event_id, symbol, buy_exchange, sell_exchange, open_time, close_time,
                     peak_spread_bps, open_spread_bps, cost_hurdle_bps, duration_ms,
-                    log_duration, is_viable, is_right_censored
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    log_duration, is_viable, is_right_censored,
+                    feature_window_json, vol_buy_bps, vol_sell_bps, latency_threshold_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 event["event_id"],
                 event["symbol"],
@@ -235,11 +256,15 @@ class DatabaseManager:
                 event.get("log_duration"),
                 1 if event.get("is_viable", False) else 0,
                 1 if event.get("is_right_censored", False) else 0,
+                event.get("feature_window_json"),
+                float(event["vol_buy_bps"]) if "vol_buy_bps" in event and event["vol_buy_bps"] is not None else None,
+                float(event["vol_sell_bps"]) if "vol_sell_bps" in event and event["vol_sell_bps"] is not None else None,
+                float(event["latency_threshold_ms"]) if "latency_threshold_ms" in event and event["latency_threshold_ms"] is not None else None,
             ))
             self._sqlite_conn.commit()
 
     def update_spread_event(self, event_id: str, updates: Dict[str, Any]) -> None:
-        """Updates a spread event upon closure."""
+        """Updates a spread event upon closure, storing the immutable viability threshold with the label."""
         if self._sqlite_conn:
             cur = self._sqlite_conn.cursor()
             cur.execute("""
@@ -249,7 +274,8 @@ class DatabaseManager:
                     duration_ms = ?,
                     log_duration = ?,
                     is_viable = ?,
-                    is_right_censored = ?
+                    is_right_censored = ?,
+                    latency_threshold_ms = COALESCE(?, latency_threshold_ms)
                 WHERE event_id = ?
             """, (
                 updates.get("close_time"),
@@ -258,9 +284,11 @@ class DatabaseManager:
                 updates.get("log_duration"),
                 1 if updates.get("is_viable", False) else 0,
                 1 if updates.get("is_right_censored", False) else 0,
+                updates.get("latency_threshold_ms"),
                 event_id,
             ))
             self._sqlite_conn.commit()
+
 
     def insert_simulated_trade(self, trade: Dict[str, Any]) -> None:
         """Inserts a paper trading trade execution record."""
@@ -361,7 +389,11 @@ class DatabaseManager:
 
 
     def prune_old_ticks(self, keep_latest_per_symbol: int = 1500) -> int:
-        """Prunes old ticks from SQLite to prevent disk bloat while keeping recent order book history."""
+        """Prunes old ticks from orderbook_ticks ONLY to prevent disk bloat (Requirement 1).
+        
+        Spread events and their persisted 20-step point-in-time feature windows are permanently
+        retained and never pruned, guaranteeing permanent training dataset integrity.
+        """
         if self._sqlite_conn:
             cur = self._sqlite_conn.cursor()
             cur.execute("""

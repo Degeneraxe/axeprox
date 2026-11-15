@@ -133,6 +133,8 @@ labeling:
   use_log_duration: true                # Target = log(1 + duration_ms)
 
 dataset:
+  version: "v1.0"
+  viability_latency_threshold_ms: 85.0  # Fixed viability latency threshold per dataset version (Requirement 3: never recomputed at startup)
   train_ratio: 0.70
   val_ratio: 0.15
   test_ratio: 0.15

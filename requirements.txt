@@ -14,7 +14,7 @@ psycopg2-binary>=2.9.9,<=2.9.10
 asyncpg>=0.29.0,<=0.30.0
 
 # Machine Learning and Deep Learning
-torch==2.15.0+cpu
+torch==2.5.1
 scikit-learn==1.9.1
 scipy==1.18.1
 

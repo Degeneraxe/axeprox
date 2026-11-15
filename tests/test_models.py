@@ -144,7 +144,11 @@ def test_train_raises_insufficient_data(tmp_path):
             duration_ms REAL,
             log_duration REAL,
             is_viable INTEGER,
-            is_right_censored INTEGER
+            is_right_censored INTEGER,
+            feature_window_json TEXT,
+            vol_buy_bps REAL,
+            vol_sell_bps REAL,
+            latency_threshold_ms REAL
         )
     """)
     cur.execute("""
@@ -171,8 +175,9 @@ def test_train_raises_insufficient_data(tmp_path):
     conn.close()
 
     # Fewer than 20 events must raise ValueError, never fabricate samples
-    with pytest.raises(ValueError, match="Insufficient real events with point-in-time orderbook history"):
+    with pytest.raises(ValueError, match="Insufficient real events with persisted feature windows in DB"):
         build_dataset_from_db(db_path=str(fake_db), min_events=20)
+
 
 
 def test_feature_label_leakage():
@@ -256,4 +261,80 @@ def test_predictor_checkpoint_strictness(tmp_path):
     assert predictor.is_loaded is True
     assert predictor.decision_threshold == pytest.approx(0.45)
     assert len(predictor.feature_names) == 14
+
+
+def test_asof_join_ticks():
+    """Verifies that asof_join_ticks correctly aligns buy/sell ticks by timestamp with max staleness (Requirement 2)."""
+    from models.features import asof_join_ticks
+
+    # Buy ticks arrive at 1000, 1100, 1200
+    buy_ticks = [
+        {"local_ts_ms": 1000.0, "best_ask": 81500.0, "best_bid": 81490.0, "imbalance": 0.1, "transit_latency_ms": 20.0, "top_spread": 10.0, "mid_price": 81495.0},
+        {"local_ts_ms": 1100.0, "best_ask": 81505.0, "best_bid": 81495.0, "imbalance": 0.2, "transit_latency_ms": 22.0, "top_spread": 10.0, "mid_price": 81500.0},
+        {"local_ts_ms": 1200.0, "best_ask": 81510.0, "best_bid": 81500.0, "imbalance": 0.3, "transit_latency_ms": 25.0, "top_spread": 10.0, "mid_price": 81505.0},
+    ]
+
+    # Sell ticks arrive at 1050, 1150
+    sell_ticks = [
+        {"local_ts_ms": 1050.0, "best_ask": 81590.0, "best_bid": 81580.0, "imbalance": -0.1, "transit_latency_ms": 100.0, "top_spread": 10.0, "mid_price": 81585.0},
+        {"local_ts_ms": 1150.0, "best_ask": 81595.0, "best_bid": 81585.0, "imbalance": -0.2, "transit_latency_ms": 110.0, "top_spread": 10.0, "mid_price": 81590.0},
+    ]
+
+    pairs = asof_join_ticks(buy_ticks, sell_ticks, max_staleness_ms=500.0, seq_len=10)
+    assert len(pairs) > 0
+    for b_tick, s_tick in pairs:
+        # Check staleness bound
+        delta = abs(b_tick["local_ts_ms"] - s_tick["local_ts_ms"])
+        assert delta <= 500.0
+
+
+def test_build_dataset_from_persisted_feature_windows(tmp_path):
+    """Verifies that train.py reads persisted feature_window_json directly from spread_events (Requirement 1)."""
+    import json
+    import sqlite3
+    from models.train import build_dataset_from_db
+
+    db_file = tmp_path / "persisted_test.db"
+    conn = sqlite3.connect(db_file)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE spread_events (
+            event_id TEXT PRIMARY KEY,
+            symbol TEXT,
+            buy_exchange TEXT,
+            sell_exchange TEXT,
+            open_time TEXT,
+            close_time TEXT,
+            peak_spread_bps REAL,
+            open_spread_bps REAL,
+            cost_hurdle_bps REAL,
+            duration_ms REAL,
+            log_duration REAL,
+            is_viable INTEGER,
+            is_right_censored INTEGER,
+            feature_window_json TEXT,
+            vol_buy_bps REAL,
+            vol_sell_bps REAL,
+            latency_threshold_ms REAL
+        )
+    """)
+
+    # Insert 25 valid events with 20-step feature windows
+    dummy_seq = [[1.0] * 14 for _ in range(20)]
+    for i in range(25):
+        cur.execute("""
+            INSERT INTO spread_events (
+                event_id, symbol, buy_exchange, sell_exchange, open_time, close_time,
+                peak_spread_bps, open_spread_bps, cost_hurdle_bps, duration_ms,
+                log_duration, is_viable, is_right_censored, feature_window_json, latency_threshold_ms
+            ) VALUES (?, 'BTC/USDT', 'binance', 'kraken', ?, ?, 10.0, 8.0, 5.0, 200.0, 5.3, 1, 0, ?, 85.0)
+        """, (f"evt_{i}", f"2026-10-30T12:{i:02d}:00Z", f"2026-10-30T12:{i:02d}:01Z", json.dumps(dummy_seq)))
+    conn.commit()
+    conn.close()
+
+    samples_X, labels_cls, targets_reg, censored_flags = build_dataset_from_db(db_path=str(db_file), min_events=20)
+    assert len(samples_X) == 25
+    assert len(labels_cls) == 25
+    assert samples_X[0].shape == (20, 14)
+
 

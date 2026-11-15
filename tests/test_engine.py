@@ -176,3 +176,36 @@ def test_execution_simulator_vwap_and_pnl():
     assert losing_result.net_pnl_usdt < 0.0
     assert simulator.virtual_balance == pytest.approx(bal_before + losing_result.net_pnl_usdt)
 
+
+def test_engine_importable_without_torch():
+    """Verifies that engine modules can be imported and instantiated without torch (Requirement 5)."""
+    import sys
+
+    # Simulate environment where torch is completely absent
+    orig_torch = sys.modules.get("torch")
+    sys.modules["torch"] = None
+    try:
+        import importlib
+        import engine.cost_model
+        import engine.detector
+        import engine.simulator
+        import engine.tracker
+
+        importlib.reload(engine.cost_model)
+        importlib.reload(engine.detector)
+        importlib.reload(engine.simulator)
+        importlib.reload(engine.tracker)
+
+        cm = engine.cost_model.CostModel()
+        sim = engine.simulator.ExecutionSimulator()
+        tracker = engine.tracker.SpreadTracker()
+        assert cm is not None
+        assert sim is not None
+        assert tracker is not None
+    finally:
+        if orig_torch is not None:
+            sys.modules["torch"] = orig_torch
+        else:
+            sys.modules.pop("torch", None)
+
+

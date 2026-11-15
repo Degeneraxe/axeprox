@@ -113,6 +113,22 @@ cd C:\Users\SIDDHU\.gemini\antigravity\scratch\arbsense
 python -m pip install -r requirements.txt
 ```
 
+#### PyTorch Platform-Specific Installation
+If your system requires platform-specific PyTorch wheels:
+- **CPU-Only (Default / Standard):**
+  ```powershell
+  python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+  ```
+- **NVIDIA GPU (CUDA 12.1):**
+  ```powershell
+  python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+  ```
+- **NVIDIA GPU (CUDA 11.8):**
+  ```powershell
+  python -m pip install torch --index-url https://download.pytorch.org/whl/cu118
+  ```
+
+
 ### Step 2: Run Automated Unit & Integration Tests
 ```powershell
 $env:PYTHONPATH="."; python -m pytest tests

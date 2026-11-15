@@ -84,8 +84,12 @@ class LiveSpreadPredictor:
         buy_snap: Any,
         sell_snap: Any,
         gross_spread_bps: float,
+        vol_buy_bps: float = 1.0,
+        vol_sell_bps: float = 1.0,
     ) -> Tuple[bool, float, float]:
         """Infers viability and duration for a candidate cross-exchange opportunity.
+        
+        Uses the shared 50-tick rolling volatility function values passed in live inference (Requirement 2).
         
         Returns:
             Tuple of:
@@ -104,6 +108,8 @@ class LiveSpreadPredictor:
             snap_buy=buy_snap,
             snap_sell=sell_snap,
             gross_spread_bps=gross_spread_bps,
+            vol_buy_bps=vol_buy_bps,
+            vol_sell_bps=vol_sell_bps,
         )
         self.history[key].append(step_feats)
         if len(self.history[key]) > self.seq_len:
