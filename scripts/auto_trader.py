@@ -31,6 +31,7 @@ from data.storage.db_manager import DatabaseManager
 from engine.cost_model import CostModel
 from engine.detector import CrossExchangeDetector
 from engine.simulator import ExecutionSimulator
+from models.features import compute_rolling_volatility_bps
 from models.predictor import LiveSpreadPredictor
 
 logging.basicConfig(
@@ -85,12 +86,28 @@ class AutonomousPaperTrader:
                     sell_snap = self.normalizer.get_snapshot(c.sell_exchange, c.symbol, now_ms)
 
                     if buy_snap and sell_snap and not buy_snap.is_stale and not sell_snap.is_stale:
+                        # 50-tick rolling volatility per exchange (Requirement 1 & 2)
+                        b_ticks = self.normalizer.get_ring_buffer(c.buy_exchange, c.symbol)
+                        s_ticks = self.normalizer.get_ring_buffer(c.sell_exchange, c.symbol)
+                        b_prices = [t.mid_price for t in b_ticks[-50:]] if b_ticks else []
+                        s_prices = [t.mid_price for t in s_ticks[-50:]] if s_ticks else []
+                        vol_buy = compute_rolling_volatility_bps(b_prices) if b_prices else 1.0
+                        vol_sell = compute_rolling_volatility_bps(s_prices) if s_prices else 1.0
+
+                        # Build live LSTM window with asof_join_ticks from in-memory ring buffers
+                        feat_win, _, _ = self.normalizer.build_feature_window(
+                            c.symbol, c.buy_exchange, c.sell_exchange, seq_len=20
+                        )
+
                         # AI Inference (PyTorch LSTM Prediction)
                         is_viable, pred_dur_ms, conf = self.predictor.predict_opportunity(
                             symbol=c.symbol,
                             buy_snap=buy_snap,
                             sell_snap=sell_snap,
                             gross_spread_bps=c.gross_spread_bps,
+                            vol_buy_bps=vol_buy,
+                            vol_sell_bps=vol_sell,
+                            feature_window=feat_win if len(feat_win) == 20 else None,
                         )
 
                         # Calculate venue fees for this specific route

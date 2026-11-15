@@ -12,9 +12,10 @@ import json
 import logging
 import math
 import uuid
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Deque
 
 from config.settings import AppConfig
 from data.storage.db_manager import DatabaseManager
@@ -24,15 +25,33 @@ from models.features import asof_join_ticks, compute_rolling_volatility_bps, ext
 logger = logging.getLogger(__name__)
 
 
+def _extract_ts(tick: Any) -> float:
+    """Helper to extract epoch ms timestamp from snapshot or dict."""
+    if hasattr(tick, "local_ts_ms"):
+        return float(tick.local_ts_ms)
+    if isinstance(tick, dict):
+        if "local_ts_ms" in tick and tick["local_ts_ms"] is not None:
+            return float(tick["local_ts_ms"])
+        if "time" in tick and tick["time"] is not None:
+            val = tick["time"]
+            if isinstance(val, (int, float)):
+                return float(val)
+            try:
+                dt_str = str(val).replace("Z", "+00:00")
+                return datetime.fromisoformat(dt_str).timestamp() * 1000.0
+            except Exception:
+                pass
+    return 0.0
+
+
 @dataclass
 class ActiveSpreadEvent:
-    """Tracks an ongoing arbitrage opportunity window."""
+    """Tracks an ongoing arbitrage opportunity window with epoch ms timestamps."""
     event_id: str
     symbol: str
     buy_exchange: str
     sell_exchange: str
     open_time_ms: float
-    open_time_iso: str
     open_spread_bps: float
     cost_hurdle_bps: float
     peak_spread_bps: float
@@ -59,10 +78,18 @@ class SpreadTracker:
         db_manager: Optional[DatabaseManager] = None,
         config: Optional[AppConfig] = None,
         on_event_closed: Optional[Callable[[ActiveSpreadEvent], None]] = None,
+        normalizer: Optional[Any] = None,
     ):
         self.db = db_manager
         self.config = config or AppConfig.load()
         self.on_event_closed = on_event_closed
+        self.normalizer = normalizer
+
+        # In-memory per-(exchange, symbol) ring buffer used by both live inference and tracker (Requirement 3)
+        if normalizer is not None and hasattr(normalizer, "ring_buffers"):
+            self.ring_buffers = normalizer.ring_buffers
+        else:
+            self.ring_buffers: Dict[Tuple[str, str], Deque[Any]] = defaultdict(lambda: deque(maxlen=100))
 
         # Pair key: (symbol, buy_exchange, sell_exchange) -> ActiveSpreadEvent
         self.active_events: Dict[Tuple[str, str, str], ActiveSpreadEvent] = {}
@@ -80,36 +107,33 @@ class SpreadTracker:
 
         self.completed_events: List[ActiveSpreadEvent] = []
 
+    def record_tick(self, snapshot: Any) -> None:
+        """Appends tick to in-memory ring buffer (Requirement 3)."""
+        key = (snapshot.exchange.lower(), snapshot.symbol)
+        self.ring_buffers[key].append(snapshot)
+
     def _build_point_in_time_feature_window(
         self,
         symbol: str,
         buy_exch: str,
         sell_exch: str,
-        open_time_iso: str,
+        open_time_ms: float,
         seq_len: int = 20,
     ) -> Tuple[List[List[float]], float, float]:
-        """Builds a 20-step point-in-time feature window aligned by timestamp using as-of join (Requirement 1 & 2)."""
-        if not self.db:
-            return [], 1.0, 1.0
+        """Builds 20-step feature window directly from in-memory ring buffer using as-of timestamp join (Requirement 1, 2, 3)."""
+        b_key = (buy_exch.lower(), symbol)
+        s_key = (sell_exch.lower(), symbol)
 
-        cur = self.db._sqlite_conn.cursor()
-        cur.execute("""
-            SELECT * FROM orderbook_ticks
-            WHERE symbol = ? AND time <= ? AND exchange IN (?, ?)
-            ORDER BY time ASC
-        """, (symbol, open_time_iso, buy_exch.lower(), sell_exch.lower()))
-        preceding = [dict(r) for r in cur.fetchall()]
+        b_ticks = [t for t in self.ring_buffers.get(b_key, []) if _extract_ts(t) <= open_time_ms]
+        s_ticks = [t for t in self.ring_buffers.get(s_key, []) if _extract_ts(t) <= open_time_ms]
 
-        b_ticks = [t for t in preceding if t["exchange"].lower() == buy_exch.lower()]
-        s_ticks = [t for t in preceding if t["exchange"].lower() == sell_exch.lower()]
-
-        # 50-tick rolling volatility calculation
-        b_prices = [t["mid_price"] for t in b_ticks[-50:]] if b_ticks else []
-        s_prices = [t["mid_price"] for t in s_ticks[-50:]] if s_ticks else []
+        # 50-tick rolling volatility calculation per exchange
+        b_prices = [(t.mid_price if hasattr(t, "mid_price") else t["mid_price"]) for t in b_ticks[-50:]] if b_ticks else []
+        s_prices = [(t.mid_price if hasattr(t, "mid_price") else t["mid_price"]) for t in s_ticks[-50:]] if s_ticks else []
         vol_b = compute_rolling_volatility_bps(b_prices) if b_prices else 1.0
         vol_s = compute_rolling_volatility_bps(s_prices) if s_prices else 1.0
 
-        # As-of join by timestamp with max staleness (Requirement 2)
+        # As-of join by timestamp with max staleness (Requirement 2 & 3)
         aligned_pairs = asof_join_ticks(b_ticks, s_ticks, max_staleness_ms=1500.0, seq_len=seq_len)
         if len(aligned_pairs) < seq_len:
             return [], vol_b, vol_s
@@ -119,8 +143,8 @@ class SpreadTracker:
         prev_vel = None
 
         for b_tick, s_tick in aligned_pairs:
-            ask_buy = float(b_tick["best_ask"])
-            bid_sell = float(s_tick["best_bid"])
+            ask_buy = float(b_tick.best_ask.price if hasattr(b_tick, "best_ask") and b_tick.best_ask else (b_tick.get("best_ask", 0.0) if isinstance(b_tick, dict) else 0.0))
+            bid_sell = float(s_tick.best_bid.price if hasattr(s_tick, "best_bid") and s_tick.best_bid else (s_tick.get("best_bid", 0.0) if isinstance(s_tick, dict) else 0.0))
             gross_bps = ((bid_sell - ask_buy) / ask_buy * 10000.0) if ask_buy > 0 else 0.0
 
             vel = (gross_bps - prev_spread) if prev_spread is not None else 0.0
@@ -128,14 +152,14 @@ class SpreadTracker:
             prev_spread = gross_bps
             prev_vel = vel
 
-            obi_b = float(b_tick["imbalance"])
-            obi_s = float(s_tick["imbalance"])
-            lat_b = float(b_tick["transit_latency_ms"])
-            lat_s = float(s_tick["transit_latency_ms"])
-            top_b = float(b_tick["top_spread"])
-            top_s = float(s_tick["top_spread"])
-            mp_b = float(b_tick["mid_price"])
-            mp_s = float(s_tick["mid_price"])
+            obi_b = float(b_tick.compute_imbalance(5) if hasattr(b_tick, "compute_imbalance") else b_tick.get("imbalance", 0.0))
+            obi_s = float(s_tick.compute_imbalance(5) if hasattr(s_tick, "compute_imbalance") else s_tick.get("imbalance", 0.0))
+            lat_b = float(b_tick.transit_latency_ms if hasattr(b_tick, "transit_latency_ms") else b_tick.get("transit_latency_ms", 0.0))
+            lat_s = float(s_tick.transit_latency_ms if hasattr(s_tick, "transit_latency_ms") else s_tick.get("transit_latency_ms", 0.0))
+            top_b = float(b_tick.top_spread if hasattr(b_tick, "top_spread") else b_tick.get("top_spread", 0.0))
+            top_s = float(s_tick.top_spread if hasattr(s_tick, "top_spread") else s_tick.get("top_spread", 0.0))
+            mp_b = float(b_tick.mid_price if hasattr(b_tick, "mid_price") else b_tick.get("mid_price", 0.0))
+            mp_s = float(s_tick.mid_price if hasattr(s_tick, "mid_price") else s_tick.get("mid_price", 0.0))
             mp_diff = ((mp_s - mp_b) / mp_b * 10000.0) if mp_b > 0 else 0.0
 
             seq.append([
@@ -167,7 +191,7 @@ class SpreadTracker:
     ) -> Optional[ActiveSpreadEvent]:
         """Updates active spread state machine with newly scanned candidate."""
         key = (candidate.symbol, candidate.buy_exchange, candidate.sell_exchange)
-        now_ms = candidate.timestamp_ms
+        now_ms = float(candidate.timestamp_ms)  # Stored as epoch ms (Requirement 4)
 
         # 1. Existing ongoing event for this pair
         if key in self.active_events:
@@ -191,16 +215,15 @@ class SpreadTracker:
         # 2. No ongoing event -> open a new one if candidate meets detection criteria
         elif candidate.is_gross_candidate:
             event_id = f"evt_{uuid.uuid4().hex[:12]}"
-            open_iso = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc).isoformat()
 
-            # Build or extract 20-step feature window and volatility (Requirement 1 & 2)
+            # Build 20-step feature window directly from in-memory ring buffer (Requirement 1, 2, 3)
             if feature_window is not None:
                 feat_win = feature_window
                 v_buy = vol_buy_bps if vol_buy_bps is not None else 1.0
                 v_sell = vol_sell_bps if vol_sell_bps is not None else 1.0
             else:
                 feat_win, v_buy, v_sell = self._build_point_in_time_feature_window(
-                    candidate.symbol, candidate.buy_exchange, candidate.sell_exchange, open_iso
+                    candidate.symbol, candidate.buy_exchange, candidate.sell_exchange, now_ms
                 )
 
             new_event = ActiveSpreadEvent(
@@ -209,7 +232,6 @@ class SpreadTracker:
                 buy_exchange=candidate.buy_exchange,
                 sell_exchange=candidate.sell_exchange,
                 open_time_ms=now_ms,
-                open_time_iso=open_iso,
                 open_spread_bps=candidate.gross_spread_bps,
                 cost_hurdle_bps=candidate.total_hurdle_bps,
                 peak_spread_bps=candidate.gross_spread_bps,
@@ -223,14 +245,14 @@ class SpreadTracker:
             )
             self.active_events[key] = new_event
 
-            # Persist event at open with complete 20-step feature window and threshold (Requirement 1 & 3)
+            # Persist event at open with complete 20-step feature window and threshold (Requirement 1 & 3 & 4)
             if self.db:
                 self.db.insert_spread_event({
                     "event_id": new_event.event_id,
                     "symbol": new_event.symbol,
                     "buy_exchange": new_event.buy_exchange,
                     "sell_exchange": new_event.sell_exchange,
-                    "open_time": new_event.open_time_iso,
+                    "open_time": new_event.open_time_ms,  # Epoch ms (Requirement 4)
                     "open_spread_bps": new_event.open_spread_bps,
                     "cost_hurdle_bps": new_event.cost_hurdle_bps,
                     "peak_spread_bps": new_event.peak_spread_bps,
@@ -240,9 +262,6 @@ class SpreadTracker:
                     "latency_threshold_ms": new_event.latency_threshold_ms,
                 })
             return new_event
-
-        return None
-
 
         return None
 
@@ -268,17 +287,17 @@ class SpreadTracker:
     def _close_event(
         self, key: Tuple[str, str, str], close_time_ms: float, right_censored: bool
     ) -> Optional[ActiveSpreadEvent]:
-        """Finalizes spread event, computes labels, and persists to DB."""
+        """Finalizes spread event, computes labels, and persists to DB (timestamps as epoch ms)."""
         event = self.active_events.pop(key, None)
         if not event:
             return None
 
         event.is_closed = True
-        event.close_time_ms = close_time_ms
+        event.close_time_ms = float(close_time_ms)
         event.is_right_censored = right_censored
 
         # Calculate duration
-        duration = max(1.0, close_time_ms - event.open_time_ms)
+        duration = max(1.0, event.close_time_ms - event.open_time_ms)
         event.duration_ms = duration
         event.log_duration = math.log(1.0 + duration) if self.use_log_duration else duration
 
@@ -288,11 +307,10 @@ class SpreadTracker:
 
         self.completed_events.append(event)
 
-        # Update in database
+        # Update in database with epoch ms timestamp (Requirement 4)
         if self.db:
-            close_iso = datetime.fromtimestamp(close_time_ms / 1000.0, timezone.utc).isoformat()
             self.db.update_spread_event(event.event_id, {
-                "close_time": close_iso,
+                "close_time": event.close_time_ms,  # Epoch ms
                 "peak_spread_bps": event.peak_spread_bps,
                 "duration_ms": event.duration_ms,
                 "log_duration": event.log_duration,
@@ -305,3 +323,4 @@ class SpreadTracker:
             self.on_event_closed(event)
 
         return event
+

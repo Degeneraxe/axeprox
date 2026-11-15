@@ -209,3 +209,49 @@ def test_engine_importable_without_torch():
             sys.modules.pop("torch", None)
 
 
+def test_live_and_training_feature_vectors_equal():
+    """Verifies that the live feature window equals the training feature window for the exact same ticks (Item 1)."""
+    import numpy as np
+    from data.normalizer import OrderBookNormalizer
+    from engine.tracker import SpreadTracker
+
+    norm = OrderBookNormalizer()
+    tracker = SpreadTracker(normalizer=norm)
+
+    # Generate 25 sequential ticks for Binance and Kraken
+    for i in range(25):
+        t_ms = 1000.0 + (i * 100.0)
+        p_b_ask = 81500.0 + i
+        p_b_bid = 81490.0 + i
+        p_k_ask = 81590.0 + i
+        p_k_bid = 81580.0 + i
+
+        norm.update_book(
+            "binance", "btcusdt",
+            [(p_b_bid, 1.0)], [(p_b_ask, 1.0)],
+            exchange_ts_ms=t_ms - 25.0, local_ts_ms=t_ms,
+        )
+        norm.update_book(
+            "kraken", "XBT/USDT",
+            [(p_k_bid, 1.0)], [(p_k_ask, 1.0)],
+            exchange_ts_ms=t_ms - 80.0, local_ts_ms=t_ms,
+        )
+
+    # 1. Live feature window built via normalizer
+    live_win, live_vol_b, live_vol_s = norm.build_feature_window("BTC/USDT", "binance", "kraken", seq_len=20)
+
+    # 2. Training feature window built via tracker
+    train_win, train_vol_b, train_vol_s = tracker._build_point_in_time_feature_window(
+        "BTC/USDT", "binance", "kraken", open_time_ms=t_ms, seq_len=20
+    )
+
+    assert len(live_win) == 20
+    assert len(train_win) == 20
+    assert live_vol_b == pytest.approx(train_vol_b)
+    assert live_vol_s == pytest.approx(train_vol_s)
+
+    # Live feature vector equals training feature vector for the same ticks
+    np.testing.assert_allclose(np.array(live_win), np.array(train_win), rtol=1e-5, atol=1e-5)
+
+
+

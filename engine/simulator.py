@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ class SimulatedTradeResult:
     """Represents the outcome of a simulated paper arbitrage execution."""
     trade_id: str
     event_id: Optional[str]
+    timestamp_ms: float
     timestamp_iso: str
     symbol: str
     buy_exchange: str
@@ -45,6 +47,7 @@ class SimulatedTradeResult:
     net_pnl_usdt: float
     injected_latency_ms: float
     status: str  # FILLED, FLEETING, PARTIAL, INSUFFICIENT_LIQUIDITY
+
 
 
 class ExecutionSimulator:
@@ -111,7 +114,8 @@ class ExecutionSimulator:
         Both legs execute concurrently in parallel; no cross-chain transfer latency is incurred.
         """
         trade_id = f"trd_{uuid.uuid4().hex[:10]}"
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_ms = time.time() * 1000.0
+        now_iso = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc).isoformat()
         target_qty = quantity or self.trade_sizes.get(symbol, 0.05)
 
         # 1. Sample Empirical Latency
@@ -123,6 +127,7 @@ class ExecutionSimulator:
             result = SimulatedTradeResult(
                 trade_id=trade_id,
                 event_id=event_id,
+                timestamp_ms=now_ms,
                 timestamp_iso=now_iso,
                 symbol=symbol,
                 buy_exchange=buy_snap.exchange,
@@ -155,6 +160,7 @@ class ExecutionSimulator:
                 result = SimulatedTradeResult(
                     trade_id=trade_id,
                     event_id=event_id,
+                    timestamp_ms=now_ms,
                     timestamp_iso=now_iso,
                     symbol=symbol,
                     buy_exchange=buy_snap.exchange,
@@ -207,6 +213,7 @@ class ExecutionSimulator:
         result = SimulatedTradeResult(
             trade_id=trade_id,
             event_id=event_id,
+            timestamp_ms=now_ms,
             timestamp_iso=now_iso,
             symbol=symbol,
             buy_exchange=buy_snap.exchange,
@@ -234,7 +241,7 @@ class ExecutionSimulator:
             self.db.insert_simulated_trade({
                 "trade_id": result.trade_id,
                 "event_id": result.event_id,
-                "timestamp": result.timestamp_iso,
+                "timestamp": result.timestamp_ms,
                 "symbol": result.symbol,
                 "buy_exchange": result.buy_exchange,
                 "sell_exchange": result.sell_exchange,
@@ -248,3 +255,4 @@ class ExecutionSimulator:
                 "latency_ms": result.injected_latency_ms,
                 "status": result.status,
             })
+

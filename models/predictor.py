@@ -86,10 +86,11 @@ class LiveSpreadPredictor:
         gross_spread_bps: float,
         vol_buy_bps: float = 1.0,
         vol_sell_bps: float = 1.0,
+        feature_window: Optional[List[List[float]]] = None,
     ) -> Tuple[bool, float, float]:
         """Infers viability and duration for a candidate cross-exchange opportunity.
         
-        Uses the shared 50-tick rolling volatility function values passed in live inference (Requirement 2).
+        Uses the shared 50-tick rolling volatility function values and in-memory as-of window (Requirements 1, 2, 3).
         
         Returns:
             Tuple of:
@@ -115,11 +116,15 @@ class LiveSpreadPredictor:
         if len(self.history[key]) > self.seq_len:
             self.history[key].pop(0)
 
-        current_seq = list(self.history[key])
-        while len(current_seq) < self.seq_len:
-            current_seq.insert(0, step_feats)
+        if feature_window is not None and len(feature_window) == self.seq_len:
+            current_seq = feature_window
+        else:
+            current_seq = list(self.history[key])
+            while len(current_seq) < self.seq_len:
+                current_seq.insert(0, step_feats)
 
         arr_in = np.array(current_seq, dtype=np.float32)
+
         if self.means is not None and self.stds is not None:
             arr_in = (arr_in - self.means) / self.stds
 

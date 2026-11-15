@@ -10,8 +10,9 @@ Implements:
 from __future__ import annotations
 
 import logging
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,8 @@ class OrderBookNormalizer:
         self.default_quote = default_quote
         # State: (exchange, symbol) -> OrderBookSnapshot
         self.books: Dict[Tuple[str, str], OrderBookSnapshot] = {}
+        # In-memory per-(exchange, symbol) ring buffers for live inference & tracker (Requirement 3)
+        self.ring_buffers: Dict[Tuple[str, str], Deque[OrderBookSnapshot]] = defaultdict(lambda: deque(maxlen=100))
         # Quote basis tracking: e.g. "USDT/USD" parity
         self.usdt_usd_basis_rate: float = 1.0000
 
@@ -208,7 +211,83 @@ class OrderBookNormalizer:
         )
 
         self.books[(exchange.lower(), norm_symbol)] = snapshot
+        self.ring_buffers[(exchange.lower(), norm_symbol)].append(snapshot)
         return snapshot
+
+    def get_ring_buffer(self, exchange: str, symbol: str) -> List[OrderBookSnapshot]:
+        """Returns the in-memory ring buffer of recent order book snapshots for (exchange, symbol)."""
+        norm_symbol = self.normalize_symbol(exchange, symbol)
+        return list(self.ring_buffers.get((exchange.lower(), norm_symbol), []))
+
+    def build_feature_window(
+        self,
+        symbol: str,
+        buy_exchange: str,
+        sell_exchange: str,
+        seq_len: int = 20,
+        max_staleness_ms: float = 1500.0,
+    ) -> Tuple[List[List[float]], float, float]:
+        """Builds a 20-step LSTM feature window from in-memory ring buffers using asof_join_ticks (Requirement 1 & 3)."""
+        from models.features import asof_join_ticks, compute_rolling_volatility_bps
+
+        norm_sym = self.normalize_symbol(buy_exchange, symbol)
+        b_ticks = self.get_ring_buffer(buy_exchange, norm_sym)
+        s_ticks = self.get_ring_buffer(sell_exchange, norm_sym)
+
+        # 50-tick rolling volatility per exchange
+        b_prices = [t.mid_price for t in b_ticks[-50:]] if b_ticks else []
+        s_prices = [t.mid_price for t in s_ticks[-50:]] if s_ticks else []
+        vol_b = compute_rolling_volatility_bps(b_prices) if b_prices else 1.0
+        vol_s = compute_rolling_volatility_bps(s_prices) if s_prices else 1.0
+
+        # As-of join by timestamp with max staleness
+        aligned_pairs = asof_join_ticks(b_ticks, s_ticks, max_staleness_ms=max_staleness_ms, seq_len=seq_len)
+        if len(aligned_pairs) < seq_len:
+            return [], vol_b, vol_s
+
+        seq: List[List[float]] = []
+        prev_spread = None
+        prev_vel = None
+
+        for b_snap, s_snap in aligned_pairs:
+            ask_buy = float(b_snap.best_ask.price) if b_snap.best_ask else 0.0
+            bid_sell = float(s_snap.best_bid.price) if s_snap.best_bid else 0.0
+            gross_bps = ((bid_sell - ask_buy) / ask_buy * 10000.0) if ask_buy > 0 else 0.0
+
+            vel = (gross_bps - prev_spread) if prev_spread is not None else 0.0
+            acc = (vel - prev_vel) if prev_vel is not None else 0.0
+            prev_spread = gross_bps
+            prev_vel = vel
+
+            obi_b = float(b_snap.compute_imbalance(5))
+            obi_s = float(s_snap.compute_imbalance(5))
+            lat_b = float(b_snap.transit_latency_ms)
+            lat_s = float(s_snap.transit_latency_ms)
+            top_b = float(b_snap.top_spread)
+            top_s = float(s_snap.top_spread)
+            mp_b = float(b_snap.mid_price)
+            mp_s = float(s_snap.mid_price)
+            mp_diff = ((mp_s - mp_b) / mp_b * 10000.0) if mp_b > 0 else 0.0
+
+            seq.append([
+                float(gross_bps),
+                float(vel),
+                float(acc),
+                float(obi_b),
+                float(obi_s),
+                float(obi_b - obi_s),
+                float(vol_b),
+                float(vol_s),
+                float(lat_b),
+                float(lat_s),
+                float(lat_b - lat_s),
+                float(top_b),
+                float(top_s),
+                float(mp_diff),
+            ])
+
+        return seq, vol_b, vol_s
+
 
     def get_snapshot(
         self, exchange: str, symbol: str, current_time_ms: float

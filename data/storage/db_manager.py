@@ -232,8 +232,17 @@ class DatabaseManager:
         return 0
 
     def insert_spread_event(self, event: Dict[str, Any]) -> None:
-        """Inserts a newly opened spread event with persisted point-in-time feature window (Requirement 1 & 3)."""
+        """Inserts a newly opened spread event with persisted point-in-time feature window (Requirement 1, 3, 4)."""
         if self._sqlite_conn:
+            open_val = event["open_time"]
+            if isinstance(open_val, (int, float)):
+                open_ms = float(open_val)
+            else:
+                try:
+                    open_ms = datetime.fromisoformat(str(open_val).replace("Z", "+00:00")).timestamp() * 1000.0
+                except Exception:
+                    open_ms = time.time() * 1000.0
+
             cur = self._sqlite_conn.cursor()
             cur.execute("""
                 INSERT OR REPLACE INTO spread_events (
@@ -247,8 +256,8 @@ class DatabaseManager:
                 event["symbol"],
                 event["buy_exchange"],
                 event["sell_exchange"],
-                event["open_time"],
-                event.get("close_time"),
+                open_ms,
+                float(event["close_time"]) if "close_time" in event and event["close_time"] is not None and isinstance(event["close_time"], (int, float)) else event.get("close_time"),
                 float(event.get("peak_spread_bps", 0.0)),
                 float(event.get("open_spread_bps", 0.0)),
                 float(event.get("cost_hurdle_bps", 0.0)),
@@ -264,8 +273,20 @@ class DatabaseManager:
             self._sqlite_conn.commit()
 
     def update_spread_event(self, event_id: str, updates: Dict[str, Any]) -> None:
-        """Updates a spread event upon closure, storing the immutable viability threshold with the label."""
+        """Updates a spread event upon closure, storing the immutable viability threshold with the label (Requirement 4)."""
         if self._sqlite_conn:
+            close_val = updates.get("close_time")
+            if close_val is not None:
+                if isinstance(close_val, (int, float)):
+                    close_ms = float(close_val)
+                else:
+                    try:
+                        close_ms = datetime.fromisoformat(str(close_val).replace("Z", "+00:00")).timestamp() * 1000.0
+                    except Exception:
+                        close_ms = time.time() * 1000.0
+            else:
+                close_ms = None
+
             cur = self._sqlite_conn.cursor()
             cur.execute("""
                 UPDATE spread_events SET
@@ -278,7 +299,7 @@ class DatabaseManager:
                     latency_threshold_ms = COALESCE(?, latency_threshold_ms)
                 WHERE event_id = ?
             """, (
-                updates.get("close_time"),
+                close_ms,
                 float(updates.get("peak_spread_bps", 0.0)),
                 updates.get("duration_ms"),
                 updates.get("log_duration"),
@@ -291,8 +312,17 @@ class DatabaseManager:
 
 
     def insert_simulated_trade(self, trade: Dict[str, Any]) -> None:
-        """Inserts a paper trading trade execution record."""
+        """Inserts a paper trading trade execution record with epoch ms timestamp (Requirement 4)."""
         if self._sqlite_conn:
+            ts_val = trade["timestamp"]
+            if isinstance(ts_val, (int, float)):
+                ts_ms = float(ts_val)
+            else:
+                try:
+                    ts_ms = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00")).timestamp() * 1000.0
+                except Exception:
+                    ts_ms = time.time() * 1000.0
+
             cur = self._sqlite_conn.cursor()
             cur.execute("""
                 INSERT OR REPLACE INTO simulated_trades (
@@ -303,7 +333,7 @@ class DatabaseManager:
             """, (
                 trade["trade_id"],
                 trade.get("event_id"),
-                trade["timestamp"],
+                ts_ms,
                 trade["symbol"],
                 trade["buy_exchange"],
                 trade["sell_exchange"],
