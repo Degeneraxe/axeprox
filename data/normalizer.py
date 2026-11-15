@@ -37,6 +37,7 @@ class OrderBookSnapshot:
     asks: List[OrderBookLevel] = field(default_factory=list)  # Sorted ascending by price
     is_stale: bool = False
     quote_age_ms: float = 0.0
+    is_crossed: bool = False
 
     @property
     def best_bid(self) -> Optional[OrderBookLevel]:
@@ -176,6 +177,8 @@ class OrderBookNormalizer:
         self.ring_buffers: Dict[Tuple[str, str], Deque[OrderBookSnapshot]] = defaultdict(lambda: deque(maxlen=100))
         # Quote basis tracking: e.g. "USDT/USD" parity
         self.usdt_usd_basis_rate: float = 1.0000
+        # Book integrity monitor: crossed books counter
+        self.crossed_books_count: int = 0
 
     def normalize_symbol(self, exchange: str, raw_symbol: str) -> str:
         """Translates raw exchange-specific ticker to standardized format."""
@@ -206,6 +209,12 @@ class OrderBookNormalizer:
         sorted_bids = [OrderBookLevel(p, a) for p, a in sorted(bids, key=lambda x: x[0], reverse=True)]
         sorted_asks = [OrderBookLevel(p, a) for p, a in sorted(asks, key=lambda x: x[0])]
 
+        # Book integrity monitor: check if book is crossed (best_bid >= best_ask)
+        is_crossed = bool(sorted_bids and sorted_asks and sorted_bids[0].price >= sorted_asks[0].price)
+        if is_crossed:
+            self.crossed_books_count += 1
+            logger.warning("[BookIntegrity] Crossed book on %s %s: bid=%.4f >= ask=%.4f", exchange, norm_symbol, sorted_bids[0].price, sorted_asks[0].price)
+
         transit_latency = max(0.0, local_ts_ms - exchange_ts_ms)
 
         snapshot = OrderBookSnapshot(
@@ -219,6 +228,7 @@ class OrderBookNormalizer:
             asks=sorted_asks,
             is_stale=False,
             quote_age_ms=0.0,
+            is_crossed=is_crossed,
         )
 
         self.books[(exchange.lower(), norm_symbol)] = snapshot
@@ -309,6 +319,9 @@ class OrderBookNormalizer:
             return None
 
         snap = self.books[key]
+        if getattr(snap, "is_crossed", False):
+            return None  # Strictly exclude corrupt / crossed books from arbitrage detection
+
         quote_age = current_time_ms - snap.local_ts_ms
         snap.quote_age_ms = max(0.0, quote_age)
         snap.is_stale = quote_age > self.max_quote_age_ms

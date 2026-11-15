@@ -42,12 +42,12 @@ markets:
       "SOL/USDT": "solusdt"
       "DOGE/USDT": "dogeusdt"
     coinbase:
-      "BTC/USDT": "BTC-USDT"
-      "ETH/USDT": "ETH-USDT"
+      "BTC/USDT": "BTC-USD"
+      "ETH/USDT": "ETH-USD"
       "XRP/USDT": "XRP-USD"
-      "ADA/USDT": "ADA-USDT"
-      "SOL/USDT": "SOL-USDT"
-      "DOGE/USDT": "DOGE-USDT"
+      "ADA/USDT": "ADA-USD"
+      "SOL/USDT": "SOL-USD"
+      "DOGE/USDT": "DOGE-USD"
       "BTC/USD": "BTC-USD"
       "ETH/USD": "ETH-USD"
       "XRP/USD": "XRP-USD"
@@ -74,6 +74,7 @@ markets:
 # Gross threshold triggers detection; net viability is evaluated per fee tier scenario
 detection:
   gross_spread_threshold_bps: 1.0  # Detect at low gross threshold (1 basis point = 0.01%)
+  max_plausible_spread_bps: 80.0   # Configurable max plausible spread filter (flag suspect above 80 bps)
   min_order_book_depth_levels: 5   # Top N levels maintained
   depth_snapshot_throttle_ms: 100   # Throttle full L2 snapshots (Amendment 6)
   min_depth_filter_enabled: true    # Top-N-levels notional must exceed configured trade size

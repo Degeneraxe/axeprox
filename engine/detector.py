@@ -54,8 +54,17 @@ class CrossExchangeDetector:
         self.gross_threshold_bps = float(self.config.detection.gross_spread_threshold_bps)
         self.exchanges = ["binance", "coinbase", "kraken"]
 
-    def scan_symbol(self, symbol: str, current_time_ms: float) -> List[SpreadCandidate]:
-        """Scans all directed exchange pairs for a symbol and returns detected spreads."""
+    def scan_symbol(
+        self,
+        symbol: str,
+        current_time_ms: float,
+        active_pairs: Optional[set] = None,
+    ) -> List[SpreadCandidate]:
+        """Scans all directed exchange pairs for a symbol and returns detected spreads.
+        
+        If active_pairs is provided, ongoing active events for this symbol are always
+        returned so the tracker receives every tick during their lifetime.
+        """
         candidates: List[SpreadCandidate] = []
 
         # Retrieve snapshots for all venues
@@ -155,7 +164,8 @@ class CrossExchangeDetector:
                     quote_age_sell_ms=snap_sell.quote_age_ms,
                 )
 
-                if is_gross:
+                is_active = (active_pairs is not None) and ((symbol, buy_exch, sell_exch) in active_pairs)
+                if is_gross or is_active:
                     candidates.append(candidate)
 
         return candidates

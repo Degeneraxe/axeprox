@@ -32,11 +32,9 @@ class BinanceFeed(BaseExchangeFeed):
         target_symbols = symbols or ["btcusdt", "ethusdt", "xrpusdt", "adausdt", "solusdt"]
         # Format for Binance streams (lowercase without slashes)
         self.clean_symbols = [s.lower().replace("/", "").replace("-", "") for s in target_symbols]
-        # Subscribes to partial depth and bookTicker streams to capture both depth levels and event time (E/T)
-        streams = []
-        for s in self.clean_symbols:
-            streams.append(f"{s}@depth10@100ms")
-            streams.append(f"{s}@bookTicker")
+        # Use Binance partial-depth streams (@depth20@100ms) (Task 2)
+        # Guarantees authoritative top-20 depth snapshots every 100ms without sequence ID gap desyncs
+        streams = [f"{s}@depth20@100ms" for s in self.clean_symbols]
         ws_url = f"{self.DEFAULT_WS_URL}?streams={'/'.join(streams)}"
 
         super().__init__(
@@ -60,26 +58,17 @@ class BinanceFeed(BaseExchangeFeed):
             payload = data["data"]
             raw_symbol = stream_name.split("@")[0].lower()
 
-            # Handle bookTicker stream (contains real exchange timestamp E/T and top-of-book)
-            if "@bookTicker" in stream_name:
-                exch_ts = float(payload.get("E") or payload.get("T") or (local_ts_ms - (clock_sync.rtt_ms / 2.0)))
-                self._last_server_time_ms = exch_ts
-                bids = [(float(payload["b"]), float(payload["B"]))]
-                asks = [(float(payload["a"]), float(payload["A"]))]
-                return raw_symbol, bids, asks, exch_ts
-
-            # Handle depth10 stream
-            elif "@depth" in stream_name:
+            # Handle authoritative partial depth snapshot stream (@depth20@100ms)
+            if "@depth" in stream_name:
                 bids_raw = payload.get("bids", [])
                 asks_raw = payload.get("asks", [])
                 bids = [(float(p), float(a)) for p, a in bids_raw]
                 asks = [(float(p), float(a)) for p, a in asks_raw]
 
-                # Use event time if present, or recent bookTicker server time + elapsed
                 if "E" in payload:
                     exchange_ts_ms = float(payload["E"])
-                elif self._last_server_time_ms > 0:
-                    exchange_ts_ms = self._last_server_time_ms
+                elif "E" in data:
+                    exchange_ts_ms = float(data["E"])
                 else:
                     exchange_ts_ms = local_ts_ms - (clock_sync.rtt_ms / 2.0)
 

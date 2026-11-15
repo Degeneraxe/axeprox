@@ -96,6 +96,11 @@ def test_spread_tracker_lifecycle_and_labeling():
     assert closed_evt.peak_spread_bps == pytest.approx(9.20)
     assert closed_evt.is_viable is True  # 200ms > 85ms and peak 9.20 > hurdle 5.00
     assert closed_evt.log_duration == pytest.approx(pytest.approx(5.3033, rel=1e-2))
+    assert len(closed_evt.lifetime_ticks) == 3
+    assert closed_evt.lifetime_ticks[0]["gross_spread_bps"] == pytest.approx(7.36)
+    assert closed_evt.lifetime_ticks[1]["gross_spread_bps"] == pytest.approx(9.20)
+    assert closed_evt.lifetime_ticks[2]["gross_spread_bps"] == pytest.approx(-1.0)
+    assert closed_evt.is_suspect is False
 
 
 def test_execution_simulator_vwap_and_pnl():
@@ -405,6 +410,79 @@ def test_cumulative_tick_counter(tmp_path):
     assert db.get_tick_count() == 8  # 3 retained + 5 new
     assert db.get_cumulative_tick_count() == 15  # 15 cumulative
     db.close()
+
+
+def test_spread_tracker_suspect_gate_and_lifetime_ticks(tmp_path):
+    """Verifies that spreads exceeding max_plausible_spread_bps are flagged as suspect and lifetime ticks are persisted."""
+    import json
+    from data.storage.db_manager import DatabaseManager
+    from engine.detector import SpreadCandidate
+
+    db_file = tmp_path / "test_suspect.db"
+    db = DatabaseManager(sqlite_path=str(db_file), migrations_dir="data/storage/migrations")
+    db.initialize()
+
+    tracker = SpreadTracker(db_manager=db)
+    now_ms = 10000.0
+
+    for i in range(25):
+        t = 1000.0 + i * 100.0
+        tracker.record_tick(OrderBookSnapshot("binance", "BTC/USDT", "USDT", t, t, 10.0, [OrderBookLevel(80000.0, 1.0)], [OrderBookLevel(80010.0, 1.0)]))
+        tracker.record_tick(OrderBookSnapshot("kraken", "BTC/USDT", "USDT", t, t, 10.0, [OrderBookLevel(81500.0, 1.0)], [OrderBookLevel(81510.0, 1.0)]))
+
+    # Candidate with 150 bps spread (> 80 bps max plausible)
+    suspect_cand = SpreadCandidate(
+        symbol="BTC/USDT",
+        buy_exchange="binance",
+        sell_exchange="kraken",
+        buy_ask=80010.0,
+        sell_bid=81210.0,
+        gross_spread_bps=150.0,
+        net_spread_bps=100.0,
+        total_hurdle_bps=50.0,
+        fee_bps=50.0,
+        vol_buffer_bps=0.0,
+        is_gross_candidate=True,
+        is_net_profitable=True,
+        timestamp_ms=now_ms,
+        quote_age_buy_ms=5.0,
+        quote_age_sell_ms=5.0,
+    )
+
+    evt = tracker.process_candidate(suspect_cand)
+    assert evt is not None
+    assert evt.is_suspect is True
+
+    # Advance tick
+    suspect_cand.timestamp_ms = 10200.0
+    suspect_cand.gross_spread_bps = 160.0
+    tracker.process_candidate(suspect_cand)
+
+    # Close tick
+    suspect_cand.timestamp_ms = 10400.0
+    suspect_cand.gross_spread_bps = 20.0  # falls below 50 bps hurdle
+    closed_evt = tracker.process_candidate(suspect_cand)
+
+    assert closed_evt is not None
+    assert closed_evt.is_closed is True
+    assert closed_evt.is_suspect is True
+    assert closed_evt.duration_ms == pytest.approx(400.0)
+    assert closed_evt.peak_spread_bps == pytest.approx(160.0)
+    assert len(closed_evt.lifetime_ticks) == 3
+
+    # Check persistence in database
+    cur = db._sqlite_conn.cursor()
+    cur.execute("SELECT is_suspect, lifetime_ticks_json FROM spread_events WHERE event_id = ?", (closed_evt.event_id,))
+    row = cur.fetchone()
+    assert row is not None
+    assert row[0] == 1  # is_suspect = True
+    ticks_saved = json.loads(row[1])
+    assert len(ticks_saved) == 3
+    assert ticks_saved[0]["gross_spread_bps"] == 150.0
+    assert ticks_saved[1]["gross_spread_bps"] == 160.0
+    assert ticks_saved[2]["gross_spread_bps"] == 20.0
+    db.close()
+
 
 
 

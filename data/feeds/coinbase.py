@@ -55,10 +55,12 @@ class CoinbaseFeed(BaseExchangeFeed):
             self._books[s] = {"bids": {}, "asks": {}}
 
     def build_subscription_payload(self) -> Dict[str, Any]:
+        # Subscribe strictly to level2_batch (Task 2)
+        # Avoid ticker stream which clobbers top-of-book and causes artificial crossed books
         return {
             "type": "subscribe",
             "product_ids": self.symbols,
-            "channels": ["level2_batch", "ticker"],
+            "channels": ["level2_batch"],
         }
 
     def parse_message(self, raw_msg: str, local_ts_ms: float) -> Optional[Tuple[str, List, List, float]]:
@@ -72,19 +74,19 @@ class CoinbaseFeed(BaseExchangeFeed):
         book = self._books[product_id]
 
         if msg_type == "snapshot":
-            # Initial L2 snapshot
+            # Initial authoritative L2 snapshot
             bids_raw = data.get("bids", [])
             asks_raw = data.get("asks", [])
             book["bids"] = {float(p): float(a) for p, a in bids_raw}
             book["asks"] = {float(p): float(a) for p, a in asks_raw}
             exchange_ts_ms = local_ts_ms
 
-            sorted_bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:10]
-            sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])[:10]
+            sorted_bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:20]
+            sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])[:20]
             return product_id, sorted_bids, sorted_asks, exchange_ts_ms
 
         elif msg_type == "l2update":
-            # Incremental updates
+            # Incremental updates with explicit size 0 removal (Task 2)
             time_str = data.get("time")
             exchange_ts_ms = _parse_iso_to_epoch_ms(time_str) if time_str else local_ts_ms
             changes = data.get("changes", [])
@@ -98,27 +100,30 @@ class CoinbaseFeed(BaseExchangeFeed):
                 else:
                     book[target_side][price] = size
 
-            sorted_bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:10]
-            sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])[:10]
-            return product_id, sorted_bids, sorted_asks, exchange_ts_ms
+            # Sort and truncate to prevent memory drift
+            sorted_bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)
+            sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])
+
+            # Crossed-book sanity guard: remove crossed asks/bids if market jumped
+            while sorted_bids and sorted_asks and sorted_bids[0][0] >= sorted_asks[0][0]:
+                crossed_ask_p = sorted_asks[0][0]
+                book["asks"].pop(crossed_ask_p, None)
+                sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])
+
+            # Keep top 20 levels in local book
+            book["bids"] = dict(sorted_bids[:50])
+            book["asks"] = dict(sorted_asks[:50])
+
+            return product_id, sorted_bids[:20], sorted_asks[:20], exchange_ts_ms
 
         elif msg_type == "ticker":
             time_str = data.get("time")
             exchange_ts_ms = _parse_iso_to_epoch_ms(time_str) if time_str else local_ts_ms
-
-            best_bid = data.get("best_bid")
-            best_bid_size = data.get("best_bid_size", "1.0")
-            best_ask = data.get("best_ask")
-            best_ask_size = data.get("best_ask_size", "1.0")
-
-            if best_bid and best_ask:
-                p_bid = float(best_bid)
-                p_ask = float(best_ask)
-                book["bids"][p_bid] = float(best_bid_size)
-                book["asks"][p_ask] = float(best_ask_size)
-
-                sorted_bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:10]
-                sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])[:10]
-                return product_id, sorted_bids, sorted_asks, exchange_ts_ms
+            best_bid = float(data.get("best_bid", 0.0))
+            bid_size = float(data.get("best_bid_size", 0.0))
+            best_ask = float(data.get("best_ask", 0.0))
+            ask_size = float(data.get("best_ask_size", 0.0))
+            if best_bid > 0 and best_ask > 0:
+                return product_id, [(best_bid, bid_size)], [(best_ask, ask_size)], exchange_ts_ms
 
         return None

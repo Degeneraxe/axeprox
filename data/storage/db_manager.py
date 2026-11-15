@@ -147,7 +147,9 @@ class DatabaseManager:
             feature_window_json TEXT,
             vol_buy_bps REAL,
             vol_sell_bps REAL,
-            latency_threshold_ms REAL
+            latency_threshold_ms REAL,
+            is_suspect INTEGER NOT NULL DEFAULT 0,
+            lifetime_ticks_json TEXT
         );
         """)
 
@@ -159,6 +161,8 @@ class DatabaseManager:
             ("vol_buy_bps", "REAL"),
             ("vol_sell_bps", "REAL"),
             ("latency_threshold_ms", "REAL"),
+            ("is_suspect", "INTEGER DEFAULT 0"),
+            ("lifetime_ticks_json", "TEXT"),
         ]:
             if col_name not in existing_cols:
                 try:
@@ -268,8 +272,9 @@ class DatabaseManager:
                     event_id, symbol, buy_exchange, sell_exchange, open_time, close_time,
                     peak_spread_bps, open_spread_bps, cost_hurdle_bps, duration_ms,
                     log_duration, is_viable, is_right_censored,
-                    feature_window_json, vol_buy_bps, vol_sell_bps, latency_threshold_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    feature_window_json, vol_buy_bps, vol_sell_bps, latency_threshold_ms,
+                    is_suspect, lifetime_ticks_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 event["event_id"],
                 event["symbol"],
@@ -288,6 +293,8 @@ class DatabaseManager:
                 float(event["vol_buy_bps"]) if "vol_buy_bps" in event and event["vol_buy_bps"] is not None else None,
                 float(event["vol_sell_bps"]) if "vol_sell_bps" in event and event["vol_sell_bps"] is not None else None,
                 float(event["latency_threshold_ms"]) if "latency_threshold_ms" in event and event["latency_threshold_ms"] is not None else None,
+                1 if event.get("is_suspect", False) else 0,
+                event.get("lifetime_ticks_json"),
             ))
             self._sqlite_conn.commit()
 
@@ -315,7 +322,9 @@ class DatabaseManager:
                     log_duration = ?,
                     is_viable = ?,
                     is_right_censored = ?,
-                    latency_threshold_ms = COALESCE(?, latency_threshold_ms)
+                    latency_threshold_ms = COALESCE(?, latency_threshold_ms),
+                    is_suspect = COALESCE(?, is_suspect),
+                    lifetime_ticks_json = COALESCE(?, lifetime_ticks_json)
                 WHERE event_id = ?
             """, (
                 close_ms,
@@ -324,7 +333,9 @@ class DatabaseManager:
                 updates.get("log_duration"),
                 1 if updates.get("is_viable", False) else 0,
                 1 if updates.get("is_right_censored", False) else 0,
-                updates.get("latency_threshold_ms"),
+                float(updates["latency_threshold_ms"]) if "latency_threshold_ms" in updates and updates["latency_threshold_ms"] is not None else None,
+                1 if updates.get("is_suspect") else 0 if "is_suspect" in updates else None,
+                updates.get("lifetime_ticks_json"),
                 event_id,
             ))
             self._sqlite_conn.commit()

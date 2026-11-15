@@ -64,10 +64,12 @@ class ActiveSpreadEvent:
     latency_threshold_ms: float = 85.0
     is_closed: bool = False
     is_right_censored: bool = False
+    is_suspect: bool = False
     close_time_ms: Optional[float] = None
     duration_ms: Optional[float] = None
     log_duration: Optional[float] = None
     is_viable: bool = False
+    lifetime_ticks: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class SpreadTracker:
@@ -204,21 +206,33 @@ class SpreadTracker:
         # 1. Existing ongoing event for this pair
         if key in self.active_events:
             event = self.active_events[key]
+
+            # Record tick observed during event's lifetime (Task 3)
+            tick_record = {
+                "time_ms": now_ms,
+                "gross_spread_bps": round(float(candidate.gross_spread_bps), 4),
+                "buy_ask": float(candidate.buy_ask),
+                "sell_bid": float(candidate.sell_bid),
+                "hurdle_bps": round(float(candidate.total_hurdle_bps), 4),
+            }
+            event.lifetime_ticks.append(tick_record)
+            event.tick_count += 1
+            event.last_seen_ms = now_ms
+
+            # Update peak spread on every tick (Task 3)
+            if candidate.gross_spread_bps > event.peak_spread_bps:
+                event.peak_spread_bps = candidate.gross_spread_bps
+
             # Check for right-censoring timeout (Amendment 5)
             if (now_ms - event.open_time_ms) >= self.max_window_ms:
-                self._close_event(key, now_ms, right_censored=True)
-                return None
+                return self._close_event(key, now_ms, right_censored=True)
 
-            # Still active? (Candidate is still positive gross spread)
-            if candidate.gross_spread_bps > 0:
-                event.last_seen_ms = now_ms
-                event.tick_count += 1
-                if candidate.gross_spread_bps > event.peak_spread_bps:
-                    event.peak_spread_bps = candidate.gross_spread_bps
-                return event
-            else:
-                # Spread closed / collapsed
+            # Events must close when the spread actually falls below the hurdle (Task 3)
+            close_hurdle = event.cost_hurdle_bps if event.open_spread_bps >= event.cost_hurdle_bps else float(self.config.detection.gross_spread_threshold_bps)
+            if candidate.gross_spread_bps < close_hurdle:
                 return self._close_event(key, now_ms, right_censored=False)
+
+            return event
 
         # 2. No ongoing event -> open a new one if candidate meets detection criteria
         elif candidate.is_gross_candidate:
@@ -253,6 +267,16 @@ class SpreadTracker:
             if not feat_win or len(feat_win) < seq_len:
                 return None
 
+            tick_record = {
+                "time_ms": now_ms,
+                "gross_spread_bps": round(float(candidate.gross_spread_bps), 4),
+                "buy_ask": float(candidate.buy_ask),
+                "sell_bid": float(candidate.sell_bid),
+                "hurdle_bps": round(float(candidate.total_hurdle_bps), 4),
+            }
+            max_plausible = float(self.config.raw.get("detection", {}).get("max_plausible_spread_bps", 80.0))
+            is_suspect = (candidate.gross_spread_bps > max_plausible)
+
             new_event = ActiveSpreadEvent(
                 event_id=event_id,
                 symbol=candidate.symbol,
@@ -269,10 +293,12 @@ class SpreadTracker:
                 vol_buy_bps=v_buy,
                 vol_sell_bps=v_sell,
                 latency_threshold_ms=self.latency_hurdle_ms,
+                is_suspect=is_suspect,
+                lifetime_ticks=[tick_record],
             )
             self.active_events[key] = new_event
 
-            # Persist event at open with complete 20-step feature window and threshold (Requirement 1 & 3 & 4)
+            # Persist event at open with complete 20-step feature window, suspect flag, and ticks (Requirement 1 & 3 & 4)
             if self.db:
                 self.db.insert_spread_event({
                     "event_id": new_event.event_id,
@@ -287,6 +313,8 @@ class SpreadTracker:
                     "vol_buy_bps": new_event.vol_buy_bps,
                     "vol_sell_bps": new_event.vol_sell_bps,
                     "latency_threshold_ms": new_event.latency_threshold_ms,
+                    "is_suspect": new_event.is_suspect,
+                    "lifetime_ticks_json": json.dumps(new_event.lifetime_ticks),
                 })
             return new_event
 
@@ -323,7 +351,12 @@ class SpreadTracker:
         event.close_time_ms = float(close_time_ms)
         event.is_right_censored = right_censored
 
-        # Calculate duration
+        # Sanity gate: flag suspect spreads (Task 4)
+        max_plausible = float(self.config.raw.get("detection", {}).get("max_plausible_spread_bps", 80.0))
+        if event.open_spread_bps > max_plausible or event.peak_spread_bps > max_plausible:
+            event.is_suspect = True
+
+        # Calculate duration = real close time minus open time (Task 3)
         duration = max(1.0, event.close_time_ms - event.open_time_ms)
         event.duration_ms = duration
         event.log_duration = math.log(1.0 + duration) if self.use_log_duration else duration
@@ -334,7 +367,7 @@ class SpreadTracker:
 
         self.completed_events.append(event)
 
-        # Update in database with epoch ms timestamp (Requirement 4)
+        # Update in database with epoch ms timestamp, suspect flag, and lifetime ticks (Requirement 4 & Task 3, 4)
         if self.db:
             self.db.update_spread_event(event.event_id, {
                 "close_time": event.close_time_ms,  # Epoch ms
@@ -344,6 +377,8 @@ class SpreadTracker:
                 "is_viable": event.is_viable,
                 "is_right_censored": event.is_right_censored,
                 "latency_threshold_ms": event.latency_threshold_ms,
+                "is_suspect": event.is_suspect,
+                "lifetime_ticks_json": json.dumps(event.lifetime_ticks),
             })
 
         if self.on_event_closed:

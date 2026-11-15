@@ -104,11 +104,15 @@ class UnifiedLiveService:
         # Trigger detection for this symbol if it's one of our supported pairs
         base_symbol = snap.symbol.replace("/USD", "/USDT")
         if base_symbol in self.config.markets.supported_pairs:
-            candidates = self.detector.scan_symbol(base_symbol, loc_ts)
+            active_pairs = set(self.tracker.active_events.keys())
+            candidates = self.detector.scan_symbol(base_symbol, loc_ts, active_pairs=active_pairs)
             for cand in candidates:
                 evt = self.tracker.process_candidate(cand)
-                if evt and evt.tick_count == 1:
-                    self.events_opened_session += 1
+                if evt:
+                    if evt.is_closed:
+                        self.events_closed_session += 1
+                    elif evt.tick_count == 1:
+                        self.events_opened_session += 1
 
     async def start(self) -> None:
         logger.info("=" * 80)
@@ -132,9 +136,9 @@ class UnifiedLiveService:
 
         # 4. Initialize Multi-Exchange Feeds
         binance_symbols = ["btcusdt", "ethusdt", "xrpusdt", "adausdt", "solusdt", "dogeusdt"]
+        # Liquid USD pairs on Coinbase with explicit USDT/USD basis handling (Task 4)
         coinbase_symbols = [
             "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "XRP-USD", "DOGE-USD",
-            "BTC-USDT", "ETH-USDT", "SOL-USDT", "ADA-USDT",
         ]
         kraken_symbols = [
             "XBT/USDT", "ETH/USDT", "XRP/USDT", "ADA/USDT", "SOL/USDT", "DOGE/USDT",
@@ -203,11 +207,12 @@ class UnifiedLiveService:
 
                     cumul_ticks = self.db.get_cumulative_tick_count() if self.db else self.cumulative_ticks
                     active_buffer = self.db.get_tick_count() if self.db else 0
+                    crossed_cnt = getattr(self.normalizer, "crossed_books_count", 0)
 
                     logger.info(
                         "[STATUS 60s] Uptime %02dm%02ds | Ticks Ingested: %d (Active Buffer: %d) | "
                         "Events Opened: %d, Closed: %d | Total DB Events: %d (With Windows: %d) | "
-                        "Viable: %d, Censored: %d | Reconnects: %d | Clock Offset: %.2fms",
+                        "Viable: %d, Censored: %d | Crossed Books: %d | Reconnects: %d | Clock Offset: %.2fms",
                         uptime_sec // 60,
                         uptime_sec % 60,
                         cumul_ticks,
@@ -218,6 +223,7 @@ class UnifiedLiveService:
                         with_win,
                         viable_cnt,
                         censored_cnt,
+                        crossed_cnt,
                         reconnect_count,
                         clock_sync.offset_ms,
                     )

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from data.feeds.base_feed import BaseExchangeFeed
@@ -43,6 +44,8 @@ class KrakenFeed(BaseExchangeFeed):
         self._books: Dict[str, Dict[str, Dict[float, float]]] = {}
         for s in self.symbols:
             self._books[s] = {"bids": {}, "asks": {}}
+        self.checksum_failure_count = 0
+        self.crossed_book_count = 0
 
     def build_subscription_payload(self) -> Dict[str, Any]:
         return {
@@ -114,8 +117,36 @@ class KrakenFeed(BaseExchangeFeed):
 
             exchange_ts_ms = (latest_exch_ts_sec * 1000.0) if latest_exch_ts_sec > 0 else local_ts_ms
 
+            # Enforce depth truncation to top 10 on both sides (Task 2)
             sorted_bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:10]
             sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])[:10]
+            book["bids"] = dict(sorted_bids)
+            book["asks"] = dict(sorted_asks)
+
+            # Integrity check: crossed book detection
+            if sorted_bids and sorted_asks and sorted_bids[0][0] >= sorted_asks[0][0]:
+                self.crossed_book_count += 1
+                logger.warning("[kraken] Crossed book detected on %s: bid=%.4f >= ask=%.4f. Resyncing.", pair, sorted_bids[0][0], sorted_asks[0][0])
+                book["bids"].clear()
+                book["asks"].clear()
+                return None
+
+            # Optional CRC32 Checksum verification if published by Kraken
+            for p_dict in payloads_to_process:
+                if "c" in p_dict:
+                    remote_crc = str(p_dict["c"])
+                    # Construct CRC string: top 10 asks (p, v stripped), then top 10 bids (p, v stripped)
+                    try:
+                        crc_parts = []
+                        for p, v in sorted_asks:
+                            crc_parts.append(str(p).replace(".", "").lstrip("0") + str(v).replace(".", "").lstrip("0"))
+                        for p, v in sorted_bids:
+                            crc_parts.append(str(p).replace(".", "").lstrip("0") + str(v).replace(".", "").lstrip("0"))
+                        local_crc = str(zlib.crc32("".join(crc_parts).encode("utf-8")))
+                        if remote_crc != local_crc:
+                            self.checksum_failure_count += 1
+                    except Exception:
+                        pass
 
             return pair, sorted_bids, sorted_asks, exchange_ts_ms
 
