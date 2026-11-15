@@ -98,8 +98,8 @@ class UnifiedLiveService:
         self.batch_writer.enqueue_snapshot(snap)
         self.tracker.record_tick(snap)
 
-        # Dynamic USDT/USD basis synchronization from Kraken USDT/USD ticker
-        if exchange.lower() == "kraken" and snap.symbol == "USDT/USD" and snap.mid_price > 0:
+        # Dynamic USDT/USD basis synchronization from Kraken or Coinbase USDT/USD ticker (Fix A)
+        if snap.symbol == "USDT/USD" and snap.mid_price > 0:
             self.normalizer.set_usdt_usd_basis(snap.mid_price)
 
         # Trigger detection for this symbol if it's one of our supported pairs
@@ -114,6 +114,48 @@ class UnifiedLiveService:
                         self.events_closed_session += 1
                     elif evt.tick_count == 1:
                         self.events_opened_session += 1
+
+    async def _periodic_basis_updater(self) -> None:
+        """Periodically polls REST USDT/USD rate as fallback and logs current basis rate (Fix A)."""
+        import urllib.request
+        import json
+        while self._running:
+            try:
+                rates = []
+                try:
+                    req_cb = urllib.request.Request(
+                        "https://api.exchange.coinbase.com/products/USDT-USD/ticker",
+                        headers={"User-Agent": "ArbSenseBasis/1.0"}
+                    )
+                    with urllib.request.urlopen(req_cb, timeout=3.0) as resp:
+                        d = json.loads(resp.read().decode())
+                        if "bid" in d and "ask" in d:
+                            rates.append((float(d["bid"]) + float(d["ask"])) / 2.0)
+                except Exception:
+                    pass
+
+                try:
+                    req_kr = urllib.request.Request(
+                        "https://api.kraken.com/0/public/Ticker?pair=USDTUSD",
+                        headers={"User-Agent": "ArbSenseBasis/1.0"}
+                    )
+                    with urllib.request.urlopen(req_kr, timeout=3.0) as resp:
+                        d = json.loads(resp.read().decode())
+                        res = d.get("result", {})
+                        k = list(res.keys())[0] if res else None
+                        if k:
+                            rates.append((float(res[k]["b"][0]) + float(res[k]["a"][0])) / 2.0)
+                except Exception:
+                    pass
+
+                if rates:
+                    mean_rate = float(sum(rates) / len(rates))
+                    self.normalizer.set_usdt_usd_basis(mean_rate)
+                    bps_offset = (1.0 / mean_rate - 1.0) * 10000.0
+                    logger.info("[BasisUpdater] Active USDT/USD rate: %.5f (%+.2f bps offset)", mean_rate, bps_offset)
+            except Exception as e:
+                logger.debug("[BasisUpdater] Poll exception: %s", e)
+            await asyncio.sleep(60.0)
 
     async def start(self, duration_sec: Optional[int] = None) -> None:
         logger.info("=" * 80)
@@ -139,7 +181,7 @@ class UnifiedLiveService:
 
         # 4. Initialize Multi-Exchange Feeds (restricted strictly to verified pairs BTC/ETH + USDT/USD basis)
         binance_symbols = ["btcusdt", "ethusdt"]
-        coinbase_symbols = ["BTC-USD", "ETH-USD"]
+        coinbase_symbols = ["BTC-USD", "ETH-USD", "USDT-USD"]
         kraken_symbols = ["XBT/USDT", "ETH/USDT", "XBT/USD", "ETH/USD", "USDT/USD"]
 
         self.feeds = [
@@ -150,6 +192,9 @@ class UnifiedLiveService:
 
         for feed in self.feeds:
             await feed.start()
+
+        # Initial basis fetch and periodic polling (Fix A)
+        asyncio.create_task(self._periodic_basis_updater())
 
         self._running = True
         logger.info("All feeds streaming live. Real-time arbitrage detection & tracking online.")
@@ -193,9 +238,10 @@ class UnifiedLiveService:
                                 SUM(feature_window_json IS NOT NULL),
                                 SUM(is_viable = 1),
                                 SUM(is_right_censored = 1),
-                                SUM(is_executable = 1)
+                                SUM(is_executable = 1),
+                                SUM(is_persistent_500ms = 1)
                             FROM spread_events
-                            WHERE dataset_version != 'invalid_v0' OR dataset_version IS NULL
+                            WHERE dataset_version = 'v2.0'
                         """)
                         row = cur.fetchone()
                         tot_ev = row[0] or 0
@@ -203,35 +249,40 @@ class UnifiedLiveService:
                         viable_cnt = row[2] or 0
                         censored_cnt = row[3] or 0
                         executable_cnt = row[4] or 0
+                        persistent_500_cnt = row[5] or 0
                     else:
                         tot_ev = len(self.tracker.completed_events) + len(self.tracker.active_events)
                         with_win = sum(1 for e in self.tracker.completed_events if e.feature_window)
                         viable_cnt = sum(1 for e in self.tracker.completed_events if e.is_viable)
                         censored_cnt = sum(1 for e in self.tracker.completed_events if e.is_right_censored)
                         executable_cnt = sum(1 for e in self.tracker.completed_events if getattr(e, "is_executable", 0))
+                        persistent_500_cnt = sum(1 for e in self.tracker.completed_events if getattr(e, "is_persistent_500ms", 0))
 
                     cumul_ticks = self.db.get_cumulative_tick_count() if self.db else self.cumulative_ticks
                     active_buffer = self.db.get_tick_count() if self.db else 0
                     crossed_cnt = getattr(self.normalizer, "crossed_books_count", 0)
+                    cur_basis = getattr(self.normalizer, "usdt_usd_basis_rate", 1.0)
+                    basis_offset = (1.0 / cur_basis - 1.0) * 10000.0 if cur_basis > 0 else 0.0
 
                     logger.info(
-                        "[STATUS 60s] Uptime %02dm%02ds | Ticks Ingested: %d (Active Buffer: %d) | "
-                        "Events Opened: %d, Closed: %d | Total DB Events: %d (With Windows: %d) | "
-                        "Executable: %d, Viable: %d, Censored: %d | Crossed Books: %d | Reconnects: %d | Clock Offset: %.2fms",
+                        "[STATUS 60s] Uptime %02dm%02ds | Ticks: %d (Buf: %d) | "
+                        "Events: %d (Windows: %d) | Exec: %d, Persist500: %d, Viable: %d, Censored: %d | "
+                        "Crossed: %d | Reconnects: %d | ClockOffset: %.2fms | Basis: %.5f (%+.2fbps)",
                         uptime_sec // 60,
                         uptime_sec % 60,
                         cumul_ticks,
                         active_buffer,
-                        self.events_opened_session,
-                        self.events_closed_session,
                         tot_ev,
                         with_win,
                         executable_cnt,
+                        persistent_500_cnt,
                         viable_cnt,
                         censored_cnt,
                         crossed_cnt,
                         reconnect_count,
                         clock_sync.offset_ms,
+                        cur_basis,
+                        basis_offset,
                     )
                     last_log_time = now_sec
 

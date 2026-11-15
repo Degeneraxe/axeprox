@@ -134,8 +134,14 @@ def test_coinbase_usd_basis_adjustment():
     assert snap_usd.symbol == "BTC/USD"
     assert snap_usd.quote_currency == "USD"
 
-    # Basis rate: 1 USD = 1.0005 USDT
-    norm.set_usdt_usd_basis(1.0005)
+    # Basis rate: usdt_usd = 0.9993 (where 1 USDT = 0.9993 USD)
+    # Price in USDT = Price in USD / usdt_usd
+    norm.set_usdt_usd_basis(0.9993)
     adjusted_ask = snap_usd.get_adjusted_price(snap_usd.best_ask.price, target_quote="USDT", basis_rate=norm.usdt_usd_basis_rate)
-    assert adjusted_ask == pytest.approx(81510.0 * 1.0005)
+    assert adjusted_ask == pytest.approx(81510.0 / 0.9993)
+
+    # Inverse direction: USDT to USD = price * usdt_usd
+    snap_usdt = OrderBookSnapshot("binance", "BTC/USDT", "USDT", 1000.0, 1050.0, 50.0, asks=[OrderBookLevel(81510.0, 1.0)])
+    adjusted_usd = snap_usdt.get_adjusted_price(81510.0, target_quote="USD", basis_rate=0.9993)
+    assert adjusted_usd == pytest.approx(81510.0 * 0.9993)
 

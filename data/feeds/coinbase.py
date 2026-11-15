@@ -39,8 +39,7 @@ class CoinbaseFeed(BaseExchangeFeed):
         heartbeat_interval_sec: float = 15.0,
     ):
         target_symbols = symbols or [
-            "BTC-USDT", "ETH-USDT", "SOL-USDT", "ADA-USDT",
-            "BTC-USD", "ETH-USD", "XRP-USD", "ADA-USD", "SOL-USD"
+            "BTC-USD", "ETH-USD", "USDT-USD"
         ]
         super().__init__(
             exchange_name="coinbase",
@@ -104,11 +103,16 @@ class CoinbaseFeed(BaseExchangeFeed):
             sorted_bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)
             sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])
 
-            # Crossed-book sanity guard: remove crossed asks/bids if market jumped
-            while sorted_bids and sorted_asks and sorted_bids[0][0] >= sorted_asks[0][0]:
-                crossed_ask_p = sorted_asks[0][0]
-                book["asks"].pop(crossed_ask_p, None)
-                sorted_asks = sorted(book["asks"].items(), key=lambda x: x[0])
+            # Crossed-book sanity guard (Fix E): clear local book and resync instead of corrupting book by popping levels
+            if sorted_bids and sorted_asks and sorted_bids[0][0] >= sorted_asks[0][0]:
+                self.crossed_book_count = getattr(self, "crossed_book_count", 0) + 1
+                logger.warning(
+                    "[coinbase] Crossed book detected on %s: bid=%.4f >= ask=%.4f. Clearing book to resync.",
+                    product_id, sorted_bids[0][0], sorted_asks[0][0]
+                )
+                book["bids"].clear()
+                book["asks"].clear()
+                return None
 
             # Keep top 20 levels in local book
             book["bids"] = dict(sorted_bids[:50])

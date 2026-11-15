@@ -143,8 +143,13 @@ class CrossExchangeDetector:
                 )
                 net_spread_bps = gross_spread_bps - fee_bps
 
-                is_gross = gross_spread_bps >= self.gross_threshold_bps
-                is_net = gross_spread_bps >= hurdle_bps
+                # Fix D: Hysteresis + Minimum Open Threshold
+                hysteresis_bps = float(det_cfg.get("hysteresis_bps", 1.0))
+                min_open_bps = float(det_cfg.get("min_open_spread_bps", 2.0))
+                open_hurdle_bps = max(min_open_bps, hurdle_bps + hysteresis_bps)
+
+                is_gross = gross_spread_bps >= max(float(self.gross_threshold_bps), min_open_bps)
+                is_net = gross_spread_bps >= open_hurdle_bps
 
                 candidate = SpreadCandidate(
                     symbol=symbol,

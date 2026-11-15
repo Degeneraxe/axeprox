@@ -52,6 +52,8 @@ markets:
 detection:
   gross_spread_threshold_bps: 1.0  # Detect at low gross threshold (1 basis point = 0.01%)
   max_plausible_spread_bps: 80.0   # Configurable max plausible spread filter (flag suspect above 80 bps)
+  hysteresis_bps: 1.0              # Hysteresis buffer in bps to prevent microtick churn (Fix D)
+  min_open_spread_bps: 2.0         # Minimum open spread threshold in bps (Fix D)
   min_order_book_depth_levels: 5   # Top N levels maintained
   depth_snapshot_throttle_ms: 100   # Throttle full L2 snapshots (Amendment 6)
   min_depth_filter_enabled: true    # Top-N-levels notional must exceed configured trade size
@@ -111,9 +113,10 @@ labeling:
   execution_latency_assumption_ms: 50.0 # Default fallback if DB has < 10 measured transit ticks
   right_censored_max_window_ms: 30000   # Max tracking duration before flagging right-censored
   use_log_duration: true                # Target = log(1 + duration_ms)
+  persistence_horizons_ms: [500, 2000, 5000] # Persistence targets: duration_ms >= h
 
 dataset:
-  version: "v1.0"
+  version: "v2.0"
   viability_latency_threshold_ms: 85.0  # Fixed viability latency threshold per dataset version (Requirement 3: never recomputed at startup)
   train_ratio: 0.70
   val_ratio: 0.15
@@ -127,7 +130,7 @@ training:
   test_ratio: 0.15
   purge_gap_events: 5                   # Purge gap between train, val, and test splits (Amendment 6)
   min_events: 20                        # Strictly fail training if fewer than N real events exist
-  target_label: "is_executable"         # Fee-independent primary classification target (duration >= latency & peak >= slippage)
+  target_label: "is_persistent_500ms"   # Configurable primary classification target (frozen based on train split 50/50 balance)
 
 
 # Execution Simulator (Amendment 7)

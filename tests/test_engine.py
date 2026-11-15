@@ -626,7 +626,7 @@ def test_redesigned_labels_and_depth_slippage(tmp_path):
     assert row[1] == pytest.approx(closed_evt.slippage_bps)
     assert row[3] == 0  # is_profitable_retail
     assert row[5] == 1  # is_profitable_zero_maker
-    assert row[6] == "v1.0"
+    assert row[6] in ("v1.0", "v2.0")
     db.close()
 
 

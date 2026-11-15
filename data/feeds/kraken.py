@@ -64,10 +64,10 @@ class KrakenFeed(BaseExchangeFeed):
         if isinstance(data, dict):
             return None
 
-        # Data messages are lists: [channel_id, payload, channel_name, pair]
+        # Data messages are lists: [channel_id, payload, channel_name, pair] or with dual payload
         if isinstance(data, list) and len(data) >= 4:
+            pair = data[-1]  # The pair symbol is ALWAYS the final element in Kraken v1 messages
             payload = data[1]
-            pair = data[3]
 
             if pair not in self._books:
                 # Find matching book
@@ -77,19 +77,28 @@ class KrakenFeed(BaseExchangeFeed):
                 pair = matched
 
             book = self._books[pair]
+            if "asks_raw" not in book:
+                book["asks_raw"] = {}
+                book["bids_raw"] = {}
             latest_exch_ts_sec = 0.0
 
             # 1. Snapshot handling (contains "as" for asks snapshot and "bs" for bids snapshot)
             if "as" in payload and "bs" in payload:
                 book["asks"] = {}
                 book["bids"] = {}
+                book["asks_raw"] = {}
+                book["bids_raw"] = {}
                 for entry in payload["as"]:
-                    p, v, t = float(entry[0]), float(entry[1]), float(entry[2])
+                    p_str, v_str, t = entry[0], entry[1], float(entry[2])
+                    p, v = float(p_str), float(v_str)
                     book["asks"][p] = v
+                    book["asks_raw"][p] = (p_str, v_str)
                     latest_exch_ts_sec = max(latest_exch_ts_sec, t)
                 for entry in payload["bs"]:
-                    p, v, t = float(entry[0]), float(entry[1]), float(entry[2])
+                    p_str, v_str, t = entry[0], entry[1], float(entry[2])
+                    p, v = float(p_str), float(v_str)
                     book["bids"][p] = v
+                    book["bids_raw"][p] = (p_str, v_str)
                     latest_exch_ts_sec = max(latest_exch_ts_sec, t)
 
             # 2. Incremental updates (payload may contain "a" and/or "b", or data[2] can contain the other side)
@@ -100,20 +109,26 @@ class KrakenFeed(BaseExchangeFeed):
             for p_dict in payloads_to_process:
                 if "a" in p_dict:
                     for entry in p_dict["a"]:
-                        p, v, t = float(entry[0]), float(entry[1]), float(entry[2])
+                        p_str, v_str, t = entry[0], entry[1], float(entry[2])
+                        p, v = float(p_str), float(v_str)
                         latest_exch_ts_sec = max(latest_exch_ts_sec, t)
                         if v <= 0.0:
                             book["asks"].pop(p, None)
+                            book["asks_raw"].pop(p, None)
                         else:
                             book["asks"][p] = v
+                            book["asks_raw"][p] = (p_str, v_str)
                 if "b" in p_dict:
                     for entry in p_dict["b"]:
-                        p, v, t = float(entry[0]), float(entry[1]), float(entry[2])
+                        p_str, v_str, t = entry[0], entry[1], float(entry[2])
+                        p, v = float(p_str), float(v_str)
                         latest_exch_ts_sec = max(latest_exch_ts_sec, t)
                         if v <= 0.0:
                             book["bids"].pop(p, None)
+                            book["bids_raw"].pop(p, None)
                         else:
                             book["bids"][p] = v
+                            book["bids_raw"][p] = (p_str, v_str)
 
             exchange_ts_ms = (latest_exch_ts_sec * 1000.0) if latest_exch_ts_sec > 0 else local_ts_ms
 
@@ -129,22 +144,34 @@ class KrakenFeed(BaseExchangeFeed):
                 logger.warning("[kraken] Crossed book detected on %s: bid=%.4f >= ask=%.4f. Resyncing.", pair, sorted_bids[0][0], sorted_asks[0][0])
                 book["bids"].clear()
                 book["asks"].clear()
+                book["bids_raw"].clear()
+                book["asks_raw"].clear()
                 return None
 
-            # Optional CRC32 Checksum verification if published by Kraken
+            # CRC32 Checksum verification if published by Kraken
             for p_dict in payloads_to_process:
                 if "c" in p_dict:
                     remote_crc = str(p_dict["c"])
-                    # Construct CRC string: top 10 asks (p, v stripped), then top 10 bids (p, v stripped)
                     try:
                         crc_parts = []
                         for p, v in sorted_asks:
-                            crc_parts.append(str(p).replace(".", "").lstrip("0") + str(v).replace(".", "").lstrip("0"))
+                            p_str, v_str = book["asks_raw"].get(p, (str(p), str(v)))
+                            crc_parts.append(p_str.replace(".", "").lstrip("0") + v_str.replace(".", "").lstrip("0"))
                         for p, v in sorted_bids:
-                            crc_parts.append(str(p).replace(".", "").lstrip("0") + str(v).replace(".", "").lstrip("0"))
+                            p_str, v_str = book["bids_raw"].get(p, (str(p), str(v)))
+                            crc_parts.append(p_str.replace(".", "").lstrip("0") + v_str.replace(".", "").lstrip("0"))
                         local_crc = str(zlib.crc32("".join(crc_parts).encode("utf-8")))
                         if remote_crc != local_crc:
                             self.checksum_failure_count += 1
+                            logger.warning(
+                                "[kraken] CRC32 checksum mismatch on %s: remote=%s, local=%s. Clearing book to trigger resync.",
+                                pair, remote_crc, local_crc
+                            )
+                            book["bids"].clear()
+                            book["asks"].clear()
+                            book["bids_raw"].clear()
+                            book["asks_raw"].clear()
+                            return None
                     except Exception:
                         pass
 

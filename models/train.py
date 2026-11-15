@@ -63,16 +63,23 @@ def build_dataset_from_db(
     db.initialize()
     cur = db._sqlite_conn.cursor()
 
+    # If dataset_version is not explicitly specified and active_version is not in DB, fallback to valid versions present in DB
+    if dataset_version is None:
+        cur.execute("SELECT DISTINCT dataset_version FROM spread_events WHERE dataset_version NOT LIKE 'invalid%' AND dataset_version IS NOT NULL")
+        avail = [r[0] for r in cur.fetchall()]
+        if active_version not in avail and avail:
+            active_version = avail[-1]
+
     # Query completed spread events for the active dataset_version, strictly excluding invalid_v0 and suspect rows
     cur.execute("""
         SELECT * FROM spread_events 
         WHERE duration_ms IS NOT NULL 
           AND feature_window_json IS NOT NULL
-          AND (dataset_version = ? OR (dataset_version IS NULL AND ? = 'v1.0'))
-          AND (dataset_version != 'invalid_v0' OR dataset_version IS NULL)
+          AND (dataset_version = ? OR dataset_version IS NULL)
+          AND (dataset_version NOT LIKE 'invalid%' OR dataset_version IS NULL)
           AND (is_suspect = 0 OR is_suspect IS NULL)
         ORDER BY open_time ASC
-    """, (active_version, active_version))
+    """, (active_version,))
     events = [dict(r) for r in cur.fetchall()]
     db.close()
 
@@ -83,6 +90,9 @@ def build_dataset_from_db(
 
     class_balances = {
         "is_executable": {"pos": 0, "neg": 0},
+        "is_persistent_500ms": {"pos": 0, "neg": 0},
+        "is_persistent_2000ms": {"pos": 0, "neg": 0},
+        "is_persistent_5000ms": {"pos": 0, "neg": 0},
         "is_viable": {"pos": 0, "neg": 0},
         "is_profitable_retail": {"pos": 0, "neg": 0},
         "is_profitable_vip1": {"pos": 0, "neg": 0},
@@ -111,9 +121,17 @@ def build_dataset_from_db(
         # Target classification label
         lbl_val = int(evt.get(tgt_label, evt.get("is_executable", evt.get("is_viable", 0))) or 0)
 
-        # Track balances across all available label columns
+        # Track balances across all available label columns (persistence labels evaluated on non-censored only)
         for k in class_balances:
-            v = int(evt.get(k, 0) or 0)
+            if "persistent" in k:
+                if is_censored:
+                    continue
+                # If column not explicitly in DB row, derive from duration
+                h_ms = 500.0 if "500ms" in k else (2000.0 if "2000ms" in k else 5000.0)
+                v = int(evt.get(k, 1 if dur >= h_ms else 0) or 0)
+            else:
+                v = int(evt.get(k, 0) or 0)
+
             if v == 1:
                 class_balances[k]["pos"] += 1
             else:
@@ -203,6 +221,27 @@ def train_models(
     print(f"    - Train set size:      {len(splits.X_train)} samples")
     print(f"    - Validation set size: {len(splits.X_val)} samples")
     print(f"    - Test set size:       {len(splits.X_test)} samples (Unseen evaluation holdout)")
+
+    # Persistence target selection: evaluate non-censored training fold to choose horizon closest to 50/50 balance
+    uncens_mask_train = ~splits.censored_train
+    uncens_train_reg = splits.y_reg_train[uncens_mask_train]
+    print("\n" + "=" * 80)
+    print("PERSISTENCE HORIZON BALANCE (TRAINING SPLIT ONLY, Non-Censored)")
+    print("=" * 80)
+    best_horizon = None
+    min_dev = 999.0
+    for h_ms in [500, 2000, 5000]:
+        h_log = math.log(1.0 + h_ms)
+        h_pos = int(np.sum(uncens_train_reg >= h_log))
+        h_tot = len(uncens_train_reg)
+        h_pct = (h_pos / max(1, h_tot)) * 100.0
+        h_dev = abs(h_pct - 50.0)
+        print(f"  is_persistent_{h_ms}ms: {h_pos:>4} pos / {h_tot - h_pos:>4} neg ({h_pct:>5.1f}%) [|pct - 50%| = {h_dev:.1f}%]")
+        if h_dev < min_dev:
+            min_dev = h_dev
+            best_horizon = h_ms
+    print(f"[*] Optimal primary persistence target selected: is_persistent_{best_horizon}ms")
+    print("=" * 80)
 
     # 3. Class Imbalance Weighting (Weighted BCE)
     n_pos = float(np.sum(splits.y_cls_train == 1.0))

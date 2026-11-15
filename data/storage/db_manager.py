@@ -153,6 +153,9 @@ class DatabaseManager:
             dataset_version TEXT NOT NULL DEFAULT 'v1.0',
             slippage_bps REAL DEFAULT 0.0,
             is_executable INTEGER NOT NULL DEFAULT 0,
+            is_persistent_500ms INTEGER NOT NULL DEFAULT 0,
+            is_persistent_2000ms INTEGER NOT NULL DEFAULT 0,
+            is_persistent_5000ms INTEGER NOT NULL DEFAULT 0,
             net_peak_retail REAL DEFAULT 0.0,
             is_profitable_retail INTEGER NOT NULL DEFAULT 0,
             net_peak_vip1 REAL DEFAULT 0.0,
@@ -177,6 +180,9 @@ class DatabaseManager:
             ("dataset_version", "TEXT DEFAULT 'v1.0'"),
             ("slippage_bps", "REAL DEFAULT 0.0"),
             ("is_executable", "INTEGER DEFAULT 0"),
+            ("is_persistent_500ms", "INTEGER DEFAULT 0"),
+            ("is_persistent_2000ms", "INTEGER DEFAULT 0"),
+            ("is_persistent_5000ms", "INTEGER DEFAULT 0"),
             ("net_peak_retail", "REAL DEFAULT 0.0"),
             ("is_profitable_retail", "INTEGER DEFAULT 0"),
             ("net_peak_vip1", "REAL DEFAULT 0.0"),
@@ -192,7 +198,7 @@ class DatabaseManager:
                 except Exception:
                     pass
 
-        # Step 1 Requirement: Mark all historical events before the tracker fix as 'invalid_v0'
+        # Step 1 Requirement: Mark historical constant-duration runs as invalid_v0
         try:
             cur.execute("""
                 UPDATE spread_events 
@@ -377,6 +383,9 @@ class DatabaseManager:
                     dataset_version = COALESCE(?, dataset_version),
                     slippage_bps = COALESCE(?, slippage_bps),
                     is_executable = COALESCE(?, is_executable),
+                    is_persistent_500ms = COALESCE(?, is_persistent_500ms),
+                    is_persistent_2000ms = COALESCE(?, is_persistent_2000ms),
+                    is_persistent_5000ms = COALESCE(?, is_persistent_5000ms),
                     net_peak_retail = COALESCE(?, net_peak_retail),
                     is_profitable_retail = COALESCE(?, is_profitable_retail),
                     net_peak_vip1 = COALESCE(?, net_peak_vip1),
@@ -399,6 +408,9 @@ class DatabaseManager:
                 updates.get("dataset_version"),
                 updates.get("slippage_bps"),
                 1 if updates.get("is_executable") else 0 if "is_executable" in updates else None,
+                1 if updates.get("is_persistent_500ms") else 0 if "is_persistent_500ms" in updates else None,
+                1 if updates.get("is_persistent_2000ms") else 0 if "is_persistent_2000ms" in updates else None,
+                1 if updates.get("is_persistent_5000ms") else 0 if "is_persistent_5000ms" in updates else None,
                 updates.get("net_peak_retail"),
                 1 if updates.get("is_profitable_retail") else 0 if "is_profitable_retail" in updates else None,
                 updates.get("net_peak_vip1"),

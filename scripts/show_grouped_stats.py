@@ -14,7 +14,7 @@ import numpy as np
 from collections import defaultdict
 
 
-def main(db_path: str = "data/arbsense.db"):
+def main(db_path: str = "data/arbsense.db", version: str = "v2.0"):
     from data.storage.db_manager import DatabaseManager
     # Ensure migrations are applied if connecting to existing DB
     try:
@@ -28,9 +28,9 @@ def main(db_path: str = "data/arbsense.db"):
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
-    print("=" * 125)
-    print("FRESH RUN: DATABASE INTEGRITY & SUMMARY STATISTICS (Step 4)")
-    print("=" * 125)
+    print("=" * 135)
+    print(f"DATASET {version}: DATABASE INTEGRITY & SUMMARY STATISTICS (Step 5)")
+    print("=" * 135)
 
     c.execute("""
         SELECT 
@@ -40,6 +40,9 @@ def main(db_path: str = "data/arbsense.db"):
             SUM(is_right_censored = 1) as censored,
             SUM(is_suspect = 1) as suspect,
             SUM(is_executable = 1) as executable,
+            SUM(is_persistent_500ms = 1) as persist_500,
+            SUM(is_persistent_2000ms = 1) as persist_2000,
+            SUM(is_persistent_5000ms = 1) as persist_5000,
             SUM(is_profitable_retail = 1) as prof_retail,
             SUM(is_profitable_vip1 = 1) as prof_vip1,
             SUM(is_profitable_vip3 = 1) as prof_vip3,
@@ -47,8 +50,8 @@ def main(db_path: str = "data/arbsense.db"):
             MIN(open_time) as min_t,
             MAX(open_time) as max_t
         FROM spread_events
-        WHERE dataset_version != 'invalid_v0' OR dataset_version IS NULL
-    """)
+        WHERE dataset_version = ?
+    """, (version,))
     row = dict(c.fetchone())
     tot_ev = row["tot_ev"] or 0
     with_win = row["with_win"] or 0
@@ -56,6 +59,9 @@ def main(db_path: str = "data/arbsense.db"):
     censored = row["censored"] or 0
     suspect = row["suspect"] or 0
     executable = row["executable"] or 0
+    persist_500 = row["persist_500"] or 0
+    persist_2000 = row["persist_2000"] or 0
+    persist_5000 = row["persist_5000"] or 0
     min_t = row["min_t"]
     max_t = row["max_t"]
 
@@ -71,7 +77,7 @@ def main(db_path: str = "data/arbsense.db"):
     print(f"Total Spread Events Opened:      {tot_ev}")
     print(f"Events with 20-Step Windows:     {with_win} ({(with_win/max(1,tot_ev))*100:.1f}%)")
     print(f"Viable Events:                   {viable} ({(viable/max(1,tot_ev))*100:.2f}%)")
-    print(f"Right-Censored Events:           {censored} ({(censored/max(1,tot_ev))*100:.2f}%)")
+    print(f"Right-Censored Events:           {censored} ({(censored/max(1,tot_ev))*100:.2f}%) [Acceptance: <5%]")
     print(f"Suspect Flagged Events (>80bps): {suspect} ({(suspect/max(1,tot_ev))*100:.2f}%)")
     print(f"Earliest Event Time (Epoch ms):  {min_t}")
     print(f"Latest Event Time (Epoch ms):    {max_t}")
@@ -86,25 +92,30 @@ def main(db_path: str = "data/arbsense.db"):
         except Exception:
             pass
 
-    print("\n" + "=" * 125)
-    print("STEP 3 & 4: LABEL BALANCE ACROSS ALL TARGETS & FEE SCENARIOS")
-    print("=" * 125)
+    uncensored_count = tot_ev - censored
+
+    print("\n" + "=" * 135)
+    print("STEP 3: LABEL BALANCE ACROSS ALL TARGETS & HORIZONS (Non-Censored Only)")
+    print("=" * 135)
     labels_to_show = [
-        ("is_executable (Primary)", executable),
-        ("is_profitable_retail", row["prof_retail"] or 0),
-        ("is_profitable_vip1", row["prof_vip1"] or 0),
-        ("is_profitable_vip3", row["prof_vip3"] or 0),
-        ("is_profitable_zero_maker", row["prof_zero_maker"] or 0),
-        ("is_viable (Legacy)", viable),
+        ("is_persistent_500ms", persist_500, uncensored_count),
+        ("is_persistent_2000ms", persist_2000, uncensored_count),
+        ("is_persistent_5000ms", persist_5000, uncensored_count),
+        ("is_executable (Fee-Indep)", executable, tot_ev),
+        ("is_profitable_retail", row["prof_retail"] or 0, tot_ev),
+        ("is_profitable_vip1", row["prof_vip1"] or 0, tot_ev),
+        ("is_profitable_vip3", row["prof_vip3"] or 0, tot_ev),
+        ("is_profitable_zero_maker", row["prof_zero_maker"] or 0, tot_ev),
+        ("is_viable (Legacy)", viable, tot_ev),
     ]
-    for lbl_desc, pos_count in labels_to_show:
-        neg_count = tot_ev - pos_count
-        pos_pct = (pos_count / max(1, tot_ev)) * 100.0
+    for lbl_desc, pos_count, denom in labels_to_show:
+        neg_count = denom - pos_count
+        pos_pct = (pos_count / max(1, denom)) * 100.0
         print(f"  {lbl_desc:<32}: {pos_count:>5} positive / {neg_count:>5} negative ({pos_pct:>5.1f}%)")
 
-    print("\n" + "=" * 125)
-    print("GROUPED METRICS PER (SYMBOL, BUY, SELL) WITH AVG / P50 / P90 AND PROJECTIONS")
-    print("=" * 125)
+    print("\n" + "=" * 135)
+    print("GROUPED METRICS PER (SYMBOL, BUY, SELL, DIRECTION) WITH AVG / P50 / P90 AND CENSORED SHARE")
+    print("=" * 135)
 
     c.execute("""
         SELECT 
@@ -117,25 +128,27 @@ def main(db_path: str = "data/arbsense.db"):
             cost_hurdle_bps,
             feature_window_json,
             is_suspect,
+            is_right_censored,
             is_executable
         FROM spread_events
-        WHERE dataset_version != 'invalid_v0' OR dataset_version IS NULL
+        WHERE dataset_version = ?
         ORDER BY symbol, buy_exchange, sell_exchange
-    """)
+    """, (version,))
     all_events = [dict(r) for r in c.fetchall()]
 
-    # Group by (symbol, buy, sell)
+    # Group by (symbol, buy, sell, direction)
     groups = defaultdict(list)
     for ev in all_events:
-        key = (ev["symbol"], ev["buy_exchange"], ev["sell_exchange"])
+        direction = f"{ev['buy_exchange']}->{ev['sell_exchange']}"
+        key = (ev["symbol"], ev["buy_exchange"], ev["sell_exchange"], direction)
         groups[key].append(ev)
 
     header = (
-        f"{'Symbol':<9} {'Buy':<8} {'Sell':<8} {'N':<5} "
+        f"{'Symbol':<9} {'Direction':<20} {'N':<5} "
         f"{'Open bps (avg/p50/p90)':<24} "
         f"{'Peak bps (avg/p50/p90)':<24} "
         f"{'Duration ms (avg/p50/p90)':<26} "
-        f"{'Win':<4} {'Susp':<4} {'Ev/hr':<7} {'Est/day'}"
+        f"{'Win%':<6} {'Cens%':<6} {'Ev/hr':<7}"
     )
     print(header)
     print("-" * len(header))
@@ -143,16 +156,24 @@ def main(db_path: str = "data/arbsense.db"):
     # Sort groups by count descending
     sorted_keys = sorted(groups.keys(), key=lambda k: len(groups[k]), reverse=True)
 
+    cb_buy_count = 0
+    cb_sell_count = 0
+    cb_buy_opens = []
+    cb_sell_opens = []
+
     for k in sorted_keys:
         evs = groups[k]
         n = len(evs)
-        sym, buy_ex, sell_ex = k
+        sym, buy_ex, sell_ex, direction = k
 
         opens = [float(e["open_spread_bps"]) for e in evs if e["open_spread_bps"] is not None]
         peaks = [float(e["peak_spread_bps"]) for e in evs if e["peak_spread_bps"] is not None]
         durs = [float(e["duration_ms"]) for e in evs if e["duration_ms"] is not None]
         n_win = sum(1 for e in evs if e["feature_window_json"] is not None)
-        n_susp = sum(1 for e in evs if e.get("is_suspect", 0) == 1)
+        n_cens = sum(1 for e in evs if e.get("is_right_censored", 0) == 1)
+
+        win_pct = (n_win / max(1, n)) * 100.0
+        cens_pct = (n_cens / max(1, n)) * 100.0
 
         avg_o, p50_o, p90_o = np.mean(opens) if opens else 0.0, np.percentile(opens, 50) if opens else 0.0, np.percentile(opens, 90) if opens else 0.0
         avg_p, p50_p, p90_p = np.mean(peaks) if peaks else 0.0, np.percentile(peaks, 50) if peaks else 0.0, np.percentile(peaks, 90) if peaks else 0.0
@@ -163,22 +184,38 @@ def main(db_path: str = "data/arbsense.db"):
         d_str = f"{avg_d:.0f}/{p50_d:.0f}/{p90_d:.0f}"
 
         ev_per_hr = n / elapsed_hours
-        est_per_day = ev_per_hr * 24.0
 
         print(
-            f"{sym:<9} {buy_ex:<8} {sell_ex:<8} {n:<5} "
+            f"{sym:<9} {direction:<20} {n:<5} "
             f"{o_str:<24} "
             f"{p_str:<24} "
             f"{d_str:<26} "
-            f"{n_win:<4} {n_susp:<4} {ev_per_hr:<7.1f} {est_per_day:<7.0f}"
+            f"{win_pct:>5.1f}% {cens_pct:>5.1f}% {ev_per_hr:<7.1f}"
         )
+
+        if buy_ex == "coinbase":
+            cb_buy_count += n
+            cb_buy_opens.extend(opens)
+        if sell_ex == "coinbase":
+            cb_sell_count += n
+            cb_sell_opens.extend(opens)
+
+    print("\n" + "=" * 135)
+    print("COINBASE CROSS-DIRECTION SYMMETRY ANALYSIS (Acceptance Criteria)")
+    print("=" * 135)
+    cb_buy_avg = np.mean(cb_buy_opens) if cb_buy_opens else 0.0
+    cb_sell_avg = np.mean(cb_sell_opens) if cb_sell_opens else 0.0
+    print(f"  - Coinbase Buy Events:  N = {cb_buy_count:>4} | Avg Open Spread = {cb_buy_avg:+.2f} bps")
+    print(f"  - Coinbase Sell Events: N = {cb_sell_count:>4} | Avg Open Spread = {cb_sell_avg:+.2f} bps")
+    print(f"  - Cross-Direction Bias: {abs(cb_buy_avg - cb_sell_avg):.2f} bps (Acceptance: near 0 +/- a few bps, no ~12 bps offset)")
+    print("=" * 135)
 
     # Per-pair hourly and daily projections
     print("\n" + "=" * 125)
     print("PAIR-LEVEL EVENT FREQUENCY & DAILY PROJECTIONS")
     print("=" * 125)
     pair_counts = defaultdict(int)
-    for (sym, _, _), evs in groups.items():
+    for (sym, _, _, _), evs in groups.items():
         pair_counts[sym] += len(evs)
 
     for sym, cnt in sorted(pair_counts.items(), key=lambda x: x[1], reverse=True):
@@ -190,4 +227,7 @@ def main(db_path: str = "data/arbsense.db"):
 
 
 if __name__ == "__main__":
-    main()
+    v = "v2.0"
+    if len(sys.argv) > 1:
+        v = sys.argv[1]
+    main(version=v)

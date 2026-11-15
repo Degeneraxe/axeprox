@@ -61,13 +61,17 @@ class OrderBookSnapshot:
         return 0.0
 
     def get_adjusted_price(self, price: float, target_quote: str = "USDT", basis_rate: float = 1.0) -> float:
-        """Applies explicit basis adjustment when converting between USD and USDT."""
+        """Applies explicit basis adjustment when converting between USD and USDT.
+        
+        Formula: price_in_USDT = price_in_USD / usdt_usd (where basis_rate is USD per USDT, e.g. 0.9993)
+                 price_in_USD = price_in_USDT * usdt_usd
+        """
         if self.quote_currency == target_quote:
             return price
         if self.quote_currency == "USD" and target_quote == "USDT":
-            return price * basis_rate
+            return (price / basis_rate) if basis_rate > 0 else price
         if self.quote_currency == "USDT" and target_quote == "USD":
-            return price / basis_rate if basis_rate > 0 else price
+            return price * basis_rate
         return price
 
     def compute_imbalance(self, depth: int = 5) -> float:
@@ -149,6 +153,7 @@ class OrderBookNormalizer:
             "ADA-USD": "ADA/USD",
             "SOL-USD": "SOL/USD",
             "DOGE-USD": "DOGE/USD",
+            "USDT-USD": "USDT/USD",
         },
         "kraken": {
             "XBT/USDT": "BTC/USDT",
@@ -215,7 +220,8 @@ class OrderBookNormalizer:
             self.crossed_books_count += 1
             logger.warning("[BookIntegrity] Crossed book on %s %s: bid=%.4f >= ask=%.4f", exchange, norm_symbol, sorted_bids[0].price, sorted_asks[0].price)
 
-        transit_latency = max(0.0, local_ts_ms - exchange_ts_ms)
+        # Transit latency honesty (Fix B): maintain true measurement without artificial flooring
+        transit_latency = local_ts_ms - exchange_ts_ms
 
         snapshot = OrderBookSnapshot(
             exchange=exchange.lower(),
@@ -269,10 +275,15 @@ class OrderBookNormalizer:
         seq: List[List[float]] = []
         prev_spread = None
         prev_vel = None
+        basis_rate = getattr(self, "usdt_usd_basis_rate", 1.0000)
 
         for b_snap, s_snap in aligned_pairs:
             ask_buy = float(b_snap.best_ask.price) if b_snap.best_ask else 0.0
             bid_sell = float(s_snap.best_bid.price) if s_snap.best_bid else 0.0
+            if getattr(b_snap, "quote_currency", "USDT") != "USDT":
+                ask_buy = b_snap.get_adjusted_price(ask_buy, target_quote="USDT", basis_rate=basis_rate)
+            if getattr(s_snap, "quote_currency", "USDT") != "USDT":
+                bid_sell = s_snap.get_adjusted_price(bid_sell, target_quote="USDT", basis_rate=basis_rate)
             gross_bps = ((bid_sell - ask_buy) / ask_buy * 10000.0) if ask_buy > 0 else 0.0
 
             vel = (gross_bps - prev_spread) if prev_spread is not None else 0.0

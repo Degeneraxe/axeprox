@@ -82,6 +82,9 @@ class ActiveSpreadEvent:
     is_profitable_vip3: bool = False
     net_peak_zero_maker: float = 0.0
     is_profitable_zero_maker: bool = False
+    is_persistent_500ms: bool = False
+    is_persistent_2000ms: bool = False
+    is_persistent_5000ms: bool = False
 
 
 class SpreadTracker:
@@ -164,10 +167,22 @@ class SpreadTracker:
         seq: List[List[float]] = []
         prev_spread = None
         prev_vel = None
+        basis_rate = getattr(self.normalizer, "usdt_usd_basis_rate", 1.0000) if self.normalizer else 1.0000
 
         for b_tick, s_tick in aligned_pairs:
             ask_buy = float(b_tick.best_ask.price if hasattr(b_tick, "best_ask") and b_tick.best_ask else (b_tick.get("best_ask", 0.0) if isinstance(b_tick, dict) else 0.0))
             bid_sell = float(s_tick.best_bid.price if hasattr(s_tick, "best_bid") and s_tick.best_bid else (s_tick.get("best_bid", 0.0) if isinstance(s_tick, dict) else 0.0))
+            b_quote = getattr(b_tick, "quote_currency", "USDT") if not isinstance(b_tick, dict) else b_tick.get("quote_currency", "USDT")
+            s_quote = getattr(s_tick, "quote_currency", "USDT") if not isinstance(s_tick, dict) else s_tick.get("quote_currency", "USDT")
+            if b_quote == "USD" and hasattr(b_tick, "get_adjusted_price"):
+                ask_buy = b_tick.get_adjusted_price(ask_buy, target_quote="USDT", basis_rate=basis_rate)
+            elif b_quote == "USD" and basis_rate > 0:
+                ask_buy = ask_buy / basis_rate
+            if s_quote == "USD" and hasattr(s_tick, "get_adjusted_price"):
+                bid_sell = s_tick.get_adjusted_price(bid_sell, target_quote="USDT", basis_rate=basis_rate)
+            elif s_quote == "USD" and basis_rate > 0:
+                bid_sell = bid_sell / basis_rate
+
             gross_bps = ((bid_sell - ask_buy) / ask_buy * 10000.0) if ask_buy > 0 else 0.0
 
             vel = (gross_bps - prev_spread) if prev_spread is not None else 0.0
@@ -241,7 +256,10 @@ class SpreadTracker:
                 return self._close_event(key, now_ms, right_censored=True)
 
             # Events must close when the spread actually falls below the hurdle (Task 3)
-            close_hurdle = event.cost_hurdle_bps if event.open_spread_bps >= event.cost_hurdle_bps else float(self.config.detection.gross_spread_threshold_bps)
+            # Fix D: Hysteresis closure buffer (hurdle - hysteresis_bps)
+            det_cfg = self.config.raw.get("detection", {})
+            hysteresis_bps = float(det_cfg.get("hysteresis_bps", 1.0))
+            close_hurdle = (event.cost_hurdle_bps - hysteresis_bps) if event.open_spread_bps >= event.cost_hurdle_bps else float(self.config.detection.gross_spread_threshold_bps)
             if candidate.gross_spread_bps < close_hurdle:
                 return self._close_event(key, now_ms, right_censored=False)
 
@@ -406,6 +424,11 @@ class SpreadTracker:
         # Step 3 Label Definition: is_executable (fee-independent primary classification target)
         event.is_executable = (duration >= event.latency_threshold_ms) and (event.peak_spread_bps >= event.slippage_bps)
 
+        # Step 3 Label Definition: Persistence targets (duration >= h)
+        event.is_persistent_500ms = bool(duration >= 500.0)
+        event.is_persistent_2000ms = bool(duration >= 2000.0)
+        event.is_persistent_5000ms = bool(duration >= 5000.0)
+
         # Step 3 Label Definition: is_profitable_<scenario> for EVERY scenario in config
         scenarios = ["retail", "vip1", "vip3", "zero_maker"]
         for scen in scenarios:
@@ -432,6 +455,9 @@ class SpreadTracker:
                 "dataset_version": event.dataset_version,
                 "slippage_bps": event.slippage_bps,
                 "is_executable": event.is_executable,
+                "is_persistent_500ms": int(event.is_persistent_500ms),
+                "is_persistent_2000ms": int(event.is_persistent_2000ms),
+                "is_persistent_5000ms": int(event.is_persistent_5000ms),
                 "net_peak_retail": event.net_peak_retail,
                 "is_profitable_retail": event.is_profitable_retail,
                 "net_peak_vip1": event.net_peak_vip1,
