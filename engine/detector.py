@@ -91,6 +91,19 @@ class CrossExchangeDetector:
                 if p_buy_ask <= 0:
                     continue
 
+                # Defect 8: Map Coinbase / USD pairs with explicit basis adjustment or exclude them
+                if snap_buy.quote_currency != snap_sell.quote_currency:
+                    basis_cfg = self.config.raw.get("markets", {}).get("basis_tracking", {})
+                    if not basis_cfg.get("enabled", True):
+                        # If basis tracking is disabled, strictly exclude cross-currency quote comparisons
+                        continue
+                    # Explicit basis adjustment: adjust USD quotes to USDT equivalent
+                    rate = getattr(self.normalizer, "usdt_usd_basis_rate", 1.0000)
+                    if snap_buy.quote_currency == "USD":
+                        p_buy_ask = p_buy_ask * rate
+                    if snap_sell.quote_currency == "USD":
+                        p_sell_bid = p_sell_bid * rate
+
                 # Gross Spread in basis points: (Bid_B - Ask_A) / Ask_A * 10,000
                 gross_spread_bps = ((p_sell_bid - p_buy_ask) / p_buy_ask) * 10000.0
 

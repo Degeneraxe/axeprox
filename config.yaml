@@ -128,7 +128,7 @@ dynamic_hurdle:
 
 # Event Tracking & Machine Learning (Amendments 5 & 6)
 labeling:
-  execution_latency_assumption_ms: 85.0 # Measured empirical round-trip threshold for viability
+  execution_latency_assumption_ms: 50.0 # Default fallback if DB has < 10 measured transit ticks
   right_censored_max_window_ms: 30000   # Max tracking duration before flagging right-censored
   use_log_duration: true                # Target = log(1 + duration_ms)
 
@@ -138,6 +138,14 @@ dataset:
   test_ratio: 0.15
   purge_gap_events: 5                   # Purge gap between train, val, and test splits (Amendment 6)
   sequence_length: 20                   # LSTM lookback window
+
+training:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  purge_gap_events: 5                   # Purge gap between train, val, and test splits (Amendment 6)
+  min_events: 20                        # Strictly fail training if fewer than N real events exist
+
 
 # Execution Simulator (Amendment 7)
 simulation:

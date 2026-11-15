@@ -119,3 +119,23 @@ def test_stale_quote_filter():
     assert stale_snap is not None
     assert stale_snap.is_stale is True
     assert stale_snap.quote_age_ms == pytest.approx(2500.0)
+
+
+def test_coinbase_usd_basis_adjustment():
+    norm = OrderBookNormalizer()
+    snap_usd = norm.update_book(
+        exchange="coinbase",
+        raw_symbol="BTC-USD",
+        bids=[(81500.0, 1.0)],
+        asks=[(81510.0, 1.0)],
+        exchange_ts_ms=1000.0,
+        local_ts_ms=1050.0,
+    )
+    assert snap_usd.symbol == "BTC/USD"
+    assert snap_usd.quote_currency == "USD"
+
+    # Basis rate: 1 USD = 1.0005 USDT
+    norm.set_usdt_usd_basis(1.0005)
+    adjusted_ask = snap_usd.get_adjusted_price(snap_usd.best_ask.price, target_quote="USDT", basis_rate=norm.usdt_usd_basis_rate)
+    assert adjusted_ask == pytest.approx(81510.0 * 1.0005)
+

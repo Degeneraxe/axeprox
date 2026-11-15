@@ -61,9 +61,14 @@ class SpreadTracker:
         # Pair key: (symbol, buy_exchange, sell_exchange) -> ActiveSpreadEvent
         self.active_events: Dict[Tuple[str, str, str], ActiveSpreadEvent] = {}
 
-        # Configurable labeling parameters
+        # Labeling parameters: derive viability latency threshold from measured transit_latency_ms in DB
+        lat_stats = self.db.get_empirical_latency_stats() if self.db else {}
         lbl_cfg = self.config.raw.get("labeling", {})
-        self.latency_hurdle_ms = float(lbl_cfg.get("execution_latency_assumption_ms", 85.0))
+        if lat_stats and lat_stats.get("count", 0) >= 10:
+            self.latency_hurdle_ms = float(lat_stats["viability_threshold_ms"])
+        else:
+            self.latency_hurdle_ms = float(lbl_cfg.get("execution_latency_assumption_ms", 50.0))
+
         self.max_window_ms = float(lbl_cfg.get("right_censored_max_window_ms", 30000.0))
         self.use_log_duration = bool(lbl_cfg.get("use_log_duration", True))
 

@@ -322,6 +322,44 @@ class DatabaseManager:
             return cur.fetchone()[0]
         return 0
 
+    def get_empirical_latency_stats(self, exchange: Optional[str] = None) -> Dict[str, float]:
+        """Derives empirical latency distribution and viability latency threshold from measured transit_latency_ms in DB.
+        
+        Eliminates hardcoded latency assumptions (45/15/85) by computing live summary statistics
+        from real orderbook ticks recorded in the storage layer.
+        """
+        if not self._sqlite_conn:
+            return {}
+        cur = self._sqlite_conn.cursor()
+        query = "SELECT transit_latency_ms FROM orderbook_ticks WHERE transit_latency_ms IS NOT NULL AND transit_latency_ms > 0"
+        params: List[Any] = []
+        if exchange:
+            query += " AND exchange = ?"
+            params.append(exchange.lower())
+        cur.execute(query, params)
+        rows = [r[0] for r in cur.fetchall()]
+        if not rows:
+            return {}
+        import numpy as np
+        arr = np.array(rows, dtype=np.float64)
+        mean_val = float(np.mean(arr))
+        std_val = float(np.std(arr)) if len(arr) > 1 else 0.0
+        min_val = float(np.min(arr))
+        max_val = float(np.percentile(arr, 99)) if len(arr) >= 20 else float(np.max(arr))
+        median_val = float(np.median(arr))
+        # Viability threshold is the data-derived round-trip threshold (median observed transit latency)
+        viability_thresh = median_val
+        return {
+            "count": len(arr),
+            "mean_ms": mean_val,
+            "std_ms": std_val,
+            "min_ms": min_val,
+            "max_ms": max_val,
+            "median_ms": median_val,
+            "viability_threshold_ms": viability_thresh,
+        }
+
+
     def prune_old_ticks(self, keep_latest_per_symbol: int = 1500) -> int:
         """Prunes old ticks from SQLite to prevent disk bloat while keeping recent order book history."""
         if self._sqlite_conn:

@@ -12,6 +12,7 @@ from collections import deque
 from typing import Deque, Dict, Optional, Tuple
 
 from config.settings import AppConfig
+from models.features import compute_rolling_volatility_bps
 
 
 class CostModel:
@@ -33,16 +34,9 @@ class CostModel:
     def get_rolling_volatility_bps(self, symbol: str) -> float:
         """Computes sample standard deviation of relative price returns in basis points."""
         prices = self._price_history.get(symbol)
-        if not prices or len(prices) < 5:
+        if not prices:
             return 1.0  # Default 1 bp volatility baseline
-
-        # Compute log returns
-        p_list = list(prices)
-        returns = [math.log(p_list[i] / p_list[i - 1]) for i in range(1, len(p_list))]
-        mean_ret = sum(returns) / len(returns)
-        variance = sum((r - mean_ret) ** 2 for r in returns) / len(returns)
-        std_ret = math.sqrt(variance)
-        return std_ret * 10000.0  # Convert to basis points
+        return compute_rolling_volatility_bps(prices)
 
     def get_fee_bps(self, exchange: str, role: str = "taker", scenario: Optional[str] = None) -> float:
         """Returns fee in basis points for an exchange."""

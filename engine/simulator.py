@@ -60,12 +60,24 @@ class ExecutionSimulator:
         self.config = config or AppConfig.load()
         self.cost_model = cost_model or CostModel(self.config)
 
-        # Empirical latency distribution parameters (derived from live feed measurements in Phase 1)
-        # Fast-leg execution latency (Binance median was 24.8ms, Kraken 140ms)
-        self.latency_mean_ms = 45.0
-        self.latency_std_ms = 15.0
-        self.latency_min_ms = 15.0
-        self.latency_max_ms = 250.0
+        # Empirical latency distribution parameters derived from measured transit_latency_ms in DB
+        lat_stats = self.db.get_empirical_latency_stats() if self.db else {}
+        sim_cfg = self.config.raw.get("simulation", {})
+        cfg_lat = sim_cfg.get("latency", {})
+        lbl_cfg = self.config.raw.get("labeling", {})
+
+        if lat_stats and lat_stats.get("count", 0) >= 10:
+            self.latency_mean_ms = lat_stats["mean_ms"]
+            self.latency_std_ms = lat_stats["std_ms"]
+            self.latency_min_ms = lat_stats["min_ms"]
+            self.latency_max_ms = lat_stats["max_ms"]
+            self.viability_latency_threshold_ms = lat_stats["viability_threshold_ms"]
+        else:
+            self.latency_mean_ms = float(cfg_lat.get("mean_ms", 50.0))
+            self.latency_std_ms = float(cfg_lat.get("std_ms", 15.0))
+            self.latency_min_ms = float(cfg_lat.get("min_ms", 10.0))
+            self.latency_max_ms = float(cfg_lat.get("max_ms", 250.0))
+            self.viability_latency_threshold_ms = float(lbl_cfg.get("execution_latency_assumption_ms", 50.0))
 
         # Capital and balance state (Pre-funded inventory assumption)
         sim_cfg = self.config.raw.get("simulation", {})
@@ -188,33 +200,8 @@ class ExecutionSimulator:
         gross_pnl = (sell_vwap - buy_vwap) * filled_qty
         net_pnl = gross_pnl - (buy_fee_usdt + sell_fee_usdt)
 
-        # ZERO-LOSS VALIDATION GATEKEEPER:
-        # If order-book slippage causes net realized alpha to fall <= 0,
-        # reject the trade from the executed ledger to protect capital!
-        if net_pnl <= 0.0:
-            status = "REJECTED_SLIPPAGE_DEFICIT"
-            result = SimulatedTradeResult(
-                trade_id=trade_id,
-                event_id=event_id,
-                timestamp_iso=now_iso,
-                symbol=symbol,
-                buy_exchange=buy_snap.exchange,
-                sell_exchange=sell_snap.exchange,
-                target_quantity=target_qty,
-                filled_quantity=0.0,
-                buy_vwap=buy_vwap,
-                sell_vwap=sell_vwap,
-                buy_slippage_bps=buy_slippage_bps,
-                sell_slippage_bps=sell_slippage_bps,
-                buy_fee_usdt=0.0,
-                sell_fee_usdt=0.0,
-                gross_pnl_usdt=0.0,
-                net_pnl_usdt=0.0,
-                injected_latency_ms=injected_lat,
-                status=status,
-            )
-            return result
-
+        # Honest accounting: Record actual realized P&L at execution time (gains or losses).
+        # Capital decreases if slippage causes net realized loss; losing trades must be recorded.
         self.virtual_balance += net_pnl
 
         result = SimulatedTradeResult(

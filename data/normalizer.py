@@ -58,6 +58,16 @@ class OrderBookSnapshot:
             return self.best_ask.price - self.best_bid.price
         return 0.0
 
+    def get_adjusted_price(self, price: float, target_quote: str = "USDT", basis_rate: float = 1.0) -> float:
+        """Applies explicit basis adjustment when converting between USD and USDT."""
+        if self.quote_currency == target_quote:
+            return price
+        if self.quote_currency == "USD" and target_quote == "USDT":
+            return price * basis_rate
+        if self.quote_currency == "USDT" and target_quote == "USD":
+            return price / basis_rate if basis_rate > 0 else price
+        return price
+
     def compute_imbalance(self, depth: int = 5) -> float:
         """Computes Order Book Imbalance (OBI) across top k levels.
         

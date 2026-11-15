@@ -37,108 +37,139 @@ logger = logging.getLogger(__name__)
 
 
 def build_dataset_from_db(
-    db_path: str = "data/arbsense.db", seq_len: int = 20
+    db_path: str = "data/arbsense.db",
+    seq_len: int = 20,
+    min_events: Optional[int] = None,
 ) -> Tuple[List[np.ndarray], List[int], List[float], List[bool]]:
-    """Constructs sequential feature vectors and targets from real accumulated database ticks and events."""
+    """Constructs sequential feature vectors and targets strictly from real stored point-in-time ticks and events.
+    
+    Zero fabrication guarantee (Defect 1):
+    - Synthetic feature decay windows and tick-stride fallbacks are deleted.
+    - Samples are constructed strictly from point-in-time orderbook ticks preceding event open_time.
+    - Labels (is_viable, log_duration, is_right_censored) are taken strictly from tracker records.
+    - If fewer than min_events real events with complete point-in-time windows exist, raises ValueError.
+    """
+    config = AppConfig.load()
+    if min_events is None:
+        min_events = int(config.raw.get("training", {}).get("min_events", 20))
+
     db = DatabaseManager(sqlite_path=db_path)
     db.initialize()
     cur = db._sqlite_conn.cursor()
 
-    # Query completed spread events
-    cur.execute("SELECT * FROM spread_events ORDER BY open_time ASC")
+    # Query completed real spread events from tracker
+    cur.execute("""
+        SELECT * FROM spread_events 
+        WHERE duration_ms IS NOT NULL AND open_time IS NOT NULL
+        ORDER BY open_time ASC
+    """)
     events = [dict(r) for r in cur.fetchall()]
-
-    # If database has few events yet, extract event windows directly from recorded orderbook_ticks
-    cur.execute("SELECT * FROM orderbook_ticks ORDER BY id ASC")
-    ticks = [dict(r) for r in cur.fetchall()]
-    db.close()
 
     samples_X: List[np.ndarray] = []
     labels_cls: List[int] = []
     targets_reg: List[float] = []
     censored_flags: List[bool] = []
 
-    if len(events) >= 20:
-        # Build samples around tracked events
-        for evt in events:
-            # Synthetic feature window using event parameters + variance
-            dur = float(evt.get("duration_ms") or 50.0)
-            log_dur = float(evt.get("log_duration") or math.log(1.0 + dur))
-            is_viable = int(evt.get("is_viable", 0))
-            is_censored = bool(evt.get("is_right_censored", 0))
-            peak_bps = float(evt.get("peak_spread_bps", 2.0))
+    # Build point-in-time sequences preceding each spread event's open_time
+    for evt in events:
+        open_time = evt["open_time"]
+        sym = evt["symbol"]
+        buy_exch = evt["buy_exchange"].lower()
+        sell_exch = evt["sell_exchange"].lower()
 
-            seq = []
-            for t in range(seq_len):
-                decay = 1.0 - (t / seq_len) * 0.3
-                step_feat = [
-                    peak_bps * decay,
-                    -0.05 * t,
-                    0.01,
-                    0.3 * decay,
-                    -0.2 * decay,
-                    0.5 * decay,
-                    1.2,
-                    1.1,
-                    25.0 + (t % 3),
-                    140.0 + (t % 5),
-                    -115.0,
-                    1.0,
-                    1.0,
-                    peak_bps * decay * 0.8,
-                ]
-                seq.append(step_feat)
+        # Query real point-in-time ticks recorded strictly before or at event open_time
+        cur.execute("""
+            SELECT * FROM orderbook_ticks
+            WHERE symbol = ? AND time <= ? AND exchange IN (?, ?)
+            ORDER BY time ASC
+        """, (sym, open_time, buy_exch, sell_exch))
+        preceding_ticks = [dict(r) for r in cur.fetchall()]
 
-            samples_X.append(np.array(seq, dtype=np.float32))
-            labels_cls.append(is_viable)
-            targets_reg.append(log_dur)
-            censored_flags.append(is_censored)
+        buy_ticks = [t for t in preceding_ticks if t["exchange"].lower() == buy_exch]
+        sell_ticks = [t for t in preceding_ticks if t["exchange"].lower() == sell_exch]
 
-    elif len(ticks) >= 100:
-        # Extract sliding spread sequences from actual recorded ticks
-        # Use stride to sample 500-800 chronological event windows across the accumulated database
-        target_samples = 600
-        stride = max(1, len(ticks) // target_samples)
-        for i in range(seq_len, len(ticks) - 15, stride):
-            window = ticks[i - seq_len : i]
-            future = ticks[i : min(len(ticks), i + 20)]
+        # Require at least seq_len ticks to construct full point-in-time window without synthesis
+        if len(buy_ticks) < seq_len or len(sell_ticks) < seq_len:
+            continue
 
-            # Construct sequence
-            seq = []
-            for k in range(len(window)):
-                row = window[k]
-                gross_bps = (row["top_spread"] / max(1.0, row["mid_price"])) * 10000.0
-                step_feat = [
-                    gross_bps,
-                    0.0,
-                    0.0,
-                    float(row["imbalance"]),
-                    -float(row["imbalance"]) * 0.5,
-                    float(row["imbalance"]) * 1.5,
-                    1.2,
-                    1.0,
-                    float(row["transit_latency_ms"]),
-                    float(row["transit_latency_ms"]) + 50.0,
-                    -50.0,
-                    float(row["top_spread"]),
-                    float(row["top_spread"]),
-                    gross_bps * 0.5,
-                ]
-                seq.append(step_feat)
+        # Take the exact seq_len ticks preceding the event
+        buy_window = buy_ticks[-seq_len:]
+        sell_window = sell_ticks[-seq_len:]
 
-            # Ground truth from future ticks
-            future_spreads = [(f["top_spread"] / max(1.0, f["mid_price"])) * 10000.0 for f in future]
-            elevated = [s for s in future_spreads if s > 0.5]
-            duration_ms = len(elevated) * 100.0  # Approx 100ms per tick
-            log_dur = math.log(1.0 + max(1.0, duration_ms))
-            is_viable = 1 if duration_ms >= 85.0 and max(future_spreads or [0]) >= 1.0 else 0
+        # Extract real prices for shared rolling volatility calculation
+        buy_prices = [b["mid_price"] for b in buy_ticks]
+        sell_prices = [s["mid_price"] for s in sell_ticks]
+        from models.features import compute_rolling_volatility_bps
+        vol_buy = compute_rolling_volatility_bps(buy_prices)
+        vol_sell = compute_rolling_volatility_bps(sell_prices)
 
-            samples_X.append(np.array(seq, dtype=np.float32))
-            labels_cls.append(is_viable)
-            targets_reg.append(log_dur)
-            censored_flags.append(False)
+        seq = []
+        prev_spread = None
+        prev_vel = None
+        for step in range(seq_len):
+            b_tick = buy_window[step]
+            s_tick = sell_window[step]
+
+            # Cross-exchange spread at this historical point in time
+            ask_buy = float(b_tick["best_ask"])
+            bid_sell = float(s_tick["best_bid"])
+            gross_bps = ((bid_sell - ask_buy) / ask_buy * 10000.0) if ask_buy > 0 else 0.0
+
+            vel = (gross_bps - prev_spread) if prev_spread is not None else 0.0
+            acc = (vel - prev_vel) if prev_vel is not None else 0.0
+            prev_spread = gross_bps
+            prev_vel = vel
+
+            obi_b = float(b_tick["imbalance"])
+            obi_s = float(s_tick["imbalance"])
+            lat_b = float(b_tick["transit_latency_ms"])
+            lat_s = float(s_tick["transit_latency_ms"])
+            top_b = float(b_tick["top_spread"])
+            top_s = float(s_tick["top_spread"])
+            mp_diff = float(((s_tick["mid_price"] - b_tick["mid_price"]) / b_tick["mid_price"]) * 10000.0) if b_tick["mid_price"] > 0 else 0.0
+
+            step_feat = [
+                float(gross_bps),
+                float(vel),
+                float(acc),
+                float(obi_b),
+                float(obi_s),
+                float(obi_b - obi_s),
+                float(vol_buy),
+                float(vol_sell),
+                float(lat_b),
+                float(lat_s),
+                float(lat_b - lat_s),
+                float(top_b),
+                float(top_s),
+                float(mp_diff),
+            ]
+            seq.append(step_feat)
+
+        dur = float(evt["duration_ms"])
+        log_dur = float(evt.get("log_duration") or math.log(1.0 + max(1.0, dur)))
+        is_viable = int(evt.get("is_viable", 0))
+        is_censored = bool(evt.get("is_right_censored", 0))
+
+        samples_X.append(np.array(seq, dtype=np.float32))
+        labels_cls.append(is_viable)
+        targets_reg.append(log_dur)
+        censored_flags.append(is_censored)
+
+    db.close()
+
+    # Zero fabrication check: strictly fail if fewer than min_events exist
+    if len(samples_X) < min_events:
+        msg = (
+            f"Insufficient real events with point-in-time orderbook history "
+            f"(found {len(samples_X)} complete sample windows, required minimum {min_events}). "
+            f"Never fabricating synthetic or stride samples."
+        )
+        logger.error("[Training Pipeline] %s", msg)
+        raise ValueError(msg)
 
     return samples_X, labels_cls, targets_reg, censored_flags
+
 
 
 def train_models(
@@ -157,15 +188,22 @@ def train_models(
     samples_X, labels_cls, targets_reg, censored_flags = build_dataset_from_db(db_path=db_path)
     print(f"[*] Total dataset samples extracted from real ticks/events: {len(samples_X)}")
 
-    # 2. Chronological Walk-Forward Split with Purge Gap (Amendments 5 & 6)
+    # 2. Chronological Walk-Forward Split with Purge Gap read from config.yaml (Defect 6)
+    cfg = AppConfig.load()
+    train_cfg = cfg.raw.get("training", {})
+    dataset_cfg = cfg.raw.get("dataset", {})
+    train_ratio = float(train_cfg.get("train_ratio", dataset_cfg.get("train_ratio", 0.70)))
+    val_ratio = float(train_cfg.get("val_ratio", dataset_cfg.get("val_ratio", 0.15)))
+    purge_gap = int(train_cfg.get("purge_gap_events", dataset_cfg.get("purge_gap_events", 5)))
+
     splits = create_walk_forward_splits(
         samples_X=samples_X,
         labels_cls=labels_cls,
         targets_reg=targets_reg,
         censored_flags=censored_flags,
-        train_ratio=0.70,
-        val_ratio=0.15,
-        purge_gap=3,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        purge_gap=purge_gap,
     )
     print(f"    - Train set size:      {len(splits.X_train)} samples")
     print(f"    - Validation set size: {len(splits.X_val)} samples")
@@ -257,15 +295,15 @@ def train_models(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), best_ckpt_path)
+            best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"    [Early Stopping] Triggered at epoch {epoch}. Best Val Loss: {best_val_loss:.4f}")
                 break
 
-    # Load best checkpoint
-    model.load_state_dict(torch.load(best_ckpt_path))
+    # Load best weights
+    model.load_state_dict(best_weights)
     model.eval()
 
     # Calibrate decision threshold STRICTLY on the validation set (never test set)
@@ -283,6 +321,19 @@ def train_models(
             best_thresh = float(t_cand)
 
     print(f"    - Decision threshold calibrated on Validation set: {best_thresh:.2f} (Val F1: {best_val_f1:.3f})")
+
+    # Save complete unified checkpoint (Defect 5: weights + decision_threshold + scaler + feature_names)
+    checkpoint_payload = {
+        "model_state_dict": model.state_dict(),
+        "decision_threshold": float(best_thresh),
+        "scaler": {
+            "means": splits.scaler.means.tolist(),
+            "stds": splits.scaler.stds.tolist(),
+        },
+        "feature_names": FEATURE_NAMES,
+    }
+    torch.save(checkpoint_payload, best_ckpt_path)
+
 
     # 7. Train Baseline Model (Amendment: Logistic Regression & Ridge on pooled features)
     print("\n[Step 2] Training Baseline Model (Logistic Regression & Ridge)...")
@@ -327,4 +378,8 @@ def train_models(
 
 
 if __name__ == "__main__":
-    train_models()
+    try:
+        train_models()
+    except ValueError as err:
+        print(f"\n[Training Halted - Real Data Integrity Gate] {err}")
+        sys.exit(0)

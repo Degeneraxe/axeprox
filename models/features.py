@@ -44,6 +44,29 @@ def compute_microprice(snap: Any) -> float:
     return (p_ask * v_bid + p_bid * v_ask) / tot_vol
 
 
+def compute_rolling_volatility_bps(prices: Any, min_observations: int = 5) -> float:
+    """Computes sample standard deviation of relative price log-returns in basis points.
+    
+    Unified shared feature function used across both live streaming paths (CostModel,
+    Detector, LivePredictor) and offline training dataset generation (train.py).
+    """
+    p_list = list(prices) if not isinstance(prices, (list, np.ndarray)) else prices
+    if len(p_list) < min_observations:
+        return 1.0  # Default 1 bp baseline volatility when history is insufficient
+
+    p_arr = np.asarray(p_list, dtype=np.float64)
+    if np.any(p_arr <= 0):
+        return 1.0
+
+    returns = np.diff(np.log(p_arr))
+    if len(returns) == 0:
+        return 1.0
+
+    std_ret = float(np.std(returns, ddof=1)) if len(returns) > 1 else float(np.std(returns))
+    return float(std_ret * 10000.0)
+
+
+
 def extract_step_features(
     snap_buy: Any,
     snap_sell: Any,

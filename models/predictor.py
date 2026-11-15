@@ -32,35 +32,51 @@ class LiveSpreadPredictor:
         self.device = torch.device("cpu")
         self.history: Dict[Tuple[str, str, str], List[List[float]]] = {}
         self.is_loaded = False
+        self.decision_threshold: float = 0.50
+        self.feature_names: List[str] = []
         self.means: Optional[np.ndarray] = None
         self.stds: Optional[np.ndarray] = None
         self._load_model()
 
     def _load_model(self) -> None:
-        if self.scaler_path.exists():
-            try:
-                import json
-                with open(self.scaler_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.means = np.array(data["means"], dtype=np.float32)
-                self.stds = np.array(data["stds"], dtype=np.float32)
-                self.stds[self.stds < 1e-6] = 1.0
-            except Exception as e:
-                logger.warning("[AI Predictor] Could not load scaler: %s", e)
+        """Loads trained PyTorch LSTM checkpoint with unified decision threshold, scaler, and feature list.
+        
+        Strictness guarantee (Defect 5):
+        Heuristic fallbacks are disabled. Raises FileNotFoundError if checkpoint is missing.
+        """
+        if not self.checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Model checkpoint not found at {self.checkpoint_path}. "
+                f"Heuristic fallback is disabled; real trained checkpoint required."
+            )
 
-        if self.checkpoint_path.exists():
-            try:
-                self.model = MultiHeadSpreadLSTM(input_dim=14, hidden_dim=64, num_layers=2)
-                state_dict = torch.load(self.checkpoint_path, map_location=self.device)
-                self.model.load_state_dict(state_dict)
-                self.model.eval()
-                self.is_loaded = True
-                logger.info("[AI Predictor] Loaded PyTorch LSTM checkpoint from %s", self.checkpoint_path)
-            except Exception as e:
-                logger.error("[AI Predictor] Failed loading checkpoint: %s", e)
-                self.is_loaded = False
-        else:
-            logger.warning("[AI Predictor] Checkpoint not found at %s. Operating in heuristic mode.", self.checkpoint_path)
+        try:
+            self.model = MultiHeadSpreadLSTM(input_dim=14, hidden_dim=64, num_layers=2)
+            payload = torch.load(self.checkpoint_path, map_location=self.device)
+
+            if isinstance(payload, dict) and "model_state_dict" in payload:
+                self.model.load_state_dict(payload["model_state_dict"])
+                self.decision_threshold = float(payload.get("decision_threshold", 0.50))
+                scaler_dict = payload.get("scaler", {})
+                if "means" in scaler_dict and "stds" in scaler_dict:
+                    self.means = np.array(scaler_dict["means"], dtype=np.float32)
+                    self.stds = np.array(scaler_dict["stds"], dtype=np.float32)
+                    self.stds[self.stds < 1e-6] = 1.0
+                self.feature_names = payload.get("feature_names", [])
+            else:
+                self.model.load_state_dict(payload)
+                self.decision_threshold = 0.50
+
+            self.model.eval()
+            self.is_loaded = True
+            logger.info(
+                "[AI Predictor] Loaded PyTorch LSTM checkpoint from %s (Threshold: %.2f)",
+                self.checkpoint_path, self.decision_threshold
+            )
+        except Exception as e:
+            logger.error("[AI Predictor] Failed loading checkpoint: %s", e)
+            self.is_loaded = False
+            raise RuntimeError(f"Failed loading checkpoint from {self.checkpoint_path}: {e}") from e
 
     def predict_opportunity(
         self,
@@ -73,10 +89,13 @@ class LiveSpreadPredictor:
         
         Returns:
             Tuple of:
-            - is_viable_predicted: bool
+            - is_viable_predicted: bool (conf >= decision_threshold)
             - predicted_duration_ms: float
             - viability_confidence: float (0.0 to 1.0)
         """
+        if not self.is_loaded or self.model is None:
+            raise RuntimeError(f"Predictor model is not loaded from {self.checkpoint_path}.")
+
         key = (symbol, buy_snap.exchange, sell_snap.exchange)
         if key not in self.history:
             self.history[key] = []
@@ -90,28 +109,20 @@ class LiveSpreadPredictor:
         if len(self.history[key]) > self.seq_len:
             self.history[key].pop(0)
 
-        # If model is loaded, run neural inference
-        if self.is_loaded and self.model is not None:
-            current_seq = list(self.history[key])
-            while len(current_seq) < self.seq_len:
-                current_seq.insert(0, step_feats)
+        current_seq = list(self.history[key])
+        while len(current_seq) < self.seq_len:
+            current_seq.insert(0, step_feats)
 
-            arr_in = np.array(current_seq, dtype=np.float32)
-            if self.means is not None and self.stds is not None:
-                arr_in = (arr_in - self.means) / self.stds
+        arr_in = np.array(current_seq, dtype=np.float32)
+        if self.means is not None and self.stds is not None:
+            arr_in = (arr_in - self.means) / self.stds
 
-            tensor_in = torch.from_numpy(np.expand_dims(arr_in, axis=0))
-            with torch.no_grad():
-                pred_prob, pred_log_dur = self.model(tensor_in)
-                conf = float(pred_prob.item())
-                log_dur = float(pred_log_dur.item())
-                dur_ms = max(50.0, float(math.expm1(np.clip(log_dur, 0, 15))))
-                is_viable = conf >= 0.40
+        tensor_in = torch.from_numpy(np.expand_dims(arr_in, axis=0))
+        with torch.no_grad():
+            pred_prob, pred_log_dur = self.model(tensor_in)
+            conf = float(pred_prob.item())
+            log_dur = float(pred_log_dur.item())
+            dur_ms = max(50.0, float(math.expm1(np.clip(log_dur, 0, 15))))
+            is_viable = conf >= self.decision_threshold
 
-            return is_viable, dur_ms, conf
-
-        # Fallback heuristic if checkpoint not loaded
-        is_viable = gross_spread_bps > 1.0
-        dur_ms = 350.0 if is_viable else 45.0
-        conf = 0.85 if is_viable else 0.30
         return is_viable, dur_ms, conf

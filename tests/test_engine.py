@@ -161,3 +161,18 @@ def test_execution_simulator_vwap_and_pnl():
     )
     assert prof_result.status == "FILLED"
     assert prof_result.net_pnl_usdt > 0.0
+
+    # Also verify honest recording of losing trade when fees exceed gross alpha (Defect 3)
+    bal_before = simulator.virtual_balance
+    losing_result = simulator.execute_arbitrage(
+        symbol="BTC/USDT",
+        buy_snap=buy_snap,
+        sell_snap=sell_snap,
+        opportunity_duration_ms=500.0,
+        quantity=0.05,
+        fee_scenario="retail",  # Retail taker fees (~40-60 bps) exceed the ~36 bps spread
+    )
+    assert losing_result.status == "FILLED"
+    assert losing_result.net_pnl_usdt < 0.0
+    assert simulator.virtual_balance == pytest.approx(bal_before + losing_result.net_pnl_usdt)
+
