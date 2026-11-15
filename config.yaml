@@ -29,43 +29,20 @@ markets:
   supported_pairs:
     - "BTC/USDT"
     - "ETH/USDT"
-    - "XRP/USDT"
-    - "ADA/USDT"
-    - "SOL/USDT"
-    - "DOGE/USDT"
   exchange_symbols:
     binance:
       "BTC/USDT": "btcusdt"
       "ETH/USDT": "ethusdt"
-      "XRP/USDT": "xrpusdt"
-      "ADA/USDT": "adausdt"
-      "SOL/USDT": "solusdt"
-      "DOGE/USDT": "dogeusdt"
     coinbase:
       "BTC/USDT": "BTC-USD"
       "ETH/USDT": "ETH-USD"
-      "XRP/USDT": "XRP-USD"
-      "ADA/USDT": "ADA-USD"
-      "SOL/USDT": "SOL-USD"
-      "DOGE/USDT": "DOGE-USD"
       "BTC/USD": "BTC-USD"
       "ETH/USD": "ETH-USD"
-      "XRP/USD": "XRP-USD"
-      "ADA/USD": "ADA-USD"
-      "SOL/USD": "SOL-USD"
-      "DOGE/USD": "DOGE-USD"
     kraken:
       "BTC/USDT": "XBT/USDT"
       "ETH/USDT": "ETH/USDT"
-      "XRP/USDT": "XRP/USDT"
-      "ADA/USDT": "ADA/USDT"
-      "SOL/USDT": "SOL/USDT"
-      "DOGE/USDT": "DOGE/USDT"
       "BTC/USD": "XBT/USD"
       "ETH/USD": "ETH/USD"
-      "XRP/USD": "XRP/USD"
-      "ADA/USD": "ADA/USD"
-      "SOL/USD": "SOL/USD"
   basis_tracking:
     enabled: true
     usdt_usd_peg_threshold_bps: 10.0 # Alert if USDT/USD deviates by > 10 bps (0.10%)
@@ -150,6 +127,7 @@ training:
   test_ratio: 0.15
   purge_gap_events: 5                   # Purge gap between train, val, and test splits (Amendment 6)
   min_events: 20                        # Strictly fail training if fewer than N real events exist
+  target_label: "is_executable"         # Fee-independent primary classification target (duration >= latency & peak >= slippage)
 
 
 # Execution Simulator (Amendment 7)

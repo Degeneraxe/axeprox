@@ -40,29 +40,39 @@ def build_dataset_from_db(
     db_path: str = "data/arbsense.db",
     seq_len: int = 20,
     min_events: Optional[int] = None,
-) -> Tuple[List[np.ndarray], List[int], List[float], List[bool]]:
+    dataset_version: Optional[str] = None,
+    target_label: Optional[str] = None,
+    return_stats: bool = False,
+) -> Any:
     """Constructs sequential feature vectors and targets directly from persisted spread events in DB.
     
-    Requirement 1:
-    - Reads persisted 20-step point-in-time feature windows (feature_window_json) directly from spread_events.
-    - Does NOT query raw orderbook_ticks for training samples.
-    - Preserves training data permanently even when raw ticks are pruned.
-    - If fewer than min_events persisted feature windows exist, raises ValueError (Zero Fabrication Guarantee).
+    Step 1 & Step 3 Implementation:
+    - Queries ONLY the active dataset_version and strictly excludes 'invalid_v0' rows.
+    - Excludes suspect-flagged events (is_suspect = 1).
+    - Configurable classification target (default: 'is_executable').
+    - Reports class balance across all labels (is_executable and is_profitable_<scenario>).
     """
     config = AppConfig.load()
     if min_events is None:
         min_events = int(config.raw.get("training", {}).get("min_events", 20))
 
+    active_version = dataset_version or config.raw.get("dataset", {}).get("version", "v1.0")
+    tgt_label = target_label or config.raw.get("training", {}).get("target_label", "is_executable")
+
     db = DatabaseManager(sqlite_path=db_path)
     db.initialize()
     cur = db._sqlite_conn.cursor()
 
-    # Query completed real spread events from tracker with persisted feature windows
+    # Query completed spread events for the active dataset_version, strictly excluding invalid_v0 and suspect rows
     cur.execute("""
         SELECT * FROM spread_events 
-        WHERE duration_ms IS NOT NULL AND feature_window_json IS NOT NULL
+        WHERE duration_ms IS NOT NULL 
+          AND feature_window_json IS NOT NULL
+          AND (dataset_version = ? OR (dataset_version IS NULL AND ? = 'v1.0'))
+          AND (dataset_version != 'invalid_v0' OR dataset_version IS NULL)
+          AND (is_suspect = 0 OR is_suspect IS NULL)
         ORDER BY open_time ASC
-    """)
+    """, (active_version, active_version))
     events = [dict(r) for r in cur.fetchall()]
     db.close()
 
@@ -70,6 +80,15 @@ def build_dataset_from_db(
     labels_cls: List[int] = []
     targets_reg: List[float] = []
     censored_flags: List[bool] = []
+
+    class_balances = {
+        "is_executable": {"pos": 0, "neg": 0},
+        "is_viable": {"pos": 0, "neg": 0},
+        "is_profitable_retail": {"pos": 0, "neg": 0},
+        "is_profitable_vip1": {"pos": 0, "neg": 0},
+        "is_profitable_vip3": {"pos": 0, "neg": 0},
+        "is_profitable_zero_maker": {"pos": 0, "neg": 0},
+    }
 
     import json
     for evt in events:
@@ -87,24 +106,36 @@ def build_dataset_from_db(
         seq = raw_seq[-seq_len:]
         dur = float(evt["duration_ms"])
         log_dur = float(evt.get("log_duration") or math.log(1.0 + max(1.0, dur)))
-        is_viable = int(evt.get("is_viable", 0))
         is_censored = bool(evt.get("is_right_censored", 0))
 
+        # Target classification label
+        lbl_val = int(evt.get(tgt_label, evt.get("is_executable", evt.get("is_viable", 0))) or 0)
+
+        # Track balances across all available label columns
+        for k in class_balances:
+            v = int(evt.get(k, 0) or 0)
+            if v == 1:
+                class_balances[k]["pos"] += 1
+            else:
+                class_balances[k]["neg"] += 1
+
         samples_X.append(np.array(seq, dtype=np.float32))
-        labels_cls.append(is_viable)
+        labels_cls.append(lbl_val)
         targets_reg.append(log_dur)
         censored_flags.append(is_censored)
 
     # Zero fabrication check: strictly fail if fewer than min_events exist
     if len(samples_X) < min_events:
         msg = (
-            f"Insufficient real events with persisted feature windows in DB "
+            f"Insufficient real events with persisted feature windows in DB for version '{active_version}' "
             f"(found {len(samples_X)} complete sample windows, required minimum {min_events}). "
             f"Never fabricating synthetic or stride samples."
         )
         logger.error("[Training Pipeline] %s", msg)
         raise ValueError(msg)
 
+    if return_stats:
+        return samples_X, labels_cls, targets_reg, censored_flags, class_balances
     return samples_X, labels_cls, targets_reg, censored_flags
 
 
@@ -116,20 +147,46 @@ def train_models(
     batch_size: int = 16,
     lr: float = 1e-3,
     checkpoint_dir: str = "models/checkpoints",
+    target_label: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Runs end-to-end model training, validation, early stopping, and comparative evaluation."""
     print("=" * 80)
     print("ArbSense AI Engine Training Pipeline (PyTorch LSTM vs Baseline)")
     print("=" * 80)
 
-    # 1. Load Data
-    samples_X, labels_cls, targets_reg, censored_flags = build_dataset_from_db(db_path=db_path)
-    print(f"[*] Total dataset samples extracted from real ticks/events: {len(samples_X)}")
-
-    # 2. Chronological Walk-Forward Split with Purge Gap read from config.yaml (Defect 6)
     cfg = AppConfig.load()
     train_cfg = cfg.raw.get("training", {})
     dataset_cfg = cfg.raw.get("dataset", {})
+    tgt_label = target_label or train_cfg.get("target_label", "is_executable")
+
+    # 1. Load Data with full label statistics
+    samples_X, labels_cls, targets_reg, censored_flags, class_balances = build_dataset_from_db(
+        db_path=db_path,
+        target_label=tgt_label,
+        return_stats=True,
+    )
+    print(f"[*] Total dataset samples extracted from real ticks/events: {len(samples_X)}")
+
+    # Step 3: Report class balance per label and per scenario
+    print("\n" + "=" * 80)
+    print("CLASS BALANCE PER LABEL AND FEE SCENARIO (Current Dataset Version)")
+    print("=" * 80)
+    for lbl_name, counts in class_balances.items():
+        tot = counts["pos"] + counts["neg"]
+        pct = (counts["pos"] / max(1, tot)) * 100.0
+        print(f"  {lbl_name:<26}: {counts['pos']:>4} positive / {counts['neg']:>4} negative ({pct:>5.1f}%)")
+    print("=" * 80)
+
+    # Check requirement: "If positives for a label are fewer than 30, do not train a classifier on it; report the count instead."
+    pos_count_target = class_balances.get(tgt_label, {}).get("pos", sum(1 for y in labels_cls if y == 1))
+    should_train_classifier = (pos_count_target >= 30)
+    if not should_train_classifier:
+        print(f"\n[!] Target label '{tgt_label}' has {pos_count_target} positive samples (< 30 required).")
+        print(f"    Per requirement: Classifier training bypassed; reporting counts only. Training regression head on log_duration.")
+    else:
+        print(f"\n[*] Target label '{tgt_label}' has {pos_count_target} positive samples (>= 30 required). Training dual-head classifier + regressor.")
+
+    # 2. Chronological Walk-Forward Split with Purge Gap read from config.yaml (Defect 6)
     train_ratio = float(train_cfg.get("train_ratio", dataset_cfg.get("train_ratio", 0.70)))
     val_ratio = float(train_cfg.get("val_ratio", dataset_cfg.get("val_ratio", 0.15)))
     purge_gap = int(train_cfg.get("purge_gap_events", dataset_cfg.get("purge_gap_events", 5)))
@@ -152,7 +209,7 @@ def train_models(
     n_neg = float(np.sum(splits.y_cls_train == 0.0))
     pos_weight_val = (n_neg / max(1.0, n_pos)) if n_pos > 0 else 1.0
     pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32)
-    print(f"    - Class Distribution (Train): {int(n_pos)} viable / {int(n_neg)} non-viable (pos_weight = {pos_weight_val:.2f})")
+    print(f"    - Class Distribution (Train): {int(n_pos)} pos / {int(n_neg)} neg (pos_weight = {pos_weight_val:.2f})")
 
     # 4. Prepare PyTorch DataLoaders
     train_ds = TensorDataset(
@@ -197,8 +254,11 @@ def train_models(
             optimizer.zero_grad()
             pred_cls, pred_reg = model(batch_x)
 
-            # Classification loss (Weighted BCE)
-            loss_cls = F.binary_cross_entropy(pred_cls, batch_y_cls, weight=torch.where(batch_y_cls == 1.0, pos_weight, 1.0))
+            # Classification loss (Weighted BCE) only if classifier training is active
+            if should_train_classifier:
+                loss_cls = F.binary_cross_entropy(pred_cls, batch_y_cls, weight=torch.where(batch_y_cls == 1.0, pos_weight, 1.0))
+            else:
+                loss_cls = torch.tensor(0.0)
 
             # Regression loss on uncensored samples
             uncens_mask = ~batch_cens
@@ -207,7 +267,7 @@ def train_models(
             else:
                 loss_reg = torch.tensor(0.0)
 
-            total_loss = loss_cls + 0.5 * loss_reg
+            total_loss = (loss_cls + 0.5 * loss_reg) if should_train_classifier else loss_reg
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
@@ -222,9 +282,16 @@ def train_models(
 
         with torch.no_grad():
             v_pred_cls, v_pred_reg = model(val_x)
-            v_loss_cls = F.binary_cross_entropy(v_pred_cls, val_y_cls)
-            v_loss_reg = F.smooth_l1_loss(v_pred_reg[~val_cens], val_y_reg[~val_cens])
-            val_loss = (v_loss_cls + 0.5 * v_loss_reg).item()
+            if should_train_classifier:
+                v_loss_cls = F.binary_cross_entropy(v_pred_cls, val_y_cls)
+            else:
+                v_loss_cls = torch.tensor(0.0)
+            uncens_val = ~val_cens
+            if uncens_val.sum() > 0:
+                v_loss_reg = F.smooth_l1_loss(v_pred_reg[uncens_val], val_y_reg[uncens_val])
+            else:
+                v_loss_reg = torch.tensor(0.0)
+            val_loss = (v_loss_cls + 0.5 * v_loss_reg).item() if should_train_classifier else v_loss_reg.item()
 
         if epoch % 5 == 0 or epoch == 1:
             print(f"    Epoch [{epoch:02d}/{epochs:02d}] Train Loss: {train_loss / len(train_loader):.4f} | Val Loss: {val_loss:.4f}")
@@ -245,20 +312,23 @@ def train_models(
     model.eval()
 
     # Calibrate decision threshold STRICTLY on the validation set (never test set)
-    with torch.no_grad():
-        v_cls_prob, _ = model(torch.tensor(splits.X_val, dtype=torch.float32))
-        v_probs = v_cls_prob.squeeze().numpy()
-
     best_thresh = 0.5
     best_val_f1 = 0.0
-    for t_cand in np.linspace(0.2, 0.8, 13):
-        from sklearn.metrics import f1_score
-        f1_cand = f1_score(splits.y_cls_val, (v_probs >= t_cand).astype(int), zero_division=0)
-        if f1_cand > best_val_f1:
-            best_val_f1 = f1_cand
-            best_thresh = float(t_cand)
+    if should_train_classifier:
+        with torch.no_grad():
+            v_cls_prob, _ = model(torch.tensor(splits.X_val, dtype=torch.float32))
+            v_probs = v_cls_prob.squeeze().numpy()
 
-    print(f"    - Decision threshold calibrated on Validation set: {best_thresh:.2f} (Val F1: {best_val_f1:.3f})")
+        for t_cand in np.linspace(0.2, 0.8, 13):
+            from sklearn.metrics import f1_score
+            f1_cand = f1_score(splits.y_cls_val, (v_probs >= t_cand).astype(int), zero_division=0)
+            if f1_cand > best_val_f1:
+                best_val_f1 = f1_cand
+                best_thresh = float(t_cand)
+
+        print(f"    - Decision threshold calibrated on Validation set: {best_thresh:.2f} (Val F1: {best_val_f1:.3f})")
+    else:
+        print(f"    - Decision threshold calibration skipped (classifier not trained; positives < 30)")
 
     # Save complete unified checkpoint (Defect 5: weights + decision_threshold + scaler + feature_names)
     checkpoint_payload = {
@@ -269,14 +339,15 @@ def train_models(
             "stds": splits.scaler.stds.tolist(),
         },
         "feature_names": FEATURE_NAMES,
+        "target_label": tgt_label,
+        "classifier_trained": should_train_classifier,
     }
     torch.save(checkpoint_payload, best_ckpt_path)
-
 
     # 7. Train Baseline Model (Amendment: Logistic Regression & Ridge on pooled features)
     print("\n[Step 2] Training Baseline Model (Logistic Regression & Ridge)...")
     baseline = BaselineModel()
-    baseline.fit(splits.X_train, splits.y_cls_train, splits.y_reg_train, splits.censored_train)
+    baseline.fit(splits.X_train, splits.y_cls_train, splits.y_reg_train, splits.censored_train, fit_classifier=should_train_classifier)
 
     # 8. Unseen Test Set Evaluation (Strict no test-set tuning rule)
     print("\n[Step 3] Evaluating on Unseen Chronological Test Set...")
@@ -305,6 +376,16 @@ def train_models(
         censored_flags=splits.censored_test,
         threshold=best_thresh,
     )
+
+    print("\n" + "=" * 80)
+    print("EVIDENCE: Comparative Evaluation Report (Test Set)")
+    print("=" * 80)
+    if not should_train_classifier:
+        print(f"NOTE: Classification metrics reflect {tgt_label} count report only ({pos_count_target} positive samples < 30).")
+    print(format_comparison_table(metrics_lstm, metrics_baseline))
+    print(f"\nBest Checkpoint saved: {best_ckpt_path}")
+
+    return metrics_lstm, metrics_baseline
 
     print("\n" + "=" * 80)
     print("EVIDENCE: Comparative Evaluation Report (Test Set)")

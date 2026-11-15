@@ -149,11 +149,22 @@ class DatabaseManager:
             vol_sell_bps REAL,
             latency_threshold_ms REAL,
             is_suspect INTEGER NOT NULL DEFAULT 0,
-            lifetime_ticks_json TEXT
+            lifetime_ticks_json TEXT,
+            dataset_version TEXT NOT NULL DEFAULT 'v1.0',
+            slippage_bps REAL DEFAULT 0.0,
+            is_executable INTEGER NOT NULL DEFAULT 0,
+            net_peak_retail REAL DEFAULT 0.0,
+            is_profitable_retail INTEGER NOT NULL DEFAULT 0,
+            net_peak_vip1 REAL DEFAULT 0.0,
+            is_profitable_vip1 INTEGER NOT NULL DEFAULT 0,
+            net_peak_vip3 REAL DEFAULT 0.0,
+            is_profitable_vip3 INTEGER NOT NULL DEFAULT 0,
+            net_peak_zero_maker REAL DEFAULT 0.0,
+            is_profitable_zero_maker INTEGER NOT NULL DEFAULT 0
         );
         """)
 
-        # Migration guard: ensure new feature persistence columns exist in existing spread_events tables
+        # Migration guard: ensure new feature persistence and label columns exist in existing spread_events tables
         cur.execute("PRAGMA table_info(spread_events);")
         existing_cols = {row[1] for row in cur.fetchall()}
         for col_name, col_type in [
@@ -163,12 +174,36 @@ class DatabaseManager:
             ("latency_threshold_ms", "REAL"),
             ("is_suspect", "INTEGER DEFAULT 0"),
             ("lifetime_ticks_json", "TEXT"),
+            ("dataset_version", "TEXT DEFAULT 'v1.0'"),
+            ("slippage_bps", "REAL DEFAULT 0.0"),
+            ("is_executable", "INTEGER DEFAULT 0"),
+            ("net_peak_retail", "REAL DEFAULT 0.0"),
+            ("is_profitable_retail", "INTEGER DEFAULT 0"),
+            ("net_peak_vip1", "REAL DEFAULT 0.0"),
+            ("is_profitable_vip1", "INTEGER DEFAULT 0"),
+            ("net_peak_vip3", "REAL DEFAULT 0.0"),
+            ("is_profitable_vip3", "INTEGER DEFAULT 0"),
+            ("net_peak_zero_maker", "REAL DEFAULT 0.0"),
+            ("is_profitable_zero_maker", "INTEGER DEFAULT 0"),
         ]:
             if col_name not in existing_cols:
                 try:
                     cur.execute(f"ALTER TABLE spread_events ADD COLUMN {col_name} {col_type};")
                 except Exception:
                     pass
+
+        # Step 1 Requirement: Mark all historical events before the tracker fix as 'invalid_v0'
+        try:
+            cur.execute("""
+                UPDATE spread_events 
+                SET dataset_version = 'invalid_v0'
+                WHERE (duration_ms IN (180.0, 350.0))
+                   OR (open_time = close_time)
+                   OR (duration_ms IS NOT NULL AND open_time == close_time);
+            """)
+            conn.commit()
+        except Exception:
+            pass
 
 
         cur.execute("""
@@ -273,8 +308,11 @@ class DatabaseManager:
                     peak_spread_bps, open_spread_bps, cost_hurdle_bps, duration_ms,
                     log_duration, is_viable, is_right_censored,
                     feature_window_json, vol_buy_bps, vol_sell_bps, latency_threshold_ms,
-                    is_suspect, lifetime_ticks_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_suspect, lifetime_ticks_json, dataset_version, slippage_bps,
+                    is_executable, net_peak_retail, is_profitable_retail,
+                    net_peak_vip1, is_profitable_vip1, net_peak_vip3, is_profitable_vip3,
+                    net_peak_zero_maker, is_profitable_zero_maker
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 event["event_id"],
                 event["symbol"],
@@ -295,6 +333,17 @@ class DatabaseManager:
                 float(event["latency_threshold_ms"]) if "latency_threshold_ms" in event and event["latency_threshold_ms"] is not None else None,
                 1 if event.get("is_suspect", False) else 0,
                 event.get("lifetime_ticks_json"),
+                str(event.get("dataset_version", "v1.0")),
+                float(event.get("slippage_bps", 0.0)),
+                1 if event.get("is_executable", False) else 0,
+                float(event.get("net_peak_retail", 0.0)),
+                1 if event.get("is_profitable_retail", False) else 0,
+                float(event.get("net_peak_vip1", 0.0)),
+                1 if event.get("is_profitable_vip1", False) else 0,
+                float(event.get("net_peak_vip3", 0.0)),
+                1 if event.get("is_profitable_vip3", False) else 0,
+                float(event.get("net_peak_zero_maker", 0.0)),
+                1 if event.get("is_profitable_zero_maker", False) else 0,
             ))
             self._sqlite_conn.commit()
 
@@ -324,7 +373,18 @@ class DatabaseManager:
                     is_right_censored = ?,
                     latency_threshold_ms = COALESCE(?, latency_threshold_ms),
                     is_suspect = COALESCE(?, is_suspect),
-                    lifetime_ticks_json = COALESCE(?, lifetime_ticks_json)
+                    lifetime_ticks_json = COALESCE(?, lifetime_ticks_json),
+                    dataset_version = COALESCE(?, dataset_version),
+                    slippage_bps = COALESCE(?, slippage_bps),
+                    is_executable = COALESCE(?, is_executable),
+                    net_peak_retail = COALESCE(?, net_peak_retail),
+                    is_profitable_retail = COALESCE(?, is_profitable_retail),
+                    net_peak_vip1 = COALESCE(?, net_peak_vip1),
+                    is_profitable_vip1 = COALESCE(?, is_profitable_vip1),
+                    net_peak_vip3 = COALESCE(?, net_peak_vip3),
+                    is_profitable_vip3 = COALESCE(?, is_profitable_vip3),
+                    net_peak_zero_maker = COALESCE(?, net_peak_zero_maker),
+                    is_profitable_zero_maker = COALESCE(?, is_profitable_zero_maker)
                 WHERE event_id = ?
             """, (
                 close_ms,
@@ -336,6 +396,17 @@ class DatabaseManager:
                 float(updates["latency_threshold_ms"]) if "latency_threshold_ms" in updates and updates["latency_threshold_ms"] is not None else None,
                 1 if updates.get("is_suspect") else 0 if "is_suspect" in updates else None,
                 updates.get("lifetime_ticks_json"),
+                updates.get("dataset_version"),
+                updates.get("slippage_bps"),
+                1 if updates.get("is_executable") else 0 if "is_executable" in updates else None,
+                updates.get("net_peak_retail"),
+                1 if updates.get("is_profitable_retail") else 0 if "is_profitable_retail" in updates else None,
+                updates.get("net_peak_vip1"),
+                1 if updates.get("is_profitable_vip1") else 0 if "is_profitable_vip1" in updates else None,
+                updates.get("net_peak_vip3"),
+                1 if updates.get("is_profitable_vip3") else 0 if "is_profitable_vip3" in updates else None,
+                updates.get("net_peak_zero_maker"),
+                1 if updates.get("is_profitable_zero_maker") else 0 if "is_profitable_zero_maker" in updates else None,
                 event_id,
             ))
             self._sqlite_conn.commit()

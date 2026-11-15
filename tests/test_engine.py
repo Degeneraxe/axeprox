@@ -484,6 +484,153 @@ def test_spread_tracker_suspect_gate_and_lifetime_ticks(tmp_path):
     db.close()
 
 
+def test_redesigned_labels_and_depth_slippage(tmp_path):
+    """Verifies Step 3 label redesign: is_executable, depth-walked slippage_bps, and multi-scenario profitability."""
+    from data.storage.db_manager import DatabaseManager
+    from engine.detector import SpreadCandidate
+    from engine.tracker import SpreadTracker, ActiveSpreadEvent
+
+    db_path = str(tmp_path / "label_test.db")
+    db = DatabaseManager(sqlite_path=db_path)
+    db.initialize()
+
+    tracker = SpreadTracker(db_manager=db)
+
+    # Warm up ring buffers with >= 20 ticks
+    for i in range(25):
+        t = 800.0 + i * 5.0
+        tracker.record_tick(OrderBookSnapshot("binance", "BTC/USDT", "USDT", t, t, 5.0, [OrderBookLevel(79990.0, 1.0)], [OrderBookLevel(80000.0, 1.0)]))
+        tracker.record_tick(OrderBookSnapshot("kraken", "BTC/USDT", "USDT", t, t, 5.0, [OrderBookLevel(80080.0, 1.0)], [OrderBookLevel(80090.0, 1.0)]))
+
+    # Buy snapshot on Binance: asks at 80000.0 (size 1.0) and 80010.0 (size 2.0)
+    # Sell snapshot on Kraken: bids at 80080.0 (size 1.0) and 80070.0 (size 2.0)
+    buy_snap = OrderBookSnapshot(
+        exchange="binance",
+        symbol="BTC/USDT",
+        quote_currency="USDT",
+        exchange_ts_ms=1000.0,
+        local_ts_ms=1005.0,
+        transit_latency_ms=5.0,
+        bids=[OrderBookLevel(price=79990.0, amount=1.0)],
+        asks=[OrderBookLevel(price=80000.0, amount=1.0), OrderBookLevel(price=80010.0, amount=2.0)],
+    )
+    sell_snap = OrderBookSnapshot(
+        exchange="kraken",
+        symbol="BTC/USDT",
+        quote_currency="USDT",
+        exchange_ts_ms=1000.0,
+        local_ts_ms=1010.0,
+        transit_latency_ms=10.0,
+        bids=[OrderBookLevel(price=80080.0, amount=1.0), OrderBookLevel(price=80070.0, amount=2.0)],
+        asks=[OrderBookLevel(price=80090.0, amount=1.0)],
+    )
+    tracker.record_tick(buy_snap)
+    tracker.record_tick(sell_snap)
+
+    # Gross spread = (80080 - 80000) / 80000 * 10000 = 10.0 bps
+    cand_open = SpreadCandidate(
+        symbol="BTC/USDT",
+        buy_exchange="binance",
+        sell_exchange="kraken",
+        buy_ask=80000.0,
+        sell_bid=80080.0,
+        gross_spread_bps=10.0,
+        net_spread_bps=5.0,
+        total_hurdle_bps=5.0,
+        fee_bps=5.0,
+        vol_buffer_bps=0.0,
+        is_gross_candidate=True,
+        is_net_profitable=True,
+        timestamp_ms=1000.0,
+        quote_age_buy_ms=5.0,
+        quote_age_sell_ms=5.0,
+    )
+
+    evt = tracker.process_candidate(cand_open)
+    assert evt is not None
+    assert evt.is_closed is False
+
+    # Spread expands to 35.0 bps at t = 1100.0 ms (below 80 bps max plausible)
+    cand_peak = SpreadCandidate(
+        symbol="BTC/USDT",
+        buy_exchange="binance",
+        sell_exchange="kraken",
+        buy_ask=80000.0,
+        sell_bid=80280.0,
+        gross_spread_bps=35.0,
+        net_spread_bps=30.0,
+        total_hurdle_bps=5.0,
+        fee_bps=5.0,
+        vol_buffer_bps=0.0,
+        is_gross_candidate=True,
+        is_net_profitable=True,
+        timestamp_ms=1100.0,
+        quote_age_buy_ms=5.0,
+        quote_age_sell_ms=5.0,
+    )
+    tracker.process_candidate(cand_peak)
+
+    # Spread collapses below hurdle (to 2.0 bps) at t = 1200.0 ms -> event closes!
+    # Duration = 1200 - 1000 = 200 ms >= latency_threshold (85 ms)
+    cand_close = SpreadCandidate(
+        symbol="BTC/USDT",
+        buy_exchange="binance",
+        sell_exchange="kraken",
+        buy_ask=80000.0,
+        sell_bid=80016.0,
+        gross_spread_bps=2.0,
+        net_spread_bps=-3.0,
+        total_hurdle_bps=5.0,
+        fee_bps=5.0,
+        vol_buffer_bps=0.0,
+        is_gross_candidate=False,
+        is_net_profitable=False,
+        timestamp_ms=1200.0,
+        quote_age_buy_ms=5.0,
+        quote_age_sell_ms=5.0,
+    )
+    closed_evt = tracker.process_candidate(cand_close)
+    assert closed_evt is not None
+    assert closed_evt.is_closed is True
+    assert closed_evt.duration_ms == pytest.approx(200.0)
+    assert closed_evt.peak_spread_bps == pytest.approx(35.0)
+
+    # Slippage verification: depth walked at trade size (default 100 USDT)
+    # Trade size = 100 USDT << top level notional (80,000 USDT), so slippage ~ 0.0 bps
+    assert closed_evt.slippage_bps is not None
+    assert closed_evt.slippage_bps >= 0.0
+
+    # is_executable verification: duration (200ms) >= latency_threshold (85ms) and peak (35 bps) >= slippage (~0 bps)
+    assert closed_evt.is_executable == 1
+
+    # Scenarios:
+    # Retail fees for binance-kraken = ~51.5 bps hurdle
+    # Peak spread = 35.0 bps -> net_peak_retail = 35.0 - 51.5 = -16.5 bps < 0 -> is_profitable_retail = 0
+    assert closed_evt.is_profitable_retail == 0
+    assert closed_evt.net_peak_retail < 0.0
+
+    # Zero maker fees: hurdle = 29.0 bps -> net_peak_zero_maker = 35.0 - 29.0 = +6.0 bps > 0 -> is_profitable_zero_maker = 1
+    assert closed_evt.is_profitable_zero_maker == 1
+    assert closed_evt.net_peak_zero_maker == pytest.approx(6.0)
+
+    # Database verification
+    cur = db._sqlite_conn.cursor()
+    cur.execute("""
+        SELECT is_executable, slippage_bps, net_peak_retail, is_profitable_retail,
+               net_peak_zero_maker, is_profitable_zero_maker, dataset_version
+        FROM spread_events WHERE event_id = ?
+    """, (closed_evt.event_id,))
+    row = cur.fetchone()
+    assert row is not None
+    assert row[0] == 1  # is_executable
+    assert row[1] == pytest.approx(closed_evt.slippage_bps)
+    assert row[3] == 0  # is_profitable_retail
+    assert row[5] == 1  # is_profitable_zero_maker
+    assert row[6] == "v1.0"
+    db.close()
+
+
+
 
 
 

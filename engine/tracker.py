@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Deque
 
 from config.settings import AppConfig
 from data.storage.db_manager import DatabaseManager
+from engine.cost_model import CostModel
 from engine.detector import SpreadCandidate
 from models.features import asof_join_ticks, compute_rolling_volatility_bps, extract_step_features
 
@@ -70,6 +71,17 @@ class ActiveSpreadEvent:
     log_duration: Optional[float] = None
     is_viable: bool = False
     lifetime_ticks: List[Dict[str, Any]] = field(default_factory=list)
+    dataset_version: str = "v1.0"
+    slippage_bps: float = 0.0
+    is_executable: bool = False
+    net_peak_retail: float = 0.0
+    is_profitable_retail: bool = False
+    net_peak_vip1: float = 0.0
+    is_profitable_vip1: bool = False
+    net_peak_vip3: float = 0.0
+    is_profitable_vip3: bool = False
+    net_peak_zero_maker: float = 0.0
+    is_profitable_zero_maker: bool = False
 
 
 class SpreadTracker:
@@ -86,6 +98,7 @@ class SpreadTracker:
         self.config = config or AppConfig.load()
         self.on_event_closed = on_event_closed
         self.normalizer = normalizer
+        self.cost_model = CostModel(self.config)
 
         # In-memory per-(exchange, symbol) ring buffer used by both live inference and tracker (Requirement 3)
         if normalizer is not None and hasattr(normalizer, "ring_buffers"):
@@ -295,6 +308,7 @@ class SpreadTracker:
                 latency_threshold_ms=self.latency_hurdle_ms,
                 is_suspect=is_suspect,
                 lifetime_ticks=[tick_record],
+                dataset_version=self.dataset_version,
             )
             self.active_events[key] = new_event
 
@@ -315,6 +329,7 @@ class SpreadTracker:
                     "latency_threshold_ms": new_event.latency_threshold_ms,
                     "is_suspect": new_event.is_suspect,
                     "lifetime_ticks_json": json.dumps(new_event.lifetime_ticks),
+                    "dataset_version": new_event.dataset_version,
                 })
             return new_event
 
@@ -365,9 +380,44 @@ class SpreadTracker:
         # Viable = Stays open longer than the event's fixed dataset threshold AND peak spread exceeded total hurdle
         event.is_viable = (duration >= event.latency_threshold_ms) and (event.peak_spread_bps >= event.cost_hurdle_bps)
 
+        # Depth-walked slippage calculation at configured trade size (Step 3)
+        trade_sizes = self.config.raw.get("simulation", {}).get("trade_sizes", {})
+        qty = float(trade_sizes.get(event.symbol, 0.0))
+        if self.normalizer and qty > 0:
+            b_sym = event.symbol if (event.buy_exchange.lower(), event.symbol) in self.normalizer.books else event.symbol.replace("USDT", "USD")
+            s_sym = event.symbol if (event.sell_exchange.lower(), event.symbol) in self.normalizer.books else event.symbol.replace("USDT", "USD")
+            snap_buy = self.normalizer.get_snapshot(event.buy_exchange, b_sym, event.close_time_ms) or self.normalizer.books.get((event.buy_exchange.lower(), b_sym))
+            snap_sell = self.normalizer.get_snapshot(event.sell_exchange, s_sym, event.close_time_ms) or self.normalizer.books.get((event.sell_exchange.lower(), s_sym))
+            if snap_buy and snap_sell and snap_buy.best_ask and snap_sell.best_bid:
+                p_ask = snap_buy.best_ask.price
+                p_bid = snap_sell.best_bid.price
+                buy_res = snap_buy.compute_vwap("buy", qty)
+                buy_vwap = buy_res[0] if isinstance(buy_res, tuple) else buy_res
+                sell_res = snap_sell.compute_vwap("sell", qty)
+                sell_vwap = sell_res[0] if isinstance(sell_res, tuple) else sell_res
+                slip_buy = ((buy_vwap - p_ask) / p_ask * 10000.0) if p_ask > 0 and buy_vwap > 0 else 0.0
+                slip_sell = ((p_bid - sell_vwap) / p_bid * 10000.0) if p_bid > 0 and sell_vwap > 0 else 0.0
+                event.slippage_bps = max(0.0, round(slip_buy + slip_sell, 2))
+            else:
+                event.slippage_bps = 0.0
+        else:
+            event.slippage_bps = 0.0
+
+        # Step 3 Label Definition: is_executable (fee-independent primary classification target)
+        event.is_executable = (duration >= event.latency_threshold_ms) and (event.peak_spread_bps >= event.slippage_bps)
+
+        # Step 3 Label Definition: is_profitable_<scenario> for EVERY scenario in config
+        scenarios = ["retail", "vip1", "vip3", "zero_maker"]
+        for scen in scenarios:
+            hurdle, _, _ = self.cost_model.get_hurdle_bps(event.buy_exchange, event.sell_exchange, event.symbol, scenario=scen)
+            net_peak = round(event.peak_spread_bps - hurdle, 2)
+            is_prof = bool(net_peak > 0)
+            setattr(event, f"net_peak_{scen}", net_peak)
+            setattr(event, f"is_profitable_{scen}", is_prof)
+
         self.completed_events.append(event)
 
-        # Update in database with epoch ms timestamp, suspect flag, and lifetime ticks (Requirement 4 & Task 3, 4)
+        # Update in database with epoch ms timestamp, suspect flag, and redesigned labels (Step 1 & 3)
         if self.db:
             self.db.update_spread_event(event.event_id, {
                 "close_time": event.close_time_ms,  # Epoch ms
@@ -379,6 +429,17 @@ class SpreadTracker:
                 "latency_threshold_ms": event.latency_threshold_ms,
                 "is_suspect": event.is_suspect,
                 "lifetime_ticks_json": json.dumps(event.lifetime_ticks),
+                "dataset_version": event.dataset_version,
+                "slippage_bps": event.slippage_bps,
+                "is_executable": event.is_executable,
+                "net_peak_retail": event.net_peak_retail,
+                "is_profitable_retail": event.is_profitable_retail,
+                "net_peak_vip1": event.net_peak_vip1,
+                "is_profitable_vip1": event.is_profitable_vip1,
+                "net_peak_vip3": event.net_peak_vip3,
+                "is_profitable_vip3": event.is_profitable_vip3,
+                "net_peak_zero_maker": event.net_peak_zero_maker,
+                "is_profitable_zero_maker": event.is_profitable_zero_maker,
             })
 
         if self.on_event_closed:

@@ -338,3 +338,100 @@ def test_build_dataset_from_persisted_feature_windows(tmp_path):
     assert samples_X[0].shape == (20, 14)
 
 
+def test_dataset_version_filtering_and_invalid_v0_exclusion(tmp_path):
+    """Verifies that train.py strictly uses the active dataset_version and excludes 'invalid_v0' rows (Step 1)."""
+    import json
+    import sqlite3
+    from models.train import build_dataset_from_db
+
+    db_file = tmp_path / "version_test.db"
+    conn = sqlite3.connect(db_file)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE spread_events (
+            event_id TEXT PRIMARY KEY,
+            symbol TEXT,
+            buy_exchange TEXT,
+            sell_exchange TEXT,
+            open_time TEXT,
+            close_time TEXT,
+            peak_spread_bps REAL,
+            open_spread_bps REAL,
+            cost_hurdle_bps REAL,
+            duration_ms REAL,
+            log_duration REAL,
+            is_viable INTEGER,
+            is_executable INTEGER,
+            is_profitable_retail INTEGER,
+            is_profitable_vip1 INTEGER,
+            is_profitable_vip3 INTEGER,
+            is_profitable_zero_maker INTEGER,
+            is_right_censored INTEGER,
+            feature_window_json TEXT,
+            dataset_version TEXT,
+            is_suspect INTEGER
+        )
+    """)
+
+    dummy_seq = [[1.0] * 14 for _ in range(20)]
+    dummy_json = json.dumps(dummy_seq)
+
+    # 1. Insert 10 events with dataset_version = 'invalid_v0' (historical constant-duration events)
+    for i in range(10):
+        cur.execute("""
+            INSERT INTO spread_events (
+                event_id, symbol, buy_exchange, sell_exchange, open_time, close_time,
+                peak_spread_bps, open_spread_bps, cost_hurdle_bps, duration_ms,
+                log_duration, is_viable, is_executable, is_right_censored, feature_window_json,
+                dataset_version, is_suspect
+            ) VALUES (?, 'BTC/USDT', 'binance', 'kraken', '1000', '1180', 10.0, 10.0, 50.0, 180.0, 5.19, 0, 1, 0, ?, 'invalid_v0', 0)
+        """, (f"old_{i}", dummy_json))
+
+    # 2. Insert 22 events with dataset_version = 'v1.0' (current verified run)
+    for i in range(22):
+        cur.execute("""
+            INSERT INTO spread_events (
+                event_id, symbol, buy_exchange, sell_exchange, open_time, close_time,
+                peak_spread_bps, open_spread_bps, cost_hurdle_bps, duration_ms,
+                log_duration, is_viable, is_executable, is_right_censored, feature_window_json,
+                dataset_version, is_suspect
+            ) VALUES (?, 'BTC/USDT', 'binance', 'kraken', '1000', '1450', 12.0, 8.0, 50.0, 450.0, 6.11, 0, 1, 0, ?, 'v1.0', 0)
+        """, (f"v1_{i}", dummy_json))
+
+    # 3. Insert 5 events with dataset_version = 'v2.0' (different version)
+    for i in range(5):
+        cur.execute("""
+            INSERT INTO spread_events (
+                event_id, symbol, buy_exchange, sell_exchange, open_time, close_time,
+                peak_spread_bps, open_spread_bps, cost_hurdle_bps, duration_ms,
+                log_duration, is_viable, is_executable, is_right_censored, feature_window_json,
+                dataset_version, is_suspect
+            ) VALUES (?, 'BTC/USDT', 'binance', 'kraken', '1000', '1600', 15.0, 9.0, 50.0, 600.0, 6.40, 0, 1, 0, ?, 'v2.0', 0)
+        """, (f"v2_{i}", dummy_json))
+
+    conn.commit()
+    conn.close()
+
+    # Query v1.0: must find exactly the 22 v1.0 events, strictly excluding all 10 'invalid_v0' events and 5 'v2.0' events
+    samples_X, labels_cls, targets_reg, censored_flags, balances = build_dataset_from_db(
+        db_path=str(db_file),
+        dataset_version="v1.0",
+        target_label="is_executable",
+        min_events=20,
+        return_stats=True,
+    )
+    assert len(samples_X) == 22
+    assert len(labels_cls) == 22
+    assert balances["is_executable"]["pos"] == 22
+    assert balances["is_executable"]["neg"] == 0
+
+    # Querying invalid_v0 should fail or return 0 events because of the explicit exclusion
+    import pytest
+    with pytest.raises(ValueError, match="Insufficient real events"):
+        build_dataset_from_db(
+            db_path=str(db_file),
+            dataset_version="invalid_v0",
+            min_events=1,
+        )
+
+

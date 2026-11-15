@@ -96,6 +96,7 @@ class UnifiedLiveService:
         self.cumulative_ticks += 1
         self.tick_counts[exchange] = self.tick_counts.get(exchange, 0) + 1
         self.batch_writer.enqueue_snapshot(snap)
+        self.tracker.record_tick(snap)
 
         # Dynamic USDT/USD basis synchronization from Kraken USDT/USD ticker
         if exchange.lower() == "kraken" and snap.symbol == "USDT/USD" and snap.mid_price > 0:
@@ -114,9 +115,11 @@ class UnifiedLiveService:
                     elif evt.tick_count == 1:
                         self.events_opened_session += 1
 
-    async def start(self) -> None:
+    async def start(self, duration_sec: Optional[int] = None) -> None:
         logger.info("=" * 80)
         logger.info("ArbSense Unified Live Ingestion, Detection & Spread Tracking Engine")
+        if duration_sec:
+            logger.info("Configured Run Duration: %d seconds (%.1f minutes)", duration_sec, duration_sec / 60.0)
         logger.info("=" * 80)
 
         # 1. Sync Clock via NTP / REST fallback
@@ -134,16 +137,10 @@ class UnifiedLiveService:
         # 3. Start High-Throughput Batch Writer
         await self.batch_writer.start()
 
-        # 4. Initialize Multi-Exchange Feeds
-        binance_symbols = ["btcusdt", "ethusdt", "xrpusdt", "adausdt", "solusdt", "dogeusdt"]
-        # Liquid USD pairs on Coinbase with explicit USDT/USD basis handling (Task 4)
-        coinbase_symbols = [
-            "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "XRP-USD", "DOGE-USD",
-        ]
-        kraken_symbols = [
-            "XBT/USDT", "ETH/USDT", "XRP/USDT", "ADA/USDT", "SOL/USDT", "DOGE/USDT",
-            "XBT/USD", "ETH/USD", "XRP/USD", "ADA/USD", "SOL/USD", "USDT/USD",
-        ]
+        # 4. Initialize Multi-Exchange Feeds (restricted strictly to verified pairs BTC/ETH + USDT/USD basis)
+        binance_symbols = ["btcusdt", "ethusdt"]
+        coinbase_symbols = ["BTC-USD", "ETH-USD"]
+        kraken_symbols = ["XBT/USDT", "ETH/USDT", "XBT/USD", "ETH/USD", "USDT/USD"]
 
         self.feeds = [
             BinanceFeed(symbols=binance_symbols, on_book_update=self.on_book_update),
@@ -163,6 +160,10 @@ class UnifiedLiveService:
 
         try:
             while self._running:
+                if duration_sec is not None and (time.time() - start_time) >= duration_sec:
+                    logger.info("Target duration of %ds reached. Stopping live session cleanly...", duration_sec)
+                    break
+
                 await asyncio.sleep(0.5)
                 now_ms = clock_sync.get_corrected_time_ms()
 
@@ -191,19 +192,23 @@ class UnifiedLiveService:
                                 COUNT(*),
                                 SUM(feature_window_json IS NOT NULL),
                                 SUM(is_viable = 1),
-                                SUM(is_right_censored = 1)
+                                SUM(is_right_censored = 1),
+                                SUM(is_executable = 1)
                             FROM spread_events
+                            WHERE dataset_version != 'invalid_v0' OR dataset_version IS NULL
                         """)
                         row = cur.fetchone()
                         tot_ev = row[0] or 0
                         with_win = row[1] or 0
                         viable_cnt = row[2] or 0
                         censored_cnt = row[3] or 0
+                        executable_cnt = row[4] or 0
                     else:
                         tot_ev = len(self.tracker.completed_events) + len(self.tracker.active_events)
                         with_win = sum(1 for e in self.tracker.completed_events if e.feature_window)
                         viable_cnt = sum(1 for e in self.tracker.completed_events if e.is_viable)
                         censored_cnt = sum(1 for e in self.tracker.completed_events if e.is_right_censored)
+                        executable_cnt = sum(1 for e in self.tracker.completed_events if getattr(e, "is_executable", 0))
 
                     cumul_ticks = self.db.get_cumulative_tick_count() if self.db else self.cumulative_ticks
                     active_buffer = self.db.get_tick_count() if self.db else 0
@@ -212,7 +217,7 @@ class UnifiedLiveService:
                     logger.info(
                         "[STATUS 60s] Uptime %02dm%02ds | Ticks Ingested: %d (Active Buffer: %d) | "
                         "Events Opened: %d, Closed: %d | Total DB Events: %d (With Windows: %d) | "
-                        "Viable: %d, Censored: %d | Crossed Books: %d | Reconnects: %d | Clock Offset: %.2fms",
+                        "Executable: %d, Viable: %d, Censored: %d | Crossed Books: %d | Reconnects: %d | Clock Offset: %.2fms",
                         uptime_sec // 60,
                         uptime_sec % 60,
                         cumul_ticks,
@@ -221,6 +226,7 @@ class UnifiedLiveService:
                         self.events_closed_session,
                         tot_ev,
                         with_win,
+                        executable_cnt,
                         viable_cnt,
                         censored_cnt,
                         crossed_cnt,
@@ -245,6 +251,13 @@ class UnifiedLiveService:
 
 
 def main():
+    duration = None
+    if len(sys.argv) > 1:
+        try:
+            duration = int(sys.argv[1])
+        except ValueError:
+            pass
+
     service = UnifiedLiveService(sqlite_path="data/arbsense.db")
 
     def _handle_signal(*_):
@@ -257,7 +270,7 @@ def main():
     except Exception:
         pass
 
-    asyncio.run(service.start())
+    asyncio.run(service.start(duration_sec=duration))
 
 
 if __name__ == "__main__":
