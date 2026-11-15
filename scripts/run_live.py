@@ -17,18 +17,19 @@ Task 2: One unified, robust long-running service that:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import AppConfig
+from config.settings import AppConfig, get_git_commit
 from data.feeds import BinanceFeed, CoinbaseFeed, KrakenFeed
 from data.normalizer import OrderBookNormalizer, OrderBookSnapshot
 from data.ntp_sync import clock_sync
@@ -78,6 +79,7 @@ class UnifiedLiveService:
         self.cumulative_ticks = 0
         self.events_opened_session = 0
         self.events_closed_session = 0
+        self.basis_poll_failures = 0
         self.tick_counts = {"binance": 0, "coinbase": 0, "kraken": 0}
         self.feeds: List[Any] = []
         self._running = False
@@ -116,7 +118,7 @@ class UnifiedLiveService:
                         self.events_opened_session += 1
 
     async def _periodic_basis_updater(self) -> None:
-        """Periodically polls REST USDT/USD rate as fallback and logs current basis rate (Fix A)."""
+        """Periodically polls REST USDT/USD rate as fallback and logs current basis rate (Fix A & Requirement 1)."""
         import urllib.request
         import json
         while self._running:
@@ -131,8 +133,9 @@ class UnifiedLiveService:
                         d = json.loads(resp.read().decode())
                         if "bid" in d and "ask" in d:
                             rates.append((float(d["bid"]) + float(d["ask"])) / 2.0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.basis_poll_failures += 1
+                    logger.warning("[BasisUpdater] Failed to poll Coinbase USDT-USD ticker: %s (failure count: %d)", e, self.basis_poll_failures)
 
                 try:
                     req_kr = urllib.request.Request(
@@ -145,16 +148,25 @@ class UnifiedLiveService:
                         k = list(res.keys())[0] if res else None
                         if k:
                             rates.append((float(res[k]["b"][0]) + float(res[k]["a"][0])) / 2.0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.basis_poll_failures += 1
+                    logger.warning("[BasisUpdater] Failed to poll Kraken USDTUSD ticker: %s (failure count: %d)", e, self.basis_poll_failures)
 
                 if rates:
                     mean_rate = float(sum(rates) / len(rates))
                     self.normalizer.set_usdt_usd_basis(mean_rate)
                     bps_offset = (1.0 / mean_rate - 1.0) * 10000.0
-                    logger.info("[BasisUpdater] Active USDT/USD rate: %.5f (%+.2f bps offset)", mean_rate, bps_offset)
+                    logger.info("[BasisUpdater] Active USDT/USD rate: %.5f (%+.2f bps offset, poll failures: %d)", mean_rate, bps_offset, self.basis_poll_failures)
+                else:
+                    self.basis_poll_failures += 1
+                    logger.warning(
+                        "[BasisUpdater] Failed to fetch USDT/USD basis from all venues (total failures: %d, current basis age: %.1fs)",
+                        self.basis_poll_failures,
+                        self.normalizer.get_basis_age_sec(),
+                    )
             except Exception as e:
-                logger.debug("[BasisUpdater] Poll exception: %s", e)
+                self.basis_poll_failures += 1
+                logger.warning("[BasisUpdater] Unexpected poll cycle exception: %s (total failures: %d)", e, self.basis_poll_failures)
             await asyncio.sleep(60.0)
 
     async def start(self, duration_sec: Optional[int] = None) -> None:
@@ -176,10 +188,24 @@ class UnifiedLiveService:
         backend = self.db.initialize()
         logger.info("Database initialized: backend=%s (%s)", backend, self.db.connection_diagnostic)
 
-        # 3. Start High-Throughput Batch Writer
+        # 3. Governance: Freeze Validation & Run Metadata Registration (Item 2)
+        dataset_ver = self.config.raw.get("dataset", {}).get("version", "v2.0")
+        latency_thresh_ms = float(self.config.raw.get("dataset", {}).get("viability_latency_threshold_ms", 85.0))
+        cfg_hash = self.config.get_config_hash()
+        git_hash = get_git_commit()
+        cfg_json = json.dumps(self.config.raw, sort_keys=True)
+        self.db.check_and_record_run_metadata(
+            dataset_version=dataset_ver,
+            config_hash=cfg_hash,
+            git_commit=git_hash,
+            latency_threshold_ms=latency_thresh_ms,
+            config_json=cfg_json,
+        )
+
+        # 4. Start High-Throughput Batch Writer
         await self.batch_writer.start()
 
-        # 4. Initialize Multi-Exchange Feeds (restricted strictly to verified pairs BTC/ETH + USDT/USD basis)
+        # 5. Initialize Multi-Exchange Feeds (restricted strictly to verified pairs BTC/ETH + USDT/USD basis)
         binance_symbols = ["btcusdt", "ethusdt"]
         coinbase_symbols = ["BTC-USD", "ETH-USD", "USDT-USD"]
         kraken_symbols = ["XBT/USDT", "ETH/USDT", "XBT/USD", "ETH/USD", "USDT/USD"]
@@ -224,10 +250,9 @@ class UnifiedLiveService:
                     pruned = self.db.prune_old_ticks(keep_latest_per_symbol=1500)
                     last_prune_time = now_sec
 
-                # 60-Second Periodic Status Line Logging (Task 2 Requirement)
+                # 60-Second Periodic Status Line Logging (Task 2 & 10 Requirement)
                 if (now_sec - last_log_time) >= 60.0:
                     uptime_sec = int(now_sec - start_time)
-                    reconnect_count = sum(getattr(f, "reconnect_count", 0) for f in self.feeds)
 
                     # Query database stats in place
                     cur = self.db._sqlite_conn.cursor() if self.db._sqlite_conn else None
@@ -239,7 +264,9 @@ class UnifiedLiveService:
                                 SUM(is_viable = 1),
                                 SUM(is_right_censored = 1),
                                 SUM(is_executable = 1),
-                                SUM(is_persistent_500ms = 1)
+                                SUM(is_persistent_500ms = 1),
+                                SUM(is_persistent_2000ms = 1),
+                                SUM(is_persistent_5000ms = 1)
                             FROM spread_events
                             WHERE dataset_version = 'v2.0'
                         """)
@@ -249,40 +276,69 @@ class UnifiedLiveService:
                         viable_cnt = row[2] or 0
                         censored_cnt = row[3] or 0
                         executable_cnt = row[4] or 0
-                        persistent_500_cnt = row[5] or 0
+                        p500_cnt = row[5] or 0
+                        p2000_cnt = row[6] or 0
+                        p5000_cnt = row[7] or 0
                     else:
                         tot_ev = len(self.tracker.completed_events) + len(self.tracker.active_events)
                         with_win = sum(1 for e in self.tracker.completed_events if e.feature_window)
                         viable_cnt = sum(1 for e in self.tracker.completed_events if e.is_viable)
                         censored_cnt = sum(1 for e in self.tracker.completed_events if e.is_right_censored)
                         executable_cnt = sum(1 for e in self.tracker.completed_events if getattr(e, "is_executable", 0))
-                        persistent_500_cnt = sum(1 for e in self.tracker.completed_events if getattr(e, "is_persistent_500ms", 0))
+                        p500_cnt = sum(1 for e in self.tracker.completed_events if getattr(e, "is_persistent_500ms", 0))
+                        p2000_cnt = sum(1 for e in self.tracker.completed_events if getattr(e, "is_persistent_2000ms", 0))
+                        p5000_cnt = sum(1 for e in self.tracker.completed_events if getattr(e, "is_persistent_5000ms", 0))
 
                     cumul_ticks = self.db.get_cumulative_tick_count() if self.db else self.cumulative_ticks
                     active_buffer = self.db.get_tick_count() if self.db else 0
-                    crossed_cnt = getattr(self.normalizer, "crossed_books_count", 0)
                     cur_basis = getattr(self.normalizer, "usdt_usd_basis_rate", 1.0)
-                    basis_offset = (1.0 / cur_basis - 1.0) * 10000.0 if cur_basis > 0 else 0.0
+                    basis_age = self.normalizer.get_basis_age_sec() if hasattr(self.normalizer, "get_basis_age_sec") else 0.0
+
+                    # Reconnects per exchange
+                    reconn_details = []
+                    kraken_feed_obj = None
+                    coinbase_feed_obj = None
+                    for feed in self.feeds:
+                        exch = getattr(feed, "exchange_name", feed.__class__.__name__.replace("Feed", "")).upper()
+                        reconn_cnt = getattr(feed, "reconnect_count", 0)
+                        reconn_details.append(f"{exch}:{reconn_cnt}")
+                        if "KRAKEN" in exch:
+                            kraken_feed_obj = feed
+                        elif "COINBASE" in exch:
+                            coinbase_feed_obj = feed
+
+                    # Kraken checksum failure rate
+                    kr_fails = getattr(kraken_feed_obj, "checksum_failure_count", 0) if kraken_feed_obj else 0
+                    kr_checks = getattr(kraken_feed_obj, "checksum_checks_count", 0) if kraken_feed_obj else 0
+                    kr_fail_rate_str = f"{(kr_fails / max(1, kr_checks)) * 100.0:.2f}% ({kr_fails}/{kr_checks})"
+
+                    # Coinbase resync count
+                    cb_resync_cnt = getattr(coinbase_feed_obj, "crossed_book_count", 0) if coinbase_feed_obj else 0
 
                     logger.info(
                         "[STATUS 60s] Uptime %02dm%02ds | Ticks: %d (Buf: %d) | "
-                        "Events: %d (Windows: %d) | Exec: %d, Persist500: %d, Viable: %d, Censored: %d | "
-                        "Crossed: %d | Reconnects: %d | ClockOffset: %.2fms | Basis: %.5f (%+.2fbps)",
+                        "Events: %d opened / %d closed (DB Total: %d, With Windows: %d, Censored: %d) | "
+                        "Persistence: [500ms: %d, 2s: %d, 5s: %d] | "
+                        "Reconnects: [%s] | Kraken CRC Fail Rate: %s | CB Resyncs: %d | "
+                        "Basis: %.5f (Age: %.1fs) | ClockOffset: %+.2fms",
                         uptime_sec // 60,
                         uptime_sec % 60,
                         cumul_ticks,
                         active_buffer,
+                        self.events_opened_session,
+                        self.events_closed_session,
                         tot_ev,
                         with_win,
-                        executable_cnt,
-                        persistent_500_cnt,
-                        viable_cnt,
                         censored_cnt,
-                        crossed_cnt,
-                        reconnect_count,
-                        clock_sync.offset_ms,
+                        p500_cnt,
+                        p2000_cnt,
+                        p5000_cnt,
+                        ", ".join(reconn_details),
+                        kr_fail_rate_str,
+                        cb_resync_cnt,
                         cur_basis,
-                        basis_offset,
+                        basis_age,
+                        clock_sync.offset_ms,
                     )
                     last_log_time = now_sec
 

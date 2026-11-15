@@ -1,0 +1,29 @@
+[Unit]
+Description=ArbSense Live Arbitrage Ingestion, Detection & Tracking Service
+After=network.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/arbsense
+ExecStart=/opt/arbsense/venv/bin/python scripts/run_live.py
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Environment configuration
+Environment=PYTHONUNBUFFERED=1
+Environment=DATABASE_URL=postgresql://postgres:postgres@localhost:5432/arbsense
+
+# Logging to systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arbsense
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

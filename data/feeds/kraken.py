@@ -45,6 +45,7 @@ class KrakenFeed(BaseExchangeFeed):
         for s in self.symbols:
             self._books[s] = {"bids": {}, "asks": {}}
         self.checksum_failure_count = 0
+        self.checksum_checks_count = 0
         self.crossed_book_count = 0
 
     def build_subscription_payload(self) -> Dict[str, Any]:
@@ -151,6 +152,7 @@ class KrakenFeed(BaseExchangeFeed):
             # CRC32 Checksum verification if published by Kraken
             for p_dict in payloads_to_process:
                 if "c" in p_dict:
+                    self.checksum_checks_count += 1
                     remote_crc = str(p_dict["c"])
                     try:
                         crc_parts = []

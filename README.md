@@ -160,7 +160,88 @@ python -m streamlit run dashboard\app.py
 
 ---
 
-## 6. Scope & Academic Limitations
+## 6. Long Run on a VM (Production Deployment Guide)
+
+This section covers deploying ArbSense for continuous 24/7 long-run data collection, arbitrage detection, and spread tracking on a cloud Virtual Machine.
+
+### 6.1 Cloud Region Selection & Latency Considerations
+
+Network round-trip latency to exchange WebSocket matching engines directly determines order execution viability and latency honesty:
+
+| Cloud Region | Proximity to Venues | Typical Latency Profile | Best For |
+|---|---|---|---|
+| **AWS `us-east-1` (N. Virginia)** *(Recommended)* | **Coinbase** matching engines physically hosted in AWS `us-east-1`; **Kraken** US gateways in NY/VA (~5–15 ms); **Binance** via transatlantic route (~65–85 ms). | Lowest Coinbase latency (<3 ms), low Kraken latency. | Primary recommendation for multi-exchange triplets with Coinbase. |
+| **AWS `eu-west-1` (Ireland)** | Balanced routing between **Binance** (Frankfurt/London) and **Kraken** (Dublin/London); ~70 ms to Coinbase (US). | Ultra-low latency to Binance and Kraken (<15 ms). | Alternative if primarily optimizing Binance <-> Kraken cross-venue pairs. |
+| **AWS `ap-northeast-1` (Tokyo)** | Proximity to APAC Binance nodes; higher latency to Coinbase/Kraken (>120 ms). | APAC colocation. | Asia-Pacific regional arbitrage. |
+
+> **Key Recommendation:** Deploy on **AWS `us-east-1` (N. Virginia)**. Because Coinbase requires order book basis normalization against live USDT rates, sub-millisecond connectivity to Coinbase matching engines prevents quote staleness and basis drift.
+
+### 6.2 Recommended VM Sizing
+
+- **vCPU:** 2 to 4 cores (e.g. AWS `t3.large` or `c6i.large`).
+- **RAM:** 4 GB to 8 GB.
+- **Disk:** 50 GB+ NVMe SSD (WAL mode and batch pruning ensure low disk footprint; <150 MB / day).
+- **OS:** Ubuntu 22.04 LTS / Debian 12.
+
+### 6.3 Step-by-Step Production Setup
+
+#### 1. System Setup & TimescaleDB Container
+```bash
+sudo apt update && sudo apt install -y git python3-venv docker.io docker-compose
+sudo systemctl enable --now docker
+
+cd /opt
+sudo git clone https://github.com/Degeneraxe/axeprox.git arbsense
+cd /opt/arbsense
+
+# Start TimescaleDB with persistent storage and auto-restart
+docker-compose up -d
+```
+
+#### 2. Python Environment
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+#### 3. Systemd Auto-Restarting Service
+The systemd service unit (`deploy/arbsense.service`) ensures automatic crash recovery and starts on boot:
+```bash
+sudo cp deploy/arbsense.service /etc/systemd/system/arbsense.service
+sudo systemctl daemon-reload
+sudo systemctl enable arbsense
+sudo systemctl start arbsense
+
+# Monitor real-time 60-second status logs
+journalctl -u arbsense -f -n 100
+```
+
+*For Docker or non-systemd environments, a `deploy/supervisord.conf` configuration is also provided.*
+
+#### 4. Automated Daily Database Backups & 7-Day Retention
+Install a daily cron job that executes safe atomic SQLite WAL backups (via `VACUUM INTO` and sidecar retention) or PostgreSQL `pg_dump`:
+```bash
+# Open crontab
+crontab -e
+
+# Run backup every day at 02:00 UTC with 7-day retention:
+0 2 * * * /opt/arbsense/venv/bin/python /opt/arbsense/scripts/backup_db.py --retention-days 7 >> /var/log/arbsense_backup.log 2>&1
+```
+
+#### 5. Live Break-Even & Microstructure Monitoring
+Inspect empirical fee hurdle distributions and symmetry metrics at any time:
+```bash
+# Run break-even analysis across all non-censored v2.0 events
+python scripts/break_even_analysis.py --version v2.0
+
+# View grouped directional stats and Coinbase symmetry
+python scripts/show_grouped_stats.py v2.0
+```
+
+---
+
+## 7. Scope & Academic Limitations
 
 1. **Spot Markets Only:** ArbSense analyzes cryptocurrency spot order books (BTC/USDT, ETH/USDT). Derivatives (futures/perpetuals) and funding rate basis trading are extensions.
 2. **Paper Trading Simulation:** ArbSense strictly executes simulated paper orders; no live funds, exchange logins, or real API keys are required.

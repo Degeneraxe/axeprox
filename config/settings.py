@@ -175,3 +175,28 @@ class AppConfig:
         exch_data = scenario_data.get(exchange.lower(), {})
         key = f"{role.lower()}_bps"
         return float(exch_data.get(key, 10.0))
+
+    def get_config_hash(self) -> str:
+        """Returns deterministic SHA-256 hash of the canonical configuration dictionary."""
+        import hashlib
+        import json
+        dump = json.dumps(self.raw, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+
+def get_git_commit() -> str:
+    """Returns the current git commit hash, or 'unknown' if not available."""
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        return res.stdout.strip()
+    except Exception:
+        return "unknown"
+

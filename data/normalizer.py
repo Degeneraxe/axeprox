@@ -182,6 +182,7 @@ class OrderBookNormalizer:
         self.ring_buffers: Dict[Tuple[str, str], Deque[OrderBookSnapshot]] = defaultdict(lambda: deque(maxlen=100))
         # Quote basis tracking: e.g. "USDT/USD" parity
         self.usdt_usd_basis_rate: float = 1.0000
+        self.last_basis_update_ts: float = 0.0
         # Book integrity monitor: crossed books counter
         self.crossed_books_count: int = 0
 
@@ -341,4 +342,20 @@ class OrderBookNormalizer:
 
     def set_usdt_usd_basis(self, rate: float) -> None:
         """Sets the active USDT/USD exchange rate to allow cross-basis spread normalization."""
+        import time
         self.usdt_usd_basis_rate = rate
+        self.last_basis_update_ts = time.time()
+
+    def is_basis_stale(self, max_staleness_sec: float = 300.0) -> bool:
+        """Returns True if no basis update occurred within max_staleness_sec (default 5 minutes)."""
+        import time
+        if self.last_basis_update_ts <= 0:
+            return True
+        return (time.time() - self.last_basis_update_ts) > max_staleness_sec
+
+    def get_basis_age_sec(self) -> float:
+        """Returns elapsed seconds since last basis rate update."""
+        import time
+        if self.last_basis_update_ts <= 0:
+            return 9999.0
+        return max(0.0, time.time() - self.last_basis_update_ts)

@@ -70,3 +70,17 @@ CREATE TABLE IF NOT EXISTS simulated_trades (
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_time ON simulated_trades (timestamp DESC);
+
+-- 4. Run Metadata Table (Dataset Freeze & Config Hash Governance)
+CREATE TABLE IF NOT EXISTS run_metadata (
+    run_id SERIAL PRIMARY KEY,
+    dataset_version VARCHAR(32) NOT NULL,
+    config_hash VARCHAR(64) NOT NULL,
+    git_commit VARCHAR(64) NOT NULL,
+    latency_threshold_ms NUMERIC(10, 2) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    config_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_metadata_version ON run_metadata (dataset_version);
+

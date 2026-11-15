@@ -121,6 +121,17 @@ class CrossExchangeDetector:
                             # Discard illiquid/thin candidate
                             continue
 
+                # Basis staleness guard (Item 1): flag Coinbase books unusable if basis > 5 min stale
+                if buy_exch.lower() == "coinbase" or sell_exch.lower() == "coinbase":
+                    if hasattr(self.normalizer, "is_basis_stale") and self.normalizer.is_basis_stale(300.0):
+                        if (current_time_ms - getattr(self, "_last_stale_warn_ms", 0.0)) >= 30000.0:
+                            logger.warning(
+                                "[BasisStalenessGuard] USDT/USD basis is stale (>300s). Flagging Coinbase books as unusable; skipping candidate %s %s->%s.",
+                                symbol, buy_exch, sell_exch
+                            )
+                            self._last_stale_warn_ms = current_time_ms
+                        continue
+
                 # Defect 8 & Task 3: Map Coinbase / USD pairs with explicit basis adjustment or exclude them
                 if snap_buy.quote_currency != snap_sell.quote_currency:
                     basis_cfg = self.config.raw.get("markets", {}).get("basis_tracking", {})

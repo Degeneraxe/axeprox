@@ -232,8 +232,21 @@ class DatabaseManager:
         );
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS run_metadata (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset_version TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            git_commit TEXT NOT NULL,
+            latency_threshold_ms REAL NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            config_json TEXT
+        );
+        """)
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ticks_exch_sym ON orderbook_ticks (exchange, symbol, id DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_spreads_time ON spread_events (open_time DESC);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_run_metadata_version ON run_metadata (dataset_version);")
         conn.commit()
         self._sqlite_conn = conn
 
@@ -567,6 +580,48 @@ class DatabaseManager:
             self._sqlite_conn.commit()
             return deleted
         return 0
+
+    def check_and_record_run_metadata(
+        self,
+        dataset_version: str,
+        config_hash: str,
+        git_commit: str,
+        latency_threshold_ms: float,
+        config_json: str = "",
+    ) -> None:
+        """Validates configuration freeze against historical runs and records run metadata (Requirement 2).
+        
+        Refuses to start a new run under an existing dataset_version if config_hash differs.
+        """
+        if self._sqlite_conn:
+            cur = self._sqlite_conn.cursor()
+            cur.execute(
+                "SELECT config_hash, git_commit, latency_threshold_ms, created_at FROM run_metadata WHERE dataset_version = ? ORDER BY run_id ASC",
+                (dataset_version,),
+            )
+            rows = cur.fetchall()
+            if rows:
+                existing_hash = rows[0]["config_hash"] if isinstance(rows[0], sqlite3.Row) else rows[0][0]
+                if existing_hash != config_hash:
+                    raise ValueError(
+                        f"Config hash mismatch for dataset_version '{dataset_version}'. "
+                        f"Frozen version config_hash='{existing_hash}', current config_hash='{config_hash}'. "
+                        f"Freeze rule strictly forbids starting a run under an existing dataset version with modified config."
+                    )
+            
+            cur.execute("""
+                INSERT INTO run_metadata (
+                    dataset_version, config_hash, git_commit, latency_threshold_ms, config_json
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (dataset_version, config_hash, git_commit, latency_threshold_ms, config_json))
+            self._sqlite_conn.commit()
+            logger.info(
+                "[RunMetadata] Run metadata verified and recorded: dataset_version=%s, config_hash=%s, git=%s, latency_threshold=%.1fms",
+                dataset_version,
+                config_hash[:12],
+                git_commit[:10] if git_commit else "unknown",
+                latency_threshold_ms,
+            )
 
     def close(self) -> None:
         if self._sqlite_conn:
