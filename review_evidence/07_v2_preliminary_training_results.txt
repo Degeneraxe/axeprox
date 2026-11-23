@@ -1,0 +1,72 @@
+====================================================================================================
+ARBSENSE v2.0 PRELIMINARY TRAINING & EVALUATION REPORT
+====================================================================================================
+Generated:         2026-11-23 04:22:01 UTC
+Active Git Commit: d4f164e
+Database Source:   backups/arbsense_20261123_041356.db (Offline Database Copy)
+Target Label:      is_persistent_500ms
+Regression Target: log(1 + duration_ms) on non-censored events
+Dataset Version:   v2.0
+====================================================================================================
+
+1. CHRONOLOGICAL DATASET SPLIT & PURGE GAPS
+----------------------------------------------------------------------------------------------------
+  Train       : 3137 events | Range: 2026-11-22 19:31:11 UTC -> 2026-11-23 03:01:26 UTC | Pos:  953 ( 30.4%)
+  Validation  :  672 events | Range: 2026-11-23 03:02:57 UTC -> 2026-11-23 03:22:22 UTC | Pos:  219 ( 32.6%)
+  Test        :  590 events | Range: 2026-11-23 03:23:29 UTC -> 2026-11-23 04:13:10 UTC | Pos:  128 ( 21.7%)
+
+  Purge Gap 1 (Train->Val): 8 events dropped (91.0s time gap >= 60s)
+  Purge Gap 2 (Val->Test):  75 events dropped (66.7s time gap >= 60s)
+
+2. OVERALL TEST SET EVALUATION
+----------------------------------------------------------------------------------------------------
+Model                            | Precision | Recall  | F1-Score | Bootstrap 95% CI | PR-AUC | Brier  | MAE (ms)  | MedAE (ms)
+----------------------------------------------------------------------------------------------------
+Majority Class Baseline          | 0.0000    | 0.0000  | 0.0000   | [0.000, 0.000]   | 0.2169 | 0.1774 | 287.8     | 183.0     
+Shortcut Baseline (Symbol+Dir)   | 0.2771    | 0.8594  | 0.4190   | [0.365, 0.471]   | 0.3330 | 0.2329 | 278.4     | 144.9     
+Logistic Regression (Full)       | 0.2266    | 0.9453  | 0.3656   | [0.321, 0.412]   | 0.3212 | 0.2278 | 273.3     | 140.4     
+Gradient Boosting (Duration)     | 0.2266    | 0.9453  | 0.3656   | [0.321, 0.412]   | 0.3212 | 0.2278 | 270.6     | 134.6     
+PyTorch LSTM (Full Multi-Head)   | 0.2169    | 1.0000  | 0.3565   | [0.312, 0.401]   | 0.3366 | 0.2218 | 273.1     | 140.2     
+----------------------------------------------------------------------------------------------------
+
+3. CONFUSION MATRICES ON TEST SET ([[TN, FP], [FN, TP]])
+----------------------------------------------------------------------------------------------------
+  - Majority Class Baseline          (Thresh=0.50): TN=462 FP=0   | FN=128 TP=0  
+  - Shortcut Baseline (Symbol+Dir)   (Thresh=0.42): TN=175 FP=287 | FN=18  TP=110
+  - Logistic Regression (Full)       (Thresh=0.34): TN=49  FP=413 | FN=7   TP=121
+  - Gradient Boosting (Duration)     (Thresh=0.34): TN=49  FP=413 | FN=7   TP=121
+  - PyTorch LSTM (Full Multi-Head)   (Thresh=0.10): TN=0   FP=462 | FN=0   TP=128
+
+4. PER-SYMBOL TEST SET BREAKDOWN
+----------------------------------------------------------------------------------------------------
+
+--- Symbol: BTC/USDT (N=235 test events, Positives=82 [34.9%]) ---
+Model                            | Precision | Recall  | F1-Score | Bootstrap 95% CI | PR-AUC | Brier  | MAE (ms)  | MedAE (ms)
+----------------------------------------------------------------------------------------------------
+Majority Class Baseline          | 0.0000    | 0.0000  | 0.0000   | [0.000, 0.000]   | 0.3489 | 0.2292 | 362.3     | 197.8     
+Shortcut Baseline (Symbol+Dir)   | 0.3489    | 1.0000  | 0.5174   | [0.449, 0.584]   | 0.3679 | 0.2877 | 364.3     | 228.2     
+Logistic Regression (Full)       | 0.3611    | 0.9512  | 0.5235   | [0.448, 0.590]   | 0.4005 | 0.2538 | 355.9     | 166.2     
+Gradient Boosting (Duration)     | 0.3611    | 0.9512  | 0.5235   | [0.448, 0.590]   | 0.4005 | 0.2538 | 359.5     | 180.0     
+PyTorch LSTM (Full Multi-Head)   | 0.3489    | 1.0000  | 0.5174   | [0.449, 0.584]   | 0.4212 | 0.2491 | 355.6     | 188.8     
+
+--- Symbol: ETH/USDT (N=355 test events, Positives=46 [13.0%]) ---
+Model                            | Precision | Recall  | F1-Score | Bootstrap 95% CI | PR-AUC | Brier  | MAE (ms)  | MedAE (ms)
+----------------------------------------------------------------------------------------------------
+Majority Class Baseline          | 0.0000    | 0.0000  | 0.0000   | [0.000, 0.000]   | 0.1296 | 0.1432 | 238.4     | 179.8     
+Shortcut Baseline (Symbol+Dir)   | 0.1728    | 0.6087  | 0.2692   | [0.188, 0.348]   | 0.1822 | 0.1965 | 221.5     | 121.5     
+Logistic Regression (Full)       | 0.1352    | 0.9348  | 0.2363   | [0.180, 0.295]   | 0.2192 | 0.2105 | 218.6     | 130.1     
+Gradient Boosting (Duration)     | 0.1352    | 0.9348  | 0.2363   | [0.180, 0.295]   | 0.2192 | 0.2105 | 211.7     | 112.0     
+PyTorch LSTM (Full Multi-Head)   | 0.1296    | 1.0000  | 0.2294   | [0.179, 0.285]   | 0.1996 | 0.2038 | 218.5     | 123.8     
+
+5. CHECK FOR SHORTCUTS ANALYSIS
+----------------------------------------------------------------------------------------------------
+Shortcut Baseline F1:           0.4190 | PR-AUC: 0.3330
+Logistic Regression Full F1:    0.3656 | PR-AUC: 0.3212
+PyTorch LSTM Full F1:           0.3565 | PR-AUC: 0.3366
+Finding: The shortcut baseline (symbol and direction only) OUTPERFORMS the full LSTM model. The model relies heavily on exchange pair identity rather than order book depth dynamics.
+
+6. OBJECTIVE ASSESSMENT & HONEST REPORTING
+----------------------------------------------------------------------------------------------------
+Model Checkpoint: models/checkpoints\v2_preliminary_lstm.pt
+Calibrated Threshold (Val-only): 0.10
+HONEST ASSESSMENT: The PyTorch LSTM does not outperform the linear baseline on this preliminary dataset. In high-frequency cross-venue order books, tabular/linear representations with regularized weighting capture most of the directional variance without the optimization overhead and variance of recurrent units.

@@ -31,36 +31,38 @@ logger = logging.getLogger("BackupDB")
 
 
 def backup_sqlite(db_path: Path, backup_dir: Path) -> Path:
-    """Safely backs up SQLite database using VACUUM INTO and checkpoints WAL."""
+    """Safely backs up SQLite database using Python sqlite3's online backup API."""
     if not db_path.exists():
         raise FileNotFoundError(f"SQLite database file not found at: {db_path}")
 
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
-    target_backup_file = backup_dir / f"arbsense_sqlite_{timestamp}.db"
+    target_backup_file = backup_dir / f"arbsense_{timestamp}.db"
 
-    logger.info("Initiating SQLite atomic backup from %s to %s...", db_path, target_backup_file)
+    logger.info("Initiating SQLite online backup via sqlite3.backup API from %s to %s...", db_path, target_backup_file)
 
-    # 1. Connect and trigger WAL checkpoint to flush memory pages
+    src_conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    dst_conn = sqlite3.connect(str(target_backup_file))
+    with dst_conn:
+        src_conn.backup(dst_conn, pages=100)
+    src_conn.close()
+
+    # Query and print event count in the copy
+    cur = dst_conn.cursor()
     try:
-        conn = sqlite3.connect(str(db_path), timeout=30.0)
-        conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
-        # 2. Use VACUUM INTO for an atomic, clean snapshot of WAL state
-        conn.execute(f"VACUUM INTO '{target_backup_file.as_posix()}';")
-        conn.close()
-        logger.info("VACUUM INTO completed successfully: %s (%d bytes)", target_backup_file.name, target_backup_file.stat().st_size)
-    except Exception as e:
-        logger.warning("VACUUM INTO failed (%s). Falling back to safe file copy of db, -wal, and -shm...", e)
-        # Fallback: copy main db plus -wal and -shm files
-        fallback_dir = backup_dir / f"arbsense_snapshot_{timestamp}"
-        fallback_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(db_path, fallback_dir / db_path.name)
-        for ext in ["-wal", "-shm"]:
-            sidecar = db_path.parent / (db_path.name + ext)
-            if sidecar.exists():
-                shutil.copy2(sidecar, fallback_dir / sidecar.name)
-                logger.info("Copied sidecar WAL file: %s", sidecar.name)
-        target_backup_file = fallback_dir
+        cur.execute("SELECT COUNT(*) FROM spread_events")
+        event_cnt = cur.fetchone()[0]
+    except Exception:
+        event_cnt = 0
+    try:
+        cur.execute("SELECT COUNT(*) FROM orderbook_ticks")
+        tick_cnt = cur.fetchone()[0]
+    except Exception:
+        tick_cnt = 0
+    dst_conn.close()
 
+    size_bytes = target_backup_file.stat().st_size
+    print(f"[BackupSuccess] Created: {target_backup_file.name} ({size_bytes} bytes) | Events in backup: {event_cnt} | Ticks in backup: {tick_cnt}")
+    logger.info("Backup complete: %s | Events: %d | Ticks: %d", target_backup_file.name, event_cnt, tick_cnt)
     return target_backup_file
 
 

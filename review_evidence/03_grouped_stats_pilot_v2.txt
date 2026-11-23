@@ -1,0 +1,64 @@
+================================================================================
+ARBSENSE REVIEW EVIDENCE ARTIFACT
+Generated:   2026-11-23 01:21:57
+Git Commit:  d4f164e
+Environment: Windows (x64) | Python 3.13.7
+================================================================================
+
+=======================================================================================================================================
+DATASET v2.0: DATABASE INTEGRITY & SUMMARY STATISTICS (Step 5)
+=======================================================================================================================================
+Total Ticks in Active Buffer:    28190
+Total Cumulative Ingested Ticks: 645650
+Total Spread Events Opened:      198
+Events with 20-Step Windows:     198 (100.0%)
+Viable Events:                   0 (0.00%)
+Right-Censored Events:           0 (0.00%) [Acceptance: <5%]
+Suspect Flagged Events (>80bps): 0 (0.00%)
+Earliest Event Time (Epoch ms):  1794749901834.81
+Latest Event Time (Epoch ms):    1794751654065.28
+
+=======================================================================================================================================
+STEP 3: LABEL BALANCE ACROSS ALL TARGETS & HORIZONS (Non-Censored Only)
+=======================================================================================================================================
+  is_persistent_500ms             :    49 positive /   149 negative ( 24.7%)
+  is_persistent_2000ms            :    15 positive /   183 negative (  7.6%)
+  is_persistent_5000ms            :     3 positive /   195 negative (  1.5%)
+  is_executable (Fee-Indep)       :   141 positive /    57 negative ( 71.2%)
+  is_profitable_retail            :     0 positive /   198 negative (  0.0%)
+  is_profitable_vip1              :     0 positive /   198 negative (  0.0%)
+  is_profitable_vip3              :     0 positive /   198 negative (  0.0%)
+  is_profitable_zero_maker        :     0 positive /   198 negative (  0.0%)
+  is_viable (Legacy)              :     0 positive /   198 negative (  0.0%)
+
+=======================================================================================================================================
+GROUPED METRICS PER (SYMBOL, BUY, SELL, DIRECTION) WITH AVG / P50 / P90 AND CENSORED SHARE
+=======================================================================================================================================
+Symbol    Direction            N     Open bps (avg/p50/p90)   Peak bps (avg/p50/p90)   Duration ms (avg/p50/p90)  Win%   Cens%  Ev/hr  
+---------------------------------------------------------------------------------------------------------------------------------------
+ETH/USDT  binance->coinbase    103   2.5/2.2/3.3              2.6/2.3/4.2              841/221/2732               100.0%   0.0% 211.6  
+BTC/USDT  binance->coinbase    19    2.8/2.6/4.1              2.9/2.6/4.1              302/197/835                100.0%   0.0% 39.0   
+BTC/USDT  binance->kraken      15    2.6/2.3/3.5              2.6/2.4/3.5              341/239/780                100.0%   0.0% 30.8   
+ETH/USDT  binance->kraken      15    3.0/3.0/3.6              3.0/3.0/3.6              90/86/207                  100.0%   0.0% 30.8   
+ETH/USDT  coinbase->binance    10    2.4/2.2/2.7              2.5/2.4/3.3              147/133/277                100.0%   0.0% 20.5   
+ETH/USDT  kraken->coinbase     8     2.3/2.3/2.7              2.3/2.3/2.7              122/34/341                 100.0%   0.0% 16.4   
+BTC/USDT  coinbase->kraken     7     2.2/2.1/2.4              2.3/2.2/2.6              447/102/1173               100.0%   0.0% 14.4   
+BTC/USDT  kraken->coinbase     7     2.3/2.3/2.4              2.3/2.3/2.4              676/548/1358               100.0%   0.0% 14.4   
+ETH/USDT  coinbase->kraken     5     2.3/2.2/2.6              2.6/2.3/3.4              244/24/687                 100.0%   0.0% 10.3   
+BTC/USDT  coinbase->binance    4     2.5/2.4/3.0              2.5/2.4/3.0              557/498/1094               100.0%   0.0% 8.2    
+BTC/USDT  kraken->binance      3     2.2/2.2/2.2              2.2/2.2/2.2              1032/345/2183              100.0%   0.0% 6.2    
+ETH/USDT  kraken->binance      2     2.1/2.1/2.2              2.1/2.1/2.2              47/47/78                   100.0%   0.0% 4.1    
+
+=======================================================================================================================================
+COINBASE CROSS-DIRECTION SYMMETRY ANALYSIS (Acceptance Criteria)
+=======================================================================================================================================
+  - Coinbase Buy Events:  N =   26 | Avg Open Spread = +2.33 bps
+  - Coinbase Sell Events: N =  137 | Avg Open Spread = +2.54 bps
+  - Cross-Direction Bias: 0.21 bps (Acceptance: near 0 +/- a few bps, no ~12 bps offset)
+=======================================================================================================================================
+
+=============================================================================================================================
+PAIR-LEVEL EVENT FREQUENCY & DAILY PROJECTIONS
+=============================================================================================================================
+  ETH/USDT  :   143 events |  293.8 events/hour |    7051 estimated events/day
+  BTC/USDT  :    55 events |  113.0 events/hour |    2712 estimated events/day

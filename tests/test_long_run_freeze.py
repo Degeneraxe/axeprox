@@ -96,9 +96,35 @@ def test_run_metadata_freeze(tmp_path):
     db_mgr.close()
 
 
-def test_break_even_analysis_execution():
-    res = run_break_even_analysis(db_path="data/arbsense.db", version="v2.0", exclude_censored=True)
-    assert res["total_events"] == 198
+def test_break_even_analysis_execution(tmp_path):
+    db_file = tmp_path / "test_break_even.db"
+    db_mgr = DatabaseManager(sqlite_path=str(db_file))
+    db_mgr.initialize()
+
+    conn = sqlite3.connect(str(db_file))
+    # Insert synthetic spread events: 9 with break-even 2.5 bps, 1 with 6.0 bps
+    for i in range(9):
+        conn.execute("""
+            INSERT INTO spread_events (
+                event_id, dataset_version, symbol, buy_exchange, sell_exchange,
+                open_spread_bps, peak_spread_bps, slippage_bps, cost_hurdle_bps,
+                duration_ms, is_right_censored, is_viable, is_executable, open_time
+            ) VALUES (?, 'v2.0', 'BTC/USDT', 'binance', 'coinbase', 2.0, 3.0, 0.5, 1.0, 500, 0, 1, 1, '2026-11-23 00:00:00')
+        """, (f"ev_{i}",))
+
+    conn.execute("""
+        INSERT INTO spread_events (
+            event_id, dataset_version, symbol, buy_exchange, sell_exchange,
+            open_spread_bps, peak_spread_bps, slippage_bps, cost_hurdle_bps,
+            duration_ms, is_right_censored, is_viable, is_executable, open_time
+        ) VALUES ('ev_9', 'v2.0', 'ETH/USDT', 'binance', 'kraken', 5.0, 7.0, 1.0, 1.0, 1000, 0, 1, 1, '2026-11-23 00:01:00')
+    """)
+    conn.commit()
+    conn.close()
+    db_mgr.close()
+
+    res = run_break_even_analysis(db_path=str(db_file), version="v2.0", exclude_censored=True)
+    assert res["total_events"] == 10
     assert res["mean_bps"] > 0.0
     assert 0.0 in res["fractions"]
     assert 5.0 in res["fractions"]

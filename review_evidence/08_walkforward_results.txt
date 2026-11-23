@@ -1,0 +1,112 @@
+====================================================================================================
+ARBSENSE v2.0 RIGOROUS WALK-FORWARD EVALUATION REPORT
+====================================================================================================
+Generated:           2026-11-23 04:46:50 UTC
+Active Git Commit:   d4f164e
+Dataset Version:     v2.0
+Database Copy:       backups/arbsense_20261123_043050.db
+Evaluation Design:   5 Expanding-Window Chronological Folds with 60s Purge Gaps
+Target Label:        is_persistent_500ms (Primary Target)
+====================================================================================================
+
+1. EXPANDING-WINDOW FOLD STRUCTURE & PURGE GAPS
+----------------------------------------------------------------------------------------------------
+Fold 1:
+  - Train: N=2093 (Uncensored: 2092, Positives: 659 [31.5%])
+  - Purge Gap 1: 10 events dropped (73.6s gap >= 60s)
+  - Val:   N=455 (Uncensored: 455, Positives: 123 [27.0%])
+  - Purge Gap 2: 10 events dropped (62.0s gap >= 60s)
+  - Test:  N=455 (Uncensored: 455, Positives: 143 [31.4%], Window: 01:32:02->02:44:02 UTC)
+
+Fold 2:
+  - Train: N=2465 (Uncensored: 2464, Positives: 770 [31.2%])
+  - Purge Gap 1: 15 events dropped (61.4s gap >= 60s)
+  - Val:   N=450 (Uncensored: 450, Positives: 120 [26.7%])
+  - Purge Gap 2: 70 events dropped (73.7s gap >= 60s)
+  - Test:  N=395 (Uncensored: 395, Positives: 98 [24.8%], Window: 02:43:34->03:20:22 UTC)
+
+Fold 3:
+  - Train: N=2837 (Uncensored: 2836, Positives: 872 [30.7%])
+  - Purge Gap 1: 8 events dropped (74.1s gap >= 60s)
+  - Val:   N=457 (Uncensored: 457, Positives: 123 [26.9%])
+  - Purge Gap 2: 5 events dropped (111.9s gap >= 60s)
+  - Test:  N=461 (Uncensored: 461, Positives: 160 [34.7%], Window: 03:18:52->03:21:59 UTC)
+
+Fold 4:
+  - Train: N=3209 (Uncensored: 3208, Positives: 970 [30.2%])
+  - Purge Gap 1: 6 events dropped (61.2s gap >= 60s)
+  - Val:   N=460 (Uncensored: 460, Positives: 154 [33.5%])
+  - Purge Gap 2: 161 events dropped (65.9s gap >= 60s)
+  - Test:  N=304 (Uncensored: 304, Positives: 57 [18.8%], Window: 03:22:43->03:32:24 UTC)
+
+Fold 5:
+  - Train: N=3582 (Uncensored: 3581, Positives: 1100 [30.7%])
+  - Purge Gap 1: 221 events dropped (60.3s gap >= 60s)
+  - Val:   N=244 (Uncensored: 244, Positives: 48 [19.7%])
+  - Purge Gap 2: 15 events dropped (65.0s gap >= 60s)
+  - Test:  N=590 (Uncensored: 590, Positives: 161 [27.3%], Window: 03:30:07->04:32:37 UTC)
+
+2. HEADLINE CLASSIFICATION METRICS (MEAN +/- STD OVER 5 FOLDS)
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+Model                        | PR-AUC            | Lift          | P@Top-10%       | P@Top-20%       | MCC               | Bal Acc         | BSS               | F1 (Sec)       
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+Majority Class Baseline      | 0.2740 +/- 0.0550 | 1.00x +/- 0.00x | 21.9% +/- 13.5% | 29.6% +/- 7.0%  | +0.0000 +/- 0.0000 | 50.0% +/- 0.0%  | -0.0000 +/- 0.0000 | 0.0000 +/- 0.0000
+Symbol+Direction Only        | 0.3789 +/- 0.0255 | 1.44x +/- 0.33x | 46.4% +/- 10.5% | 41.6% +/- 5.6%  | +0.1676 +/- 0.0505 | 58.7% +/- 2.9%  | -0.1860 +/- 0.1204 | 0.4176 +/- 0.0569
+Symbol+Direction+Hour        | 0.3818 +/- 0.0289 | 1.45x +/- 0.33x | 45.4% +/- 9.8%  | 40.8% +/- 6.8%  | +0.1469 +/- 0.0662 | 57.3% +/- 3.9%  | -0.1352 +/- 0.0830 | 0.3654 +/- 0.0779
+Regularized Logistic Reg     | 0.3484 +/- 0.0679 | 1.28x +/- 0.16x | 39.3% +/- 7.5%  | 36.0% +/- 9.0%  | +0.0885 +/- 0.0461 | 54.3% +/- 2.5%  | -0.2361 +/- 0.1157 | 0.3427 +/- 0.1237
+HistGradientBoosting         | 0.3816 +/- 0.0675 | 1.41x +/- 0.22x | 43.2% +/- 16.1% | 37.7% +/- 6.9%  | +0.0833 +/- 0.0744 | 53.9% +/- 4.2%  | -0.0721 +/- 0.0284 | 0.3245 +/- 0.1410
+PyTorch LSTM (3-seed mean)   | 0.3796 +/- 0.0629 | 1.41x +/- 0.19x | 42.2% +/- 9.5%  | 38.5% +/- 8.0%  | +0.1321 +/- 0.0707 | 56.3% +/- 3.9%  | -0.1631 +/- 0.1193 | 0.3272 +/- 0.0942
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+3. DURATION PREDICTION: MEDIAN ABSOLUTE ERROR (ms)
+---------------------------------------------------------------------------------------------------------------------------------------
+Model                            | MedAE (Fold 1)  | MedAE (Fold 2)  | MedAE (Fold 3)  | MedAE (Fold 4)  | MedAE (Fold 5)  | Mean +/- Std (ms) 
+---------------------------------------------------------------------------------------------------------------------------------------
+Constant Median                  |      194.6 ms |      188.2 ms |      211.7 ms |      178.4 ms |      184.4 ms |  191.5 +/- 11.4 ms
+Ridge Regressor                  |      184.5 ms |      196.1 ms |      229.9 ms |      135.0 ms |      155.7 ms |  180.2 +/- 32.8 ms
+HistGradientBoosting             |      160.6 ms |      155.9 ms |      171.7 ms |      121.4 ms |      159.3 ms |  153.8 +/- 17.0 ms
+HistGB Quantile (Median Loss)    |      175.1 ms |      179.9 ms |      194.6 ms |      146.3 ms |      157.9 ms |  170.8 +/- 16.9 ms
+PyTorch LSTM                     |      164.3 ms |      120.6 ms |      118.8 ms |      109.7 ms |      138.7 ms |  130.4 +/- 19.4 ms
+---------------------------------------------------------------------------------------------------------------------------------------
+
+4. PROBABILITY CALIBRATION ANALYSIS (PLATT SCALING ON HistGradientBoosting)
+------------------------------------------------------------------------------------------
+Bin Range    | N Samples  | Raw Mean Pred Prob   | Calibrated Pred Prob | Observed Base Rate  
+------------------------------------------------------------------------------------------
+[0.0, 0.2)   | 139        | 0.1527               | 0.2217               | 0.1223              
+[0.2, 0.4)   | 864        | 0.3076               | 0.2298               | 0.2118              
+[0.4, 0.6)   | 914        | 0.4898               | 0.2555               | 0.3173              
+[0.6, 0.8)   | 265        | 0.6719               | 0.3409               | 0.4415              
+[0.8, 1.0)   | 23         | 0.8423               | 0.4372               | 0.5217              
+------------------------------------------------------------------------------------------
+BSS Before Calibration: -0.0721
+BSS After Calibration:  +0.0037 (Delta: +0.0757)
+
+5. FEATURE IMPORTANCE (HistGradientBoosting Permutation Importance)
+--------------------------------------------------------------------------------
+   1. open_spread_bps               : +0.0277
+   2. spread_vs_hurdle              : +0.0149
+   3. transit_lat_buy_ms            : +0.0138
+   4. transit_lat_sell_ms           : +0.0132
+   5. obi_sell_mean_5               : +0.0081
+   6. depth_walked_slippage         : +0.0067
+   7. volatility_10                 : +0.0062
+   8. spread_accel_3                : +0.0046
+   9. transit_lat_diff_ms           : +0.0045
+  10. spread_velocity_10            : +0.0042
+
+6. STATISTICAL SIGNIFICANCE (PAIRED BOOTSTRAP TEST: LSTM vs HGB)
+--------------------------------------------------------------------------------
+Mean Delta PR-AUC (LSTM - HGB): -0.0010
+Average 95% Bootstrap CI:       [-0.0619, +0.0623]
+Empirical Two-Sided p-value:    0.7940
+Conclusion: The difference in PR-AUC between the PyTorch LSTM and HistGradientBoosting is NOT statistically significant (the 95% bootstrap CI spans zero).
+
+7. PLAIN-LANGUAGE EXECUTIVE CONCLUSION
+--------------------------------------------------------------------------------
+HONEST VERDICT: Across 5 expanding-window chronological walk-forward folds, HistGradientBoosting (PR-AUC 0.3816 +/- 0.0675, Lift 1.41x) and Regularized Logistic Regression (PR-AUC 0.3484 +/- 0.0679, Lift 1.28x) achieve comparable discriminative performance to the simple heuristic baseline Symbol+Direction+Hour (PR-AUC 0.3818 +/- 0.0289, Lift 1.45x). The PyTorch LSTM (tuned with 1 layer, hidden 32, dropout 0.3, evaluated across 3 random seeds: PR-AUC 0.3796 +/- 0.0629, Lift 1.41x) does not outperform the tabular baselines. The paired bootstrap 95% confidence interval for delta PR-AUC (LSTM - HGB) is [-0.0619, +0.0623] with a p-value of 0.7940, indicating that the sequence model provides no statistically significant advantage over tabular gradient boosting or simple venue/direction routing rules. For duration prediction, non-linear regressors (PyTorch LSTM MedAE 130.4 ms, HistGradientBoosting MedAE 153.8 ms) achieve lower median absolute errors than the constant median baseline (191.5 ms), though this duration improvement over the constant baseline has not been significance-tested.
+
+DATASET & METHODOLOGICAL LIMITATIONS:
+1. Single Market Regime: All results are derived from a single ~9-hour overnight collection session (approx. 19:30 to 04:30 UTC), representing a single low-volatility Asian/European overnight trading regime. Out-of-sample test windows are relatively short (ranging from 3 minutes to 72 minutes).
+2. Temporal Clustering & Effective Sample Size: Spread events cluster heavily in time during brief periods of cross-venue dislocation. As a consequence, observations are not independent, meaning the effective sample size is smaller than the nominal event count, and the reported bootstrap confidence intervals are likely too narrow.
+3. Latency Feature Limitations & Venue Identification: Several exchange feeds do not provide native matching-engine timestamps (Binance depth snapshots and Coinbase L2 channel updates lack granular exchange-send timestamps), requiring transit latencies to be estimated via local arrival intervals. These latency features may therefore act primarily as static venue identifiers rather than dynamic indicators of order-flow congestion.

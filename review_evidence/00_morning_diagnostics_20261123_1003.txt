@@ -1,0 +1,47 @@
+===============================================================================================
+ARBSENSE MORNING DIAGNOSTIC REPORT (v2.0 Long Run)
+===============================================================================================
+Timestamp:               2026-11-23 10:04:27
+Database:                arbsense.db (Read-Only Mode)
+Active Dataset Version:  v2.0
+Active Git Commit:       d4f164e713
+Config Hash:             5aed1adafca86d7b...
+Latency Threshold:       85.0 ms
+Run Uptime:              8h 51m (31886s)
+Total Ticks Ingested:    31,251
+Total Spread Events:     4,652
+Event Generation Rate:   525.2 events/hour (12606 estimated/day)
+Events with 20-Step Win: 4652 (100.0%) [Requirement: 100%]
+Right-Censored Share:    1 (0.02%) [Requirement: < 5%]
+
+-----------------------------------------------------------------------------------------------
+PERSISTENCE HORIZON LABEL BALANCES (Non-Censored Samples)
+-----------------------------------------------------------------------------------------------
+  is_persistent_500ms (Primary Target)  :  1381 pos /  3271 neg ( 29.7%)
+  is_persistent_2000ms                  :   230 pos /  4422 neg (  4.9%)
+  is_persistent_5000ms                  :    50 pos /  4602 neg (  1.1%)
+  is_executable (Fee-Independent)       :  3185 pos /  1467 neg ( 68.5%)
+
+-----------------------------------------------------------------------------------------------
+PER-(SYMBOL, DIRECTION) SPREAD DISTRIBUTION
+-----------------------------------------------------------------------------------------------
+Symbol     Direction                Count   Avg Open bps    Avg Peak bps    Avg Dur (ms)   
+-----------------------------------------------------------------------------------------------
+ETH/USDT   binance -> coinbase      706     2.56            2.86            836.2          
+ETH/USDT   kraken -> coinbase       642     2.61            3.27            370.8          
+ETH/USDT   coinbase -> binance      502     2.75            3.17            340.9          
+ETH/USDT   coinbase -> kraken       480     2.51            3.06            310.9          
+BTC/USDT   coinbase -> binance      388     2.84            3.21            818.0          
+BTC/USDT   coinbase -> kraken       341     2.57            3.23            635.5          
+ETH/USDT   binance -> kraken        328     2.78            3.15            394.9          
+ETH/USDT   kraken -> binance        317     3.38            3.93            431.1          
+BTC/USDT   binance -> kraken        279     2.96            3.22            564.2          
+BTC/USDT   kraken -> binance        257     3.41            3.88            677.4          
+BTC/USDT   kraken -> coinbase       218     2.69            3.54            688.5          
+BTC/USDT   binance -> coinbase      194     2.69            3.07            613.9          
+
+-----------------------------------------------------------------------------------------------
+LATEST COLLECTOR STATUS LINE (from logs/run_live.log)
+-----------------------------------------------------------------------------------------------
+  10:03:48 [INFO] LiveCollectorTracker: [STATUS 60s] Uptime 530m45s | Ticks: 18247045 (Buf: 7500) | Events: 4635 opened / 4635 closed (DB Total: 4652, With Windows: 4652, Censored: 1) | Persistence: [500ms: 1381, 2s: 230, 5s: 50] | Reconnects: [BINANCE:0, COINBASE:0, KRAKEN:2] | Kraken CRC Fail Rate: 0.00% (0/16457496) | CB Resyncs: 0 | Basis: 0.99860 (Age: 0.8s) | ClockOffset: +66.50ms
+===============================================================================================

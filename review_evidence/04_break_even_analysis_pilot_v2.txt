@@ -1,0 +1,44 @@
+================================================================================
+ARBSENSE REVIEW EVIDENCE ARTIFACT
+Generated:   2026-11-23 01:21:57
+Git Commit:  d4f164e
+Environment: Windows (x64) | Python 3.13.7
+================================================================================
+
+==========================================================================================
+ARBSENSE BREAK-EVEN & FEE HURDLE ANALYSIS (Dataset: v2.0)
+Source DB: pilot_v2.db | Total Events Analyzed: 198 (Non-Censored: True)
+==========================================================================================
+
+1. SPREAD & SLIPPAGE COMPONENTS (bps):
+  - Peak Spread:      Mean =  2.63 bps | Median =  2.34 bps | Max =  5.79 bps
+  - Slippage (VWAP):  Mean =  0.32 bps | Median =  0.04 bps | Max =  2.50 bps
+  - Effective Spread: Mean =  2.31 bps | Median =  2.17 bps | Max =  5.44 bps
+
+2. DISTRIBUTION OF BREAK-EVEN ROUND-TRIP FEE HURDLES (peak_bps - slippage_bps):
+  Metric                Value (bps)
+  --------------------------------
+  Min                         -0.31
+  p10                          1.38
+  p25                          1.92
+  p50 (Median)                 2.17
+  Mean                         2.31
+  p75                          2.58
+  p90                          3.60
+  p95                          4.26
+  p99                          5.14
+  Max                          5.44
+  Std Dev                      0.98
+
+3. FRACTION PROFITABLE AT BENCHMARK ROUND-TRIP FEE HURDLES:
+  Hurdle Tier               Threshold       Profitable Events  Fraction Profitable 
+  ------------------------------------------------------------------------------
+  Zero Cost (Gross > Slip)  > 0 bps         194 / 198           97.98%             
+  Ultra-VIP Maker (5 bps)   > 5 bps         4 / 198              2.02%             
+  Tier-1 VIP / Neg Maker (10 bps) > 10 bps        0 / 198              0.00%             
+  Standard Institutional (20 bps) > 20 bps        0 / 198              0.00%             
+
+4. BREAK-EVEN DISTRIBUTION BY PAIR:
+  - BTC/USDT   (N= 55): Mean = 1.95 bps | Median = 2.08 bps | P(>0bps) =  92.7% | P(>5bps) =   0.0%
+  - ETH/USDT   (N=143): Mean = 2.45 bps | Median = 2.18 bps | P(>0bps) = 100.0% | P(>5bps) =   2.8%
+==========================================================================================

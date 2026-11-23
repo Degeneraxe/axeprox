@@ -1,0 +1,17 @@
+================================================================================
+ARBSENSE REVIEW EVIDENCE ARTIFACT
+Generated:   2026-11-23 01:21:57
+Git Commit:  d4f164e
+Environment: Windows (x64) | Python 3.13.7
+================================================================================
+
+RUN METADATA ROW IN LIVE DATABASE (data/arbsense.db):
+
+  run_id:               3
+  dataset_version:      v2.0
+  config_hash:          5aed1adafca86d7b623872fe249765e76570ed0c767698696ce5ad92d87956bd
+  git_commit:           d4f164e71311069f4a9ce02c370886578b66e1b8
+  latency_threshold_ms: 85.0 ms
+  created_at:           2026-11-22 19:43:02 UTC
+  config_json (canonical):
+{"dataset": {"purge_gap_events": 5, "sequence_length": 20, "test_ratio": 0.15, "train_ratio": 0.7, "val_ratio": 0.15, "version": "v2.0", "viability_latency_threshold_ms": 85.0}, "detection": {"depth_snapshot_throttle_ms": 100, "gross_spread_threshold_bps": 1.0, "hysteresis_bps": 1.0, "max_plausible_spread_bps": 80.0, "min_depth_filter_enabled": true, "min_depth_levels": 5, "min_open_spread_bps": 2.0, "min_order_book_depth_levels": 5}, "dynamic_hurdle": {"rolling_window_ticks": 50, "volatility_multiplier_k": 1.5}, "fee_scenarios": {"active_scenario": "retail", "scenarios": {"retail": {"binance": {"maker_bps": 10.0, "taker_bps": 10.0}, "coinbase": {"maker_bps": 40.0, "taker_bps": 60.0}, "kraken": {"maker_bps": 25.0, "taker_bps": 40.0}}, "vip1": {"binance": {"maker_bps": 8.0, "taker_bps": 9.0}, "coinbase": {"maker_bps": 20.0, "taker_bps": 40.0}, "kraken": {"maker_bps": 14.0, "taker_bps": 24.0}}, "vip3": {"binance": {"maker_bps": 4.0, "taker_bps": 6.0}, "coinbase": {"maker_bps": 10.0, "taker_bps": 20.0}, "kraken": {"maker_bps": 8.0, "taker_bps": 16.0}}, "zero_maker": {"binance": {"maker_bps": 0.0, "taker_bps": 7.5}, "coinbase": {"maker_bps": 0.0, "taker_bps": 25.0}, "kraken": {"maker_bps": 0.0, "taker_bps": 20.0}}}}, "labeling": {"execution_latency_assumption_ms": 50.0, "persistence_horizons_ms": [500, 2000, 5000], "right_censored_max_window_ms": 30000, "use_log_duration": true}, "markets": {"basis_tracking": {"enabled": true, "usdt_usd_peg_threshold_bps": 10.0}, "exchange_symbols": {"binance": {"BTC/USDT": "btcusdt", "ETH/USDT": "ethusdt"}, "coinbase": {"BTC/USD": "BTC-USD", "BTC/USDT": "BTC-USD", "ETH/USD": "ETH-USD", "ETH/USDT": "ETH-USD"}, "kraken": {"BTC/USD": "XBT/USD", "BTC/USDT": "XBT/USDT", "ETH/USD": "ETH/USD", "ETH/USDT": "ETH/USDT"}}, "primary_quote": "USDT", "supported_pairs": ["BTC/USDT", "ETH/USDT"]}, "simulation": {"depth_walking_slippage": true, "initial_capital_usdt": 10000.0, "pre_funded_balance_assumption": true, "trade_sizes": {"ADA/USDT": 5000.0, "BTC/USDT": 0.05, "DOGE/USDT": 5000.0, "ETH/USDT": 0.5, "SOL/USDT": 10.0, "XRP/USDT": 1000.0}}, "storage": {"backend": "auto", "batch_size": 50, "flush_interval_ms": 500, "sqlite_path": "data/arbsense.db"}, "system": {"env": "development", "log_level": "INFO", "project_name": "ArbSense", "random_seed": 42, "version": "1.0.0"}, "time_sync": {"fallback_rest_url": "https://api.binance.com/api/v3/time", "heartbeat_interval_sec": 15.0, "max_quote_age_ms": 1500, "ntp_server": "pool.ntp.org", "ntp_timeout_sec": 3.0, "reconnect_backoff": {"initial_delay_sec": 1.0, "jitter": true, "max_delay_sec": 30.0, "multiplier": 2.0}}, "training": {"min_events": 20, "purge_gap_events": 5, "target_label": "is_persistent_500ms", "test_ratio": 0.15, "train_ratio": 0.7, "val_ratio": 0.15}}

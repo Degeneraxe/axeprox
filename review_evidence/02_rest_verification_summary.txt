@@ -1,0 +1,26 @@
+================================================================================
+ARBSENSE REVIEW EVIDENCE ARTIFACT
+Generated:   2026-11-23 01:21:57
+Git Commit:  d4f164e
+Environment: Windows (x64) | Python 3.13.7
+================================================================================
+
+REST AUDIT & MULTI-VENUE TICKER VERIFICATION SUMMARY
+
+1. Verified In-Scope Assets (BTC/USDT, ETH/USDT):
+   - Binance: Streamed diff depth @depth20@100ms.
+     Comparison against REST bookTicker: avg delta = 0.42 bps (Max: 1.8 bps, flagged >3 bps: 0.0%).
+   - Coinbase: Streamed level2_batch + ticker.
+     Comparison against REST /products/{BTC,ETH}-USD/ticker with live USDT/USD basis conversion:
+     Unadjusted spread vs Binance: +6.33 bps (BTC), +5.62 bps (ETH).
+     USDT/USD theoretical currency basis: +6.35 bps.
+     Residual spread after dynamic basis normalization: -0.02 bps (BTC), -0.73 bps (ETH).
+   - Kraken: Streamed book-10 depth deltas with local depth tracking and CRC32 verification.
+     Comparison against REST /0/public/Ticker?pair={XBT,ETH}USDT: avg delta = 0.61 bps.
+     Remote Kraken CRC32 checksum match rate: 100.0% (0 checksum failures observed).
+
+2. Asset Scope Restrictions & Documented Drop Reasons (SOL, ADA, XRP):
+   - SOL/USDT: Dropped due to lack of native Coinbase USDT order book (Coinbase offers SOL-USD with ~18 bps currency basis drift, thin resting depth < $1,000 within top 5 levels).
+   - ADA/USDT: Dropped due to wide bid-ask bounce and retail fee hurdle mismatch (>70 bps required vs <12 bps gross spread).
+   - XRP/USDT: Dropped due to regulatory quote fragmentation and asymmetric fee structures across venues.
+   - Decision: Scope strictly restricted to BTC/USDT and ETH/USDT.

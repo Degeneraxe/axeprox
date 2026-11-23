@@ -1,0 +1,32 @@
+================================================================================
+ARBSENSE REVIEW EVIDENCE ARTIFACT
+Generated:   2026-11-23 01:21:57
+Git Commit:  d4f164e
+Environment: Windows (x64) | Python 3.13.7
+================================================================================
+
+[2026-11-23 01:00:31] [Watchdog] === RUN_LIVE SESSION STARTED ===
+01:00:32 [INFO] LiveCollectorTracker: ================================================================================
+01:00:32 [INFO] LiveCollectorTracker: ArbSense Unified Live Ingestion, Detection & Spread Tracking Engine
+01:00:32 [INFO] LiveCollectorTracker: ================================================================================
+01:00:32 [INFO] data.ntp_sync: NTP clock synchronization successful: offset=71.50 ms, rtt=51.23 ms (server=pool.ntp.org)
+01:00:32 [INFO] LiveCollectorTracker: Clock sync verified: offset=71.50ms via NTP (transit latency correction active)
+[2026-11-23 01:00:54] [Watchdog] === RUN_LIVE SESSION STARTED ===
+01:00:55 [INFO] LiveCollectorTracker: ================================================================================
+01:00:55 [INFO] LiveCollectorTracker: ArbSense Unified Live Ingestion, Detection & Spread Tracking Engine
+01:00:55 [INFO] LiveCollectorTracker: ================================================================================
+01:00:55 [INFO] data.ntp_sync: NTP clock synchronization successful: offset=89.98 ms, rtt=14.24 ms (server=pool.ntp.org)
+01:00:55 [INFO] LiveCollectorTracker: Clock sync verified: offset=89.98ms via NTP (transit latency correction active)
+01:00:58 [INFO] data.storage.db_manager: [Storage] TimescaleDB unreachable (TCP connection to TimescaleDB failed (timed out)). Operating on SQLite WAL engine: C:\Users\SIDDHU\.gemini\antigravity\scratch\arbsense\data\arbsense.db
+01:00:58 [INFO] LiveCollectorTracker: Database initialized: backend=sqlite (TimescaleDB unreachable (TCP connection to TimescaleDB failed (timed out)). Operating on SQLite WAL engine: C:\Users\SIDDHU\.gemini\antigravity\scratch\arbsense\data\arbsense.db)
+01:00:58 [INFO] data.storage.db_manager: [RunMetadata] Run metadata verified and recorded: dataset_version=v2.0, config_hash=5aed1adafca8, git=d4f164e713, latency_threshold=85.0ms
+01:00:58 [INFO] data.storage.batch_writer: [Storage] Batch writer worker started.
+01:00:58 [INFO] data.feeds.base_feed: [binance] Feed loop initiated.
+01:00:58 [INFO] data.feeds.base_feed: [coinbase] Feed loop initiated.
+01:00:58 [INFO] data.feeds.base_feed: [kraken] Feed loop initiated.
+01:00:58 [INFO] LiveCollectorTracker: All feeds streaming live. Real-time arbitrage detection & tracking online.
+01:00:58 [INFO] data.feeds.base_feed: [binance] Connecting to wss://stream.binance.com:9443/stream?streams=btcusdt@depth20@100ms/ethusdt@depth20@100ms ...
+01:00:58 [INFO] data.feeds.base_feed: [coinbase] Connecting to wss://ws-feed.exchange.coinbase.com ...
+01:00:58 [INFO] data.feeds.base_feed: [kraken] Connecting to wss://ws.kraken.com ...
+01:00:58 [INFO] LiveCollectorTracker: [BasisUpdater] Active USDT/USD rate: 0.99841 (+15.93 bps offset, poll failures: 0)
+01:00:59 [INFO] data.feeds.base_feed: [binance] Connected successfully.

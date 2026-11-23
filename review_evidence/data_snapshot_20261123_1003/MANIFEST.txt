@@ -1,0 +1,14 @@
+================================================================================
+ARBSENSE DATA SNAPSHOT MANIFEST
+Snapshot Timestamp:  20261123_1003
+Git Commit:          d4f164e71311069f4a9ce02c370886578b66e1b8
+Dataset Version:     v2.0
+================================================================================
+
+File:    arbsense_20261123_043050.db
+Size:    119300096 bytes (113.77 MB)
+SHA-256: 093594e0efc765827103047a38d01e9ad4cca985b29f55258a1ccae102b7b74a
+
+File:    run_live.log
+Size:    276963 bytes (0.26 MB)
+SHA-256: 328d67563052d04e1bd96f162580936ac472cd63745d4c2240afcee2dec7fbfa

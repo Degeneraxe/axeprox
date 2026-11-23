@@ -13,6 +13,11 @@ ENV/
 build/
 dist/
 *.egg-info/
+*.zip
+
+# Logs
+logs/
+*.log
 
 # Databases & WAL files
 *.db
