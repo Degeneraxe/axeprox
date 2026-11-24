@@ -84,7 +84,6 @@ def get_tabular_feature_names(use_latency: bool = False) -> List[str]:
     """Returns tabular feature column names based on features.use_latency switch."""
     base = [
         "open_spread_bps",
-        "depth_walked_slippage",
         "spread_vs_hurdle",
         "spread_velocity_3",
         "spread_velocity_5",
@@ -497,7 +496,6 @@ def engineer_tabular_features(
     s = seq_arr[:, 0]  # gross spread bps across window
     open_bps = float(event_dict.get("open_spread_bps", s[-1] if len(s) > 0 else 0.0))
     hurdle_bps = float(event_dict.get("cost_hurdle_bps", 0.0))
-    slippage = float(event_dict.get("slippage_bps", 0.0))
     spread_vs_hurdle = open_bps - hurdle_bps
 
     # Velocities and accelerations over 3, 5, 10 steps
@@ -528,7 +526,6 @@ def engineer_tabular_features(
 
     base_vec = [
         open_bps,
-        slippage,
         spread_vs_hurdle,
         vel_3,
         vel_5,

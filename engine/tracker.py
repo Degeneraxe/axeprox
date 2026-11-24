@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Deque
 
 from config.settings import AppConfig
 from data.storage.db_manager import DatabaseManager
+from engine.simulator import arrival_books
 from engine.cost_model import CostModel
 from engine.detector import SpreadCandidate
 from models.features import asof_join_ticks, compute_rolling_volatility_bps, extract_step_features, build_feature_step
@@ -72,15 +73,17 @@ class ActiveSpreadEvent:
     is_viable: bool = False
     lifetime_ticks: List[Dict[str, Any]] = field(default_factory=list)
     dataset_version: str = "v1.0"
-    slippage_bps: float = 0.0
+    native_usdt_route: bool = True
+    execution_status: str = "pending"
+    slippage_bps: Optional[float] = None
     is_executable: bool = False
-    net_peak_retail: float = 0.0
+    net_peak_retail: Optional[float] = None
     is_profitable_retail: bool = False
-    net_peak_vip1: float = 0.0
+    net_peak_vip1: Optional[float] = None
     is_profitable_vip1: bool = False
-    net_peak_vip3: float = 0.0
+    net_peak_vip3: Optional[float] = None
     is_profitable_vip3: bool = False
-    net_peak_zero_maker: float = 0.0
+    net_peak_zero_maker: Optional[float] = None
     is_profitable_zero_maker: bool = False
     is_persistent_500ms: bool = False
     is_persistent_2000ms: bool = False
@@ -96,10 +99,13 @@ class SpreadTracker:
         config: Optional[AppConfig] = None,
         on_event_closed: Optional[Callable[[ActiveSpreadEvent], None]] = None,
         normalizer: Optional[Any] = None,
+        on_arrival: Optional[Callable] = None,
     ):
         self.db = db_manager
         self.config = config or AppConfig.load()
         self.on_event_closed = on_event_closed
+        self.pending_arrivals = {}
+        self.on_arrival = on_arrival
         self.normalizer = normalizer
         self.cost_model = CostModel(self.config)
 
@@ -238,6 +244,42 @@ class SpreadTracker:
 
         return seq, vol_b, vol_s
 
+    def observe_arrivals(self, now_ms: float) -> None:
+        for event_id, event in list(self.pending_arrivals.items()):
+            arrival = event.open_time_ms + event.latency_threshold_ms
+            if now_ms < arrival:
+                continue
+            books = arrival_books(self.ring_buffers, event.symbol, event.buy_exchange,
+                                  event.sell_exchange, arrival) if event.native_usdt_route else None
+            evidence = {"arrival_ms": arrival}
+            event.execution_status = "missing_books" if event.native_usdt_route else "conversion_required"
+            if books:
+                buy, sell = books
+                qty = self.config.raw["simulation"]["trade_sizes"].get(event.symbol, 0)
+                b, _, buy_full = buy.compute_vwap("buy", qty)
+                s, _, sell_full = sell.compute_vwap("sell", qty)
+                evidence.update(buy_book_ms=buy.local_ts_ms, sell_book_ms=sell.local_ts_ms, quantity=qty)
+                event.execution_status = "insufficient_depth"
+                if qty > 0 and buy_full and sell_full and b > 0 and s > 0:
+                    event.execution_status = "priced"
+                    event.is_executable = True
+                    evidence.update(buy_vwap=b, sell_vwap=s)
+                    event.slippage_bps = 10000 * (b / buy.best_ask.price - s / sell.best_bid.price)
+                    scenarios = self.config.raw["fee_scenarios"]
+                    for scenario, schedule in scenarios["scenarios"].items():
+                        bf = schedule[event.buy_exchange]["taker_bps"] / 10000
+                        sf = schedule[event.sell_exchange]["taker_bps"] / 10000
+                        net = 10000 * (s * (1 - sf) / b - (1 + bf))
+                        setattr(event, f"net_peak_{scenario}", net)
+                        setattr(event, f"is_profitable_{scenario}", net > 0)
+                    event.is_viable = getattr(event, "is_profitable_" + scenarios["active_scenario"])
+            evidence["status"] = event.execution_status
+            if self.db:
+                self.db.record_arrival(event, evidence)
+            del self.pending_arrivals[event_id]
+            if books and self.on_arrival:
+                self.on_arrival(event, *books)
+
     def process_candidate(
         self,
         candidate: SpreadCandidate,
@@ -249,6 +291,8 @@ class SpreadTracker:
         """Updates active spread state machine with newly scanned candidate."""
         key = (candidate.symbol, candidate.buy_exchange, candidate.sell_exchange)
         now_ms = float(candidate.timestamp_ms)  # Stored as epoch ms (Requirement 4)
+
+        self.observe_arrivals(now_ms)
 
         # 1. Existing ongoing event for this pair
         if key in self.active_events:
@@ -345,9 +389,11 @@ class SpreadTracker:
                 latency_threshold_ms=self.latency_hurdle_ms,
                 is_suspect=is_suspect,
                 lifetime_ticks=[tick_record],
+                native_usdt_route=candidate.native_usdt_route,
                 dataset_version=self.dataset_version,
             )
             self.active_events[key] = new_event
+            self.pending_arrivals[event_id] = new_event
 
             # Persist event at open with complete 20-step feature window, suspect flag, and ticks (Requirement 1 & 3 & 4)
             if self.db:
@@ -372,8 +418,21 @@ class SpreadTracker:
 
         return None
 
+    def finish(self, now_ms: float) -> None:
+        """Finalize observed arrivals and censor events still open when capture ends."""
+        self.observe_arrivals(now_ms)
+        for event in self.pending_arrivals.values():
+            event.execution_status = "capture_ended"
+            if self.db:
+                self.db.record_arrival(event, {"status": "capture_ended",
+                                              "arrival_ms": event.open_time_ms + event.latency_threshold_ms})
+        self.pending_arrivals.clear()
+        for key in list(self.active_events):
+            self._close_event(key, now_ms, right_censored=True)
+
     def check_timeouts(self, current_time_ms: float) -> List[ActiveSpreadEvent]:
         """Closes events that have stopped receiving updates or exceeded max duration."""
+        self.observe_arrivals(current_time_ms)
         closed: List[ActiveSpreadEvent] = []
         for key, event in list(self.active_events.items()):
             time_since_last = current_time_ms - event.last_seen_ms
@@ -413,49 +472,9 @@ class SpreadTracker:
         event.duration_ms = duration
         event.log_duration = math.log(1.0 + duration) if self.use_log_duration else duration
 
-        # Ground truth viability label (Requirement 3):
-        # Viable = Stays open longer than the event's fixed dataset threshold AND peak spread exceeded total hurdle
-        event.is_viable = (duration >= event.latency_threshold_ms) and (event.peak_spread_bps >= event.cost_hurdle_bps)
-
-        # Depth-walked slippage calculation at configured trade size (Step 3)
-        trade_sizes = self.config.raw.get("simulation", {}).get("trade_sizes", {})
-        qty = float(trade_sizes.get(event.symbol, 0.0))
-        if self.normalizer and qty > 0:
-            b_sym = event.symbol if (event.buy_exchange.lower(), event.symbol) in self.normalizer.books else event.symbol.replace("USDT", "USD")
-            s_sym = event.symbol if (event.sell_exchange.lower(), event.symbol) in self.normalizer.books else event.symbol.replace("USDT", "USD")
-            snap_buy = self.normalizer.get_snapshot(event.buy_exchange, b_sym, event.close_time_ms) or self.normalizer.books.get((event.buy_exchange.lower(), b_sym))
-            snap_sell = self.normalizer.get_snapshot(event.sell_exchange, s_sym, event.close_time_ms) or self.normalizer.books.get((event.sell_exchange.lower(), s_sym))
-            if snap_buy and snap_sell and snap_buy.best_ask and snap_sell.best_bid:
-                p_ask = snap_buy.best_ask.price
-                p_bid = snap_sell.best_bid.price
-                buy_res = snap_buy.compute_vwap("buy", qty)
-                buy_vwap = buy_res[0] if isinstance(buy_res, tuple) else buy_res
-                sell_res = snap_sell.compute_vwap("sell", qty)
-                sell_vwap = sell_res[0] if isinstance(sell_res, tuple) else sell_res
-                slip_buy = ((buy_vwap - p_ask) / p_ask * 10000.0) if p_ask > 0 and buy_vwap > 0 else 0.0
-                slip_sell = ((p_bid - sell_vwap) / p_bid * 10000.0) if p_bid > 0 and sell_vwap > 0 else 0.0
-                event.slippage_bps = max(0.0, round(slip_buy + slip_sell, 2))
-            else:
-                event.slippage_bps = 0.0
-        else:
-            event.slippage_bps = 0.0
-
-        # Step 3 Label Definition: is_executable (fee-independent primary classification target)
-        event.is_executable = (duration >= event.latency_threshold_ms) and (event.peak_spread_bps >= event.slippage_bps)
-
-        # Step 3 Label Definition: Persistence targets (duration >= h)
         event.is_persistent_500ms = bool(duration >= 500.0)
         event.is_persistent_2000ms = bool(duration >= 2000.0)
         event.is_persistent_5000ms = bool(duration >= 5000.0)
-
-        # Step 3 Label Definition: is_profitable_<scenario> for EVERY scenario in config
-        scenarios = ["retail", "vip1", "vip3", "zero_maker"]
-        for scen in scenarios:
-            hurdle, _, _ = self.cost_model.get_hurdle_bps(event.buy_exchange, event.sell_exchange, event.symbol, scenario=scen)
-            net_peak = round(event.peak_spread_bps - hurdle, 2)
-            is_prof = bool(net_peak > 0)
-            setattr(event, f"net_peak_{scen}", net_peak)
-            setattr(event, f"is_profitable_{scen}", is_prof)
 
         self.completed_events.append(event)
 

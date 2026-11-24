@@ -170,3 +170,26 @@ def test_spread_events_and_trades_insert():
         db.close()
         if os.path.exists(db_path):
             os.remove(db_path)
+
+
+def test_depth_archive_survives_backpressure_and_stop():
+    import asyncio
+    from unittest.mock import Mock
+
+    async def exercise():
+        saved = []
+        db = Mock()
+        db.insert_ticks_batch.side_effect = lambda batch: saved.extend(batch)
+        writer = BatchWriter(db, batch_size=100, flush_interval_sec=60)
+        writer.queue = asyncio.Queue(maxsize=2)
+        await writer.start()
+        for stamp in range(8):
+            writer.enqueue_snapshot(OrderBookSnapshot(
+                "kraken", "BTC/USDT", "USDT", stamp, stamp, 0,
+                [OrderBookLevel(99, 2)], [OrderBookLevel(100, 2)]))
+        await asyncio.sleep(0.01)
+        await writer.stop()
+        assert [tick["local_ts_ms"] for tick in saved] == list(range(8))
+        assert all(tick["bid_depth"] and tick["ask_depth"] for tick in saved)
+
+    asyncio.run(exercise())

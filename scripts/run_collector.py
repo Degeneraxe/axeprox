@@ -68,7 +68,7 @@ class MarketDataCollector:
         logger.info("Clock sync completed: offset=%.2fms via %s", clock_sync.offset_ms, clock_sync.method_used)
 
         # 2. Init Storage
-        backend = self.db.initialize()
+        backend = self.db.initialize(sqlite_only=True)
         logger.info("Database initialized with backend: %s (%s)", backend, self.db.connection_diagnostic)
 
         # 3. Start Batch Writer

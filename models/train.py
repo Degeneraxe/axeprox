@@ -105,6 +105,13 @@ def build_dataset_from_db(
     if has_suspect:
         where_clauses.append("(is_suspect = 0 OR is_suspect IS NULL)")
 
+    execution_target = tgt_label in ("is_viable", "is_executable") or tgt_label.startswith("is_profitable_")
+    if execution_target and (active_version == "v2.2" or dataset_version is None):
+        if "execution_evidence_json" not in cols:
+            conn.close()
+            raise ValueError("Arrival-based execution labels require recorded arrival evidence")
+        where_clauses.append("json_extract(execution_evidence_json, '$.status') IN ('priced','insufficient_depth')")
+
     query = f"SELECT * FROM spread_events WHERE {' AND '.join(where_clauses)} ORDER BY open_time ASC"
     cur.execute(query, tuple(params))
     events = [dict(r) for r in cur.fetchall()]
@@ -146,7 +153,11 @@ def build_dataset_from_db(
         log_dur = float(ev.get("log_duration", math.log1p(max(0.0, dur))))
         targets_reg.append(log_dur)
 
+        evidence = json.loads(ev.get("execution_evidence_json") or "{}")
         for lbl_k in class_balances:
+            if (ev.get("dataset_version") == "v2.2" and not lbl_k.startswith("is_persistent_")
+                    and evidence.get("status") not in ("priced", "insufficient_depth")):
+                continue
             val = ev.get(lbl_k)
             if val == 1 or val is True:
                 class_balances[lbl_k]["pos"] += 1

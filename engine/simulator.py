@@ -10,6 +10,7 @@ Implements Amendments 1 and 7:
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 import uuid
@@ -23,6 +24,21 @@ from data.storage.db_manager import DatabaseManager
 from engine.cost_model import CostModel
 
 logger = logging.getLogger(__name__)
+
+
+def arrival_books(buffers, symbol, buy_exchange, sell_exchange, arrival_ms):
+    """Find each venue's most recent received book at or before simulated arrival."""
+    books = []
+    for venue in (buy_exchange, sell_exchange):
+        history = buffers.get((venue.lower(), symbol), ())
+        book = next((b for b in reversed(history) if b.local_ts_ms <= arrival_ms), None)
+        if (book is None or book.quote_currency != "USDT" or book.is_crossed
+                or arrival_ms - book.local_ts_ms > 250 or not book.best_bid or not book.best_ask):
+            return None
+        books.append(book)
+    if abs(books[0].local_ts_ms - books[1].local_ts_ms) > 100:
+        return None
+    return tuple(books)
 
 
 @dataclass
@@ -108,6 +124,7 @@ class ExecutionSimulator:
         opportunity_duration_ms: Optional[float] = None,
         quantity: Optional[float] = None,
         fee_scenario: Optional[str] = None,
+        arrival_latency_ms: Optional[float] = None,
     ) -> SimulatedTradeResult:
         """Executes simulated paper trade against real order book depth snapshots.
         
@@ -120,37 +137,18 @@ class ExecutionSimulator:
         trade_id = f"trd_{uuid.uuid4().hex[:10]}"
         now_ms = time.time() * 1000.0
         now_iso = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc).isoformat()
-        target_qty = quantity or self.trade_sizes.get(symbol, 0.05)
+        target_qty = self.trade_sizes.get(symbol, 0.05) if quantity is None else quantity
+        if not math.isfinite(target_qty) or target_qty <= 0:
+            raise ValueError("Trade quantity must be positive and finite")
+        if buy_snap.quote_currency != "USDT" or sell_snap.quote_currency != "USDT":
+            raise ValueError("USDT books are required for USDT paper P&L")
+        fee_buy, fee_sell = self.taker_rates(buy_snap, sell_snap, fee_scenario)
 
-        # 1. Sample Empirical Latency
-        injected_lat = self.sample_latency_ms()
-
-        # 2. Race against time: Fleeting Opportunity Check
-        # If the spread closes before the order reaches the matching engines, the trade fails.
-        if opportunity_duration_ms is not None and opportunity_duration_ms < injected_lat:
-            result = SimulatedTradeResult(
-                trade_id=trade_id,
-                event_id=event_id,
-                timestamp_ms=now_ms,
-                timestamp_iso=now_iso,
-                symbol=symbol,
-                buy_exchange=buy_snap.exchange,
-                sell_exchange=sell_snap.exchange,
-                target_quantity=target_qty,
-                filled_quantity=0.0,
-                buy_vwap=0.0,
-                sell_vwap=0.0,
-                buy_slippage_bps=0.0,
-                sell_slippage_bps=0.0,
-                buy_fee_usdt=0.0,
-                sell_fee_usdt=0.0,
-                gross_pnl_usdt=0.0,
-                net_pnl_usdt=0.0,
-                injected_latency_ms=injected_lat,
-                status="FLEETING",
-            )
-            self._record_result(result)
-            return result
+        # An explicit arrival delay is supplied by live and replay callers.
+        # Without one this is a static, zero-delay depth calculation.
+        injected_lat = 0.0 if arrival_latency_ms is None else float(arrival_latency_ms)
+        if not math.isfinite(injected_lat) or injected_lat < 0:
+            raise ValueError("Arrival latency must be finite and nonnegative")
 
         # 3. Depth-Walking Order Book VWAP (Amendment 7)
         buy_vwap, buy_filled, buy_complete = buy_snap.compute_vwap("buy", target_qty)
@@ -159,31 +157,9 @@ class ExecutionSimulator:
         filled_qty = min(buy_filled, sell_filled)
 
         if not buy_complete or not sell_complete or filled_qty <= 0:
-            status = "PARTIAL" if filled_qty > 0 else "INSUFFICIENT_LIQUIDITY"
-            if filled_qty <= 0:
-                result = SimulatedTradeResult(
-                    trade_id=trade_id,
-                    event_id=event_id,
-                    timestamp_ms=now_ms,
-                    timestamp_iso=now_iso,
-                    symbol=symbol,
-                    buy_exchange=buy_snap.exchange,
-                    sell_exchange=sell_snap.exchange,
-                    target_quantity=target_qty,
-                    filled_quantity=0.0,
-                    buy_vwap=0.0,
-                    sell_vwap=0.0,
-                    buy_slippage_bps=0.0,
-                    sell_slippage_bps=0.0,
-                    buy_fee_usdt=0.0,
-                    sell_fee_usdt=0.0,
-                    gross_pnl_usdt=0.0,
-                    net_pnl_usdt=0.0,
-                    injected_latency_ms=injected_lat,
-                    status=status,
-                )
-                self._record_result(result)
-                return result
+            # The paired paper baseline assumes all-or-none on both legs.
+            buy_vwap = sell_vwap = filled_qty = 0.0
+            status = "INSUFFICIENT_LIQUIDITY"
         else:
             status = "FILLED"
 
@@ -191,20 +167,10 @@ class ExecutionSimulator:
         best_ask = buy_snap.best_ask.price if buy_snap.best_ask else buy_vwap
         best_bid = sell_snap.best_bid.price if sell_snap.best_bid else sell_vwap
 
-        buy_slippage_bps = max(0.0, ((buy_vwap - best_ask) / best_ask) * 10000.0)
-        sell_slippage_bps = max(0.0, ((best_bid - sell_vwap) / best_bid) * 10000.0)
-
-        # 5. Venue Fee Calculation
-        # Under zero_maker, high-frequency traders use Maker/Taker routing (0 bps maker leg + taker leg)
-        if fee_scenario == "zero_maker":
-            fee_rate_buy = self.cost_model.get_fee_bps(buy_snap.exchange, role="maker", scenario=fee_scenario) / 10000.0
-            fee_rate_sell = self.cost_model.get_fee_bps(sell_snap.exchange, role="taker", scenario=fee_scenario) / 10000.0
-        else:
-            fee_rate_buy = self.cost_model.get_fee_bps(buy_snap.exchange, role="taker", scenario=fee_scenario) / 10000.0
-            fee_rate_sell = self.cost_model.get_fee_bps(sell_snap.exchange, role="taker", scenario=fee_scenario) / 10000.0
-
-        buy_fee_usdt = (buy_vwap * filled_qty) * fee_rate_buy
-        sell_fee_usdt = (sell_vwap * filled_qty) * fee_rate_sell
+        buy_slippage_bps = max(0.0, (buy_vwap / best_ask - 1) * 10000) if filled_qty else 0.0
+        sell_slippage_bps = max(0.0, (1 - sell_vwap / best_bid) * 10000) if filled_qty else 0.0
+        buy_fee_usdt = buy_vwap * filled_qty * fee_buy
+        sell_fee_usdt = sell_vwap * filled_qty * fee_sell
 
         # 6. Realized Gross and Net P&L Accounting
         gross_pnl = (sell_vwap - buy_vwap) * filled_qty
@@ -238,6 +204,19 @@ class ExecutionSimulator:
 
         self._record_result(result)
         return result
+
+    def taker_rates(
+        self, buy_snap: OrderBookSnapshot, sell_snap: OrderBookSnapshot, scenario: Optional[str]
+    ) -> tuple[float, float]:
+        schedules = self.config.raw["fee_scenarios"]
+        schedule = schedules["scenarios"][scenario or schedules["active_scenario"]]
+        for book in (buy_snap, sell_snap):
+            if "taker_bps" not in schedule.get(book.exchange.lower(), {}):
+                raise ValueError(f"No taker fee configured for {book.exchange}")
+        return (
+            self.cost_model.get_fee_bps(buy_snap.exchange, role="taker", scenario=scenario) / 10000,
+            self.cost_model.get_fee_bps(sell_snap.exchange, role="taker", scenario=scenario) / 10000,
+        )
 
     def _record_result(self, result: SimulatedTradeResult) -> None:
         self.execution_history.append(result)

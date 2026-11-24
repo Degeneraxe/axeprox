@@ -47,7 +47,7 @@ async def run_pipeline(collection_duration_sec: int = 15):
 
     # 2. Database
     db = DatabaseManager(sqlite_path="data/arbsense.db")
-    backend = db.initialize()
+    backend = db.initialize(sqlite_only=True)
     print(f"[*] Storage initialized: {backend.upper()} ({db.connection_diagnostic})")
 
     # 3. Engines
@@ -61,21 +61,12 @@ async def run_pipeline(collection_duration_sec: int = 15):
 
     executed_trades = []
 
-    def on_spread_closed(evt: ActiveSpreadEvent):
-        # Execute paper trade if opportunity is candidate
-        buy_snap = normalizer.get_snapshot(evt.buy_exchange, evt.symbol, clock_sync.get_corrected_time_ms())
-        sell_snap = normalizer.get_snapshot(evt.sell_exchange, evt.symbol, clock_sync.get_corrected_time_ms())
-        if buy_snap and sell_snap and not buy_snap.is_stale and not sell_snap.is_stale:
-            res = simulator.execute_arbitrage(
-                symbol=evt.symbol,
-                buy_snap=buy_snap,
-                sell_snap=sell_snap,
-                event_id=evt.event_id,
-                opportunity_duration_ms=evt.duration_ms,
-            )
-            executed_trades.append(res)
+    def on_arrival(evt, buy_snap, sell_snap):
+        result = simulator.execute_arbitrage(evt.symbol, buy_snap, sell_snap, event_id=evt.event_id,
+                                             arrival_latency_ms=evt.latency_threshold_ms)
+        executed_trades.append(result)
 
-    tracker = SpreadTracker(db_manager=db, config=config, on_event_closed=on_spread_closed)
+    tracker = SpreadTracker(db_manager=db, config=config, normalizer=normalizer, on_arrival=on_arrival)
     batch_writer = BatchWriter(db_manager=db, batch_size=50, flush_interval_sec=0.5)
     await batch_writer.start()
 
@@ -86,7 +77,7 @@ async def run_pipeline(collection_duration_sec: int = 15):
 
         now_ms = clock_sync.get_corrected_time_ms()
         for sym in ["BTC/USDT", "ETH/USDT"]:
-            cands = detector.scan_symbol(sym, now_ms)
+            cands = detector.scan_symbol(sym, now_ms, active_pairs=set(tracker.active_events))
             for c in cands:
                 tracker.process_candidate(c)
         tracker.check_timeouts(now_ms)
@@ -110,7 +101,7 @@ async def run_pipeline(collection_duration_sec: int = 15):
     # Stop Feeds
     for f in feeds:
         await f.stop()
-    tracker.check_timeouts(clock_sync.get_corrected_time_ms() + 5000.0)
+    tracker.finish(clock_sync.get_corrected_time_ms())
     await batch_writer.stop()
 
     print("\n" + "=" * 80)

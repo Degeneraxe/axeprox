@@ -31,7 +31,7 @@ from config.settings import AppConfig
 from data.normalizer import OrderBookLevel, OrderBookSnapshot
 from data.storage.db_manager import DatabaseManager
 from engine.cost_model import CostModel
-from engine.simulator import ExecutionSimulator
+from engine.simulator import ExecutionSimulator, arrival_books
 
 # ------------------------------------------------------------------------------
 # Page Configuration
@@ -97,13 +97,30 @@ def load_config() -> AppConfig:
 
 def calculate_route_hurdle(buy_venue: str, sell_venue: str, scenario: str, cost_model: CostModel) -> float:
     """Computes exact fee hurdle (bps) for a cross-exchange route under active scenario."""
-    if scenario == "zero_maker":
-        fee_buy = cost_model.get_fee_bps(buy_venue, role="maker", scenario=scenario)
-        fee_sell = cost_model.get_fee_bps(sell_venue, role="taker", scenario=scenario)
-    else:
-        fee_buy = cost_model.get_fee_bps(buy_venue, role="taker", scenario=scenario)
-        fee_sell = cost_model.get_fee_bps(sell_venue, role="taker", scenario=scenario)
-    return fee_buy + fee_sell
+    buy = cost_model.get_fee_bps(buy_venue, "taker", scenario)
+    sell = cost_model.get_fee_bps(sell_venue, "taker", scenario)
+    return (buy + sell) / (1 - sell / 10000)
+
+
+def replay_books(cur, symbol, venues, timestamp):
+    histories = {}
+    for venue in venues:
+        cur.execute("""SELECT * FROM orderbook_ticks WHERE exchange = ? AND symbol = ?
+                       AND local_ts_ms <= ? ORDER BY local_ts_ms DESC, id DESC LIMIT 1""",
+                    (venue, symbol, timestamp))
+        row = cur.fetchone()
+        if row is None or row["is_stale"]:
+            return None
+        def levels(column):
+            return [OrderBookLevel(float(x["p"]), float(x["a"])) for x in json.loads(row[column] or "[]")]
+        bids, asks = levels("bid_depth"), levels("ask_depth")
+        if not bids or not asks or bids[0].price >= asks[0].price:
+            return None
+        book = OrderBookSnapshot(venue, symbol, row["quote_currency"], row["exchange_ts_ms"],
+                                 row["local_ts_ms"], row["transit_latency_ms"], bids, asks)
+        histories[venue, symbol] = [book]
+    return arrival_books(histories, symbol, *venues, timestamp)
+
 
 
 def main():
@@ -154,7 +171,7 @@ def main():
     elif fee_scenario == "vip3":
         st.sidebar.caption("VIP 3 institutional: 6–20 bps taker fees. Moderate spreads profit.")
     elif fee_scenario == "zero_maker":
-        st.sidebar.caption("Zero-Maker / HFT: 0 bps maker + 7.5–25 bps taker. High net alpha.")
+        st.sidebar.caption("Depth-taking orders pay the configured taker fee on each leg.")
 
     st.sidebar.markdown("---")
     if st.sidebar.button("🔄 Refresh Data Now", use_container_width=True):
@@ -406,7 +423,7 @@ def main():
                 default_qty = 0.05 if "BTC" in trade_sym else (0.50 if "ETH" in trade_sym else 10.0)
                 trade_qty = st.number_input(
                     "Order Size",
-                    value=float(default_qty),
+                    value=float(default_qty), min_value=0.0001,
                     step=0.01 if "BTC" in trade_sym or "ETH" in trade_sym else 1.0,
                     format="%.4f" if "BTC" in trade_sym or "ETH" in trade_sym else "%.1f",
                 )
@@ -429,45 +446,19 @@ def main():
 
                 test_pipeline_btn = st.button("🧪 Simulate In-Memory Paper Trade", use_container_width=True)
                 if test_pipeline_btn:
-                    b_asks = [OrderBookLevel(b_tick["best_ask"], trade_qty * 3)]
-                    s_bids = [OrderBookLevel(s_tick["best_bid"], trade_qty * 3)]
-
-                    buy_snap = OrderBookSnapshot(
-                        exchange=buy_venue,
-                        symbol=trade_sym,
-                        quote_currency="USDT",
-                        exchange_ts_ms=b_tick["exchange_ts_ms"],
-                        local_ts_ms=b_tick["local_ts_ms"],
-                        transit_latency_ms=b_tick["transit_latency_ms"],
-                        asks=b_asks,
-                    )
-                    sell_snap = OrderBookSnapshot(
-                        exchange=sell_venue,
-                        symbol=trade_sym,
-                        quote_currency="USDT",
-                        exchange_ts_ms=s_tick["exchange_ts_ms"],
-                        local_ts_ms=s_tick["local_ts_ms"],
-                        transit_latency_ms=s_tick["transit_latency_ms"],
-                        bids=s_bids,
-                    )
-
-                    # In-memory execution simulator: db_manager=None guarantees ZERO database writes
-                    simulator = ExecutionSimulator(db_manager=None, config=config)
-                    trade_res = simulator.execute_arbitrage(
-                        symbol=trade_sym,
-                        buy_snap=buy_snap,
-                        sell_snap=sell_snap,
-                        quantity=trade_qty,
-                        fee_scenario=fee_scenario,
-                        opportunity_duration_ms=600.0,
-                    )
-
-                    if trade_res.status == "FILLED":
-                        st.success(
-                            f"✅ **Trade Simulated FILLED!** Bought {trade_res.filled_quantity} {trade_sym} on {buy_venue.upper()} at VWAP ${trade_res.buy_vwap:,.2f}, Sold on {sell_venue.upper()} at VWAP ${trade_res.sell_vwap:,.2f}. Gross P&L: ${trade_res.gross_pnl_usdt:+.2f} | Fees: -${(trade_res.buy_fee_usdt + trade_res.sell_fee_usdt):.2f} | **Net P&L: {trade_res.net_pnl_usdt:+.2f} USDT** (Injected Latency: {trade_res.injected_latency_ms:.1f}ms)"
-                        )
+                    simulator = ExecutionSimulator(config=config)
+                    delay = simulator.viability_latency_threshold_ms
+                    arrival = min(b_tick["local_ts_ms"], s_tick["local_ts_ms"])
+                    venues = (buy_venue, sell_venue)
+                    decision_books = replay_books(cur, trade_sym, venues, arrival - delay)
+                    books = replay_books(cur, trade_sym, venues, arrival)
+                    if buy_venue == sell_venue or not decision_books or not books:
+                        st.info("Replay requires two venues with fresh recorded depth at decision and arrival.")
                     else:
-                        st.warning(f"⚠️ Simulated Status: {trade_res.status} (Injected Latency: {trade_res.injected_latency_ms:.1f}ms)")
+                        result = simulator.execute_arbitrage(trade_sym, *books, quantity=trade_qty,
+                                                             fee_scenario=fee_scenario, arrival_latency_ms=delay)
+                        st.write(f"Historical replay · {result.status} · {delay:g} ms delay · "
+                                 f"Net P&L {result.net_pnl_usdt:+.4f} USDT")
             else:
                 st.info(f"Awaiting book updates from {buy_venue.upper()} and {sell_venue.upper()} for {trade_sym}...")
 

@@ -9,6 +9,7 @@ From stored events in the validated database:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -22,11 +23,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+from config.settings import AppConfig
+
+
 def run_break_even_analysis(
     db_path: str = "data/arbsense.db",
-    version: str = "v2.0",
+    version: str | None = None,
     exclude_censored: bool = True,
 ) -> Dict[str, Any]:
+    version = version or AppConfig.load().raw["dataset"]["version"]
     full_path = Path(db_path)
     if not full_path.is_absolute():
         full_path = PROJECT_ROOT / full_path
@@ -39,19 +44,7 @@ def run_break_even_analysis(
     cur = conn.cursor()
 
     query = """
-        SELECT 
-            event_id,
-            symbol,
-            buy_exchange,
-            sell_exchange,
-            open_spread_bps,
-            peak_spread_bps,
-            slippage_bps,
-            cost_hurdle_bps,
-            duration_ms,
-            is_right_censored,
-            is_viable,
-            is_executable
+        SELECT *
         FROM spread_events
         WHERE dataset_version = ?
     """
@@ -68,7 +61,7 @@ def run_break_even_analysis(
         return {}
 
     events = [dict(r) for r in rows]
-    total_n = len(events)
+    print(f"Selected {len(events)} event rows.")
 
     # Compute break-even round-trip fee hurdle per event: peak_spread_bps - slippage_bps
     # (i.e. the maximum round-trip fee an execution can bear before becoming net negative)
@@ -79,8 +72,16 @@ def run_break_even_analysis(
 
     for ev in events:
         peak = float(ev["peak_spread_bps"] if ev["peak_spread_bps"] is not None else 0.0)
-        slip = float(ev["slippage_bps"] if ev["slippage_bps"] is not None else 0.0)
-        be = peak - slip
+        if ev["slippage_bps"] is None:
+            continue
+        slip = float(ev["slippage_bps"])
+        if version == "v2.2":
+            evidence = json.loads(ev.get("execution_evidence_json") or "{}")
+            if evidence.get("status") != "priced":
+                continue
+            be = 10000 * (evidence["sell_vwap"] / evidence["buy_vwap"] - 1)
+        else:
+            be = peak - slip
         break_evens.append(be)
         slippages.append(slip)
         peaks.append(peak)
@@ -90,6 +91,12 @@ def run_break_even_analysis(
             per_symbol[sym] = []
         per_symbol[sym].append(be)
 
+    total_n = len(break_evens)
+    if not total_n:
+        print("No priced observations for this analysis.")
+        return {}
+    if version != "v2.2":
+        print("Historical peak-based screening estimates.")
     arr = np.array(break_evens, dtype=np.float64)
     arr_peaks = np.array(peaks, dtype=np.float64)
     arr_slips = np.array(slippages, dtype=np.float64)
@@ -126,7 +133,7 @@ def run_break_even_analysis(
     print(f"  - Slippage (VWAP):  Mean = {np.mean(arr_slips):5.2f} bps | Median = {np.median(arr_slips):5.2f} bps | Max = {np.max(arr_slips):5.2f} bps")
     print(f"  - Effective Spread: Mean = {mean_val:5.2f} bps | Median = {p50:5.2f} bps | Max = {max_val:5.2f} bps")
 
-    print("\n2. DISTRIBUTION OF BREAK-EVEN ROUND-TRIP FEE HURDLES (peak_bps - slippage_bps):")
+    print("\n2. DISTRIBUTION OF BREAK-EVEN ROUND-TRIP FEE HURDLES:")
     print(f"  {'Metric':<20} {'Value (bps)':>12}")
     print("  " + "-" * 32)
     print(f"  {'Min':<20} {min_val:>12.2f}")
@@ -177,7 +184,7 @@ def run_break_even_analysis(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ArbSense Break-Even Spread Analysis")
     parser.add_argument("--db", default="data/arbsense.db", help="Path to SQLite database")
-    parser.add_argument("--version", default="v2.0", help="Dataset version to analyze")
+    parser.add_argument("--version", default=None, help="Dataset version (defaults to active config)")
     parser.add_argument("--include-censored", action="store_true", help="Include right-censored events")
     args = parser.parse_args()
 

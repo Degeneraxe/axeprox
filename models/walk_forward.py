@@ -108,6 +108,7 @@ def load_events_from_db(
     cur = conn.cursor()
 
     cfg = AppConfig.load()
+    explicit_version = dataset_version is not None
     if dataset_version is None:
         dataset_version = cfg.raw.get("dataset", {}).get("version", "v2.1")
     use_latency = bool(cfg.raw.get("features", {}).get("use_latency", False))
@@ -116,28 +117,12 @@ def load_events_from_db(
     # Discover valid dataset versions in DB if active not present
     cur.execute("SELECT DISTINCT dataset_version FROM spread_events WHERE dataset_version NOT LIKE 'invalid%' AND dataset_version IS NOT NULL")
     avail = [r[0] for r in cur.fetchall()]
-    if dataset_version not in avail and avail:
+    execution_target = target_label in ("is_executable", "is_viable") or target_label.startswith("is_profitable_")
+    if not explicit_version and not execution_target and dataset_version not in avail and avail:
         dataset_version = avail[-1]
 
     cur.execute("""
-        SELECT 
-            event_id,
-            symbol,
-            buy_exchange,
-            sell_exchange,
-            open_time,
-            close_time,
-            duration_ms,
-            open_spread_bps,
-            cost_hurdle_bps,
-            slippage_bps,
-            is_persistent_500ms,
-            is_persistent_2000ms,
-            is_persistent_5000ms,
-            is_executable,
-            is_viable,
-            is_right_censored,
-            feature_window_json
+        SELECT *
         FROM spread_events
         WHERE dataset_version = ?
           AND feature_window_json IS NOT NULL
@@ -154,6 +139,10 @@ def load_events_from_db(
     event_times_queue_per_pair: Dict[Tuple[str, str, str], List[float]] = {}
 
     for r in rows:
+        if execution_target and dataset_version == "v2.2":
+            evidence = json.loads(r["execution_evidence_json"] or "{}")
+            if evidence.get("status") not in ("priced", "insufficient_depth"):
+                continue
         win_str = r["feature_window_json"]
         if not win_str:
             continue
@@ -177,7 +166,7 @@ def load_events_from_db(
         else:
             raw_target = 1 if dur >= 500.0 else 0
 
-        target_cls = int(raw_target) if not is_cens else (1 if dur >= 500.0 else 0)
+        target_cls = int(raw_target) if execution_target or not is_cens else (1 if dur >= 500.0 else 0)
 
         sym = r["symbol"]
         buy_ex = r["buy_exchange"]

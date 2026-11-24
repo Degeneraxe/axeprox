@@ -37,6 +37,7 @@ class SpreadCandidate:
     timestamp_ms: float
     quote_age_buy_ms: float
     quote_age_sell_ms: float
+    native_usdt_route: bool = True
 
 
 class CrossExchangeDetector:
@@ -59,6 +60,8 @@ class CrossExchangeDetector:
         symbol: str,
         current_time_ms: float,
         active_pairs: Optional[set] = None,
+        *,
+        paper_usdt_only: bool = False,
     ) -> List[SpreadCandidate]:
         """Scans all directed exchange pairs for a symbol and returns detected spreads.
         
@@ -71,7 +74,7 @@ class CrossExchangeDetector:
         snaps: Dict[str, OrderBookSnapshot] = {}
         for exch in self.exchanges:
             s = self.normalizer.get_snapshot(exch, symbol, current_time_ms)
-            if not s or s.is_stale:
+            if (not s or s.is_stale) and not paper_usdt_only:
                 # Fallback to USD quote if USDT is not directly present or is stale
                 s_usd = self.normalizer.get_snapshot(exch, symbol.replace("USDT", "USD"), current_time_ms)
                 if s_usd and not s_usd.is_stale:
@@ -105,7 +108,7 @@ class CrossExchangeDetector:
                 # Minimum depth liquidity filter (Task 3):
                 # Top-N-levels notional/quantity must exceed configured trade size for both legs
                 det_cfg = self.config.raw.get("detection", {})
-                if det_cfg.get("min_depth_filter_enabled", True):
+                if not paper_usdt_only and det_cfg.get("min_depth_filter_enabled", True):
                     top_n = int(det_cfg.get("min_depth_levels", 5))
                     trade_sizes = self.config.raw.get("simulation", {}).get("trade_sizes", {})
                     min_qty = float(trade_sizes.get(symbol, 0.0))
@@ -122,7 +125,7 @@ class CrossExchangeDetector:
                             continue
 
                 # Basis staleness guard (Item 1): flag Coinbase books unusable if basis > 5 min stale
-                if buy_exch.lower() == "coinbase" or sell_exch.lower() == "coinbase":
+                if not paper_usdt_only and (buy_exch == "coinbase" or sell_exch == "coinbase"):
                     if hasattr(self.normalizer, "is_basis_stale") and self.normalizer.is_basis_stale(300.0):
                         if (current_time_ms - getattr(self, "_last_stale_warn_ms", 0.0)) >= 30000.0:
                             logger.warning(
@@ -178,6 +181,7 @@ class CrossExchangeDetector:
                     timestamp_ms=current_time_ms,
                     quote_age_buy_ms=snap_buy.quote_age_ms,
                     quote_age_sell_ms=snap_sell.quote_age_ms,
+                    native_usdt_route=(snap_buy.quote_currency == snap_sell.quote_currency == "USDT"),
                 )
 
                 is_active = (active_pairs is not None) and ((symbol, buy_exch, sell_exch) in active_pairs)

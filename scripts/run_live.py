@@ -98,14 +98,14 @@ class UnifiedLiveService:
         self.cumulative_ticks += 1
         self.tick_counts[exchange] = self.tick_counts.get(exchange, 0) + 1
         self.batch_writer.enqueue_snapshot(snap)
-        self.tracker.record_tick(snap)
+        self.tracker.observe_arrivals(loc_ts)
 
         # Dynamic USDT/USD basis synchronization from Kraken or Coinbase USDT/USD ticker (Fix A)
         if snap.symbol == "USDT/USD" and snap.mid_price > 0:
             self.normalizer.set_usdt_usd_basis(snap.mid_price)
 
         # Trigger detection for this symbol if it's one of our supported pairs
-        base_symbol = snap.symbol.replace("/USD", "/USDT")
+        base_symbol = snap.symbol.removesuffix("/USD") + "/USDT" if snap.symbol.endswith("/USD") else snap.symbol
         if base_symbol in self.config.markets.supported_pairs:
             active_pairs = set(self.tracker.active_events.keys())
             candidates = self.detector.scan_symbol(base_symbol, loc_ts, active_pairs=active_pairs)
@@ -121,37 +121,40 @@ class UnifiedLiveService:
         """Periodically polls REST USDT/USD rate as fallback and logs current basis rate (Fix A & Requirement 1)."""
         import urllib.request
         import json
+        def fetch_rates():
+            rates = []
+            try:
+                req_cb = urllib.request.Request(
+                    "https://api.exchange.coinbase.com/products/USDT-USD/ticker",
+                    headers={"User-Agent": "ArbSenseBasis/1.0"}
+                )
+                with urllib.request.urlopen(req_cb, timeout=3.0) as resp:
+                    d = json.loads(resp.read().decode())
+                    if "bid" in d and "ask" in d:
+                        rates.append((float(d["bid"]) + float(d["ask"])) / 2.0)
+            except Exception as e:
+                self.basis_poll_failures += 1
+                logger.warning("[BasisUpdater] Failed to poll Coinbase USDT-USD ticker: %s (failure count: %d)", e, self.basis_poll_failures)
+
+            try:
+                req_kr = urllib.request.Request(
+                    "https://api.kraken.com/0/public/Ticker?pair=USDTUSD",
+                    headers={"User-Agent": "ArbSenseBasis/1.0"}
+                )
+                with urllib.request.urlopen(req_kr, timeout=3.0) as resp:
+                    d = json.loads(resp.read().decode())
+                    res = d.get("result", {})
+                    k = list(res.keys())[0] if res else None
+                    if k:
+                        rates.append((float(res[k]["b"][0]) + float(res[k]["a"][0])) / 2.0)
+            except Exception as e:
+                self.basis_poll_failures += 1
+                logger.warning("[BasisUpdater] Failed to poll Kraken USDTUSD ticker: %s (failure count: %d)", e, self.basis_poll_failures)
+            return rates
+
         while self._running:
             try:
-                rates = []
-                try:
-                    req_cb = urllib.request.Request(
-                        "https://api.exchange.coinbase.com/products/USDT-USD/ticker",
-                        headers={"User-Agent": "ArbSenseBasis/1.0"}
-                    )
-                    with urllib.request.urlopen(req_cb, timeout=3.0) as resp:
-                        d = json.loads(resp.read().decode())
-                        if "bid" in d and "ask" in d:
-                            rates.append((float(d["bid"]) + float(d["ask"])) / 2.0)
-                except Exception as e:
-                    self.basis_poll_failures += 1
-                    logger.warning("[BasisUpdater] Failed to poll Coinbase USDT-USD ticker: %s (failure count: %d)", e, self.basis_poll_failures)
-
-                try:
-                    req_kr = urllib.request.Request(
-                        "https://api.kraken.com/0/public/Ticker?pair=USDTUSD",
-                        headers={"User-Agent": "ArbSenseBasis/1.0"}
-                    )
-                    with urllib.request.urlopen(req_kr, timeout=3.0) as resp:
-                        d = json.loads(resp.read().decode())
-                        res = d.get("result", {})
-                        k = list(res.keys())[0] if res else None
-                        if k:
-                            rates.append((float(res[k]["b"][0]) + float(res[k]["a"][0])) / 2.0)
-                except Exception as e:
-                    self.basis_poll_failures += 1
-                    logger.warning("[BasisUpdater] Failed to poll Kraken USDTUSD ticker: %s (failure count: %d)", e, self.basis_poll_failures)
-
+                rates = await asyncio.to_thread(fetch_rates)
                 if rates:
                     mean_rate = float(sum(rates) / len(rates))
                     self.normalizer.set_usdt_usd_basis(mean_rate)
@@ -185,7 +188,7 @@ class UnifiedLiveService:
         )
 
         # 2. Init Storage Layer
-        backend = self.db.initialize()
+        backend = self.db.initialize(sqlite_only=True)
         logger.info("Database initialized: backend=%s (%s)", backend, self.db.connection_diagnostic)
 
         # Store initial NTP offset sample
@@ -363,6 +366,7 @@ class UnifiedLiveService:
         logger.info("Initiating graceful shutdown of feeds and storage queues...")
         for feed in self.feeds:
             await feed.stop()
+        self.tracker.finish(clock_sync.get_corrected_time_ms())
         await self.batch_writer.stop()
         self.db.close()
         logger.info("Unified Live Service stopped cleanly.")

@@ -44,7 +44,7 @@ class DatabaseManager:
         self.connection_diagnostic: str = ""
         self._sqlite_conn: Optional[sqlite3.Connection] = None
 
-    def initialize(self) -> str:
+    def initialize(self, *, sqlite_only: bool = False) -> str:
         """Probes TimescaleDB connection, applies migrations, or falls back to SQLite."""
         if self.read_only:
             self.backend_type = "sqlite"
@@ -57,7 +57,7 @@ class DatabaseManager:
             return self.backend_type
 
         # 1. Probe TimescaleDB / PostgreSQL
-        ts_ok, ts_diag = self._probe_timescaledb()
+        ts_ok, ts_diag = (False, "SQLite selected") if sqlite_only else self._probe_timescaledb()
         if ts_ok:
             try:
                 self._init_timescaledb()
@@ -192,6 +192,7 @@ class DatabaseManager:
         cur.execute("PRAGMA table_info(spread_events);")
         existing_cols = {row[1] for row in cur.fetchall()}
         for col_name, col_type in [
+            ("execution_evidence_json", "TEXT"),
             ("feature_window_json", "TEXT"),
             ("vol_buy_bps", "REAL"),
             ("vol_sell_bps", "REAL"),
@@ -398,17 +399,33 @@ class DatabaseManager:
                 1 if event.get("is_suspect", False) else 0,
                 event.get("lifetime_ticks_json"),
                 str(event.get("dataset_version", "v1.0")),
-                float(event.get("slippage_bps", 0.0)),
+                event.get("slippage_bps"),
                 1 if event.get("is_executable", False) else 0,
-                float(event.get("net_peak_retail", 0.0)),
+                event.get("net_peak_retail"),
                 1 if event.get("is_profitable_retail", False) else 0,
-                float(event.get("net_peak_vip1", 0.0)),
+                event.get("net_peak_vip1"),
                 1 if event.get("is_profitable_vip1", False) else 0,
-                float(event.get("net_peak_vip3", 0.0)),
+                event.get("net_peak_vip3"),
                 1 if event.get("is_profitable_vip3", False) else 0,
-                float(event.get("net_peak_zero_maker", 0.0)),
+                event.get("net_peak_zero_maker"),
                 1 if event.get("is_profitable_zero_maker", False) else 0,
             ))
+            self._sqlite_conn.commit()
+
+    def record_arrival(self, event, evidence: dict) -> None:
+        if self.read_only:
+            raise RuntimeError("Database is in read-only mode")
+        if self._sqlite_conn:
+            fields = {"execution_evidence_json": json.dumps(evidence),
+                      "slippage_bps": event.slippage_bps, "is_viable": event.is_viable,
+                      "is_executable": event.is_executable}
+            for tier in ("retail", "vip1", "vip3", "zero_maker"):
+                for prefix in ("net_peak_", "is_profitable_"):
+                    key = prefix + tier
+                    fields[key] = getattr(event, key)
+            assignments = ", ".join(f"{key} = ?" for key in fields)
+            self._sqlite_conn.execute(f"UPDATE spread_events SET {assignments} WHERE event_id = ?",
+                                      (*fields.values(), event.event_id))
             self._sqlite_conn.commit()
 
     def update_spread_event(self, event_id: str, updates: Dict[str, Any]) -> None:
@@ -645,9 +662,12 @@ class DatabaseManager:
         if keep_latest_per_symbol is None:
             try:
                 from config.settings import AppConfig
-                keep_latest_per_symbol = int(AppConfig.load().raw.get("storage", {}).get("tick_prune_keep_count", 1500))
+                keep_latest_per_symbol = int(AppConfig.load().raw.get("storage", {}).get("tick_prune_keep_count", 0))
             except Exception:
-                keep_latest_per_symbol = 1500
+                keep_latest_per_symbol = 0
+
+        if keep_latest_per_symbol <= 0:
+            return 0
 
         if self._sqlite_conn:
             cur = self._sqlite_conn.cursor()

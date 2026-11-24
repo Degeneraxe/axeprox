@@ -26,7 +26,7 @@ class BatchWriter:
         db_manager: DatabaseManager,
         batch_size: int = 50,
         flush_interval_sec: float = 0.5,
-        depth_throttle_ms: int = 100,
+        depth_throttle_ms: int = 0,
     ):
         self.db = db_manager
         self.batch_size = batch_size
@@ -34,6 +34,7 @@ class BatchWriter:
         self.depth_throttle_ms = depth_throttle_ms
 
         self.queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=10000)
+        self._staged: List[Dict[str, Any]] = []
         self._running = False
         self._flush_task: Optional[asyncio.Task] = None
         self._last_depth_write: Dict[Tuple[str, str], float] = {}
@@ -74,15 +75,18 @@ class BatchWriter:
             "ts_source": getattr(snap, "ts_source", "exchange"),
         }
 
-        try:
-            self.queue.put_nowait(tick_record)
-        except asyncio.QueueFull:
-            logger.warning("[Storage] Batch queue full! Dropping oldest tick.")
-            try:
-                self.queue.get_nowait()
-                self.queue.put_nowait(tick_record)
-            except Exception:
-                pass
+        if self.queue.full():
+            # Keep arrival order across both the worker batch and queued snapshots.
+            self._drain_and_write()
+        self.queue.put_nowait(tick_record)
+
+    def _drain_and_write(self) -> None:
+        while not self.queue.empty():
+            self._staged.append(self.queue.get_nowait())
+            self.queue.task_done()
+        if self._staged:
+            self.db.insert_ticks_batch(self._staged)
+            self._staged.clear()
 
     async def start(self) -> None:
         if self._running:
@@ -104,7 +108,7 @@ class BatchWriter:
         logger.info("[Storage] Batch writer stopped.")
 
     async def _flush_worker(self) -> None:
-        batch: List[Dict[str, Any]] = []
+        batch = self._staged
         last_flush_time = time.time()
 
         while self._running:
@@ -121,7 +125,7 @@ class BatchWriter:
                 # Check flush condition
                 if len(batch) >= self.batch_size or ((time.time() - last_flush_time) >= self.flush_interval_sec and batch):
                     self.db.insert_ticks_batch(batch)
-                    batch = []
+                    batch.clear()
                     last_flush_time = time.time()
 
             except asyncio.CancelledError:
@@ -131,13 +135,4 @@ class BatchWriter:
                 await asyncio.sleep(0.1)
 
     async def _flush_remaining(self) -> None:
-        remaining: List[Dict[str, Any]] = []
-        while not self.queue.empty():
-            try:
-                remaining.append(self.queue.get_nowait())
-                self.queue.task_done()
-            except Exception:
-                break
-        if remaining:
-            self.db.insert_ticks_batch(remaining)
-            logger.info("[Storage] Flushed %d remaining ticks on shutdown.", len(remaining))
+        self._drain_and_write()

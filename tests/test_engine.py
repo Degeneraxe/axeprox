@@ -94,7 +94,9 @@ def test_spread_tracker_lifecycle_and_labeling():
     assert closed_evt.is_closed is True
     assert closed_evt.duration_ms == pytest.approx(200.0)
     assert closed_evt.peak_spread_bps == pytest.approx(9.20)
-    assert closed_evt.is_viable is True  # 200ms > 85ms and peak 9.20 > hurdle 5.00
+    assert closed_evt.is_viable is False
+    assert closed_evt.execution_status == "missing_books"
+    assert closed_evt.slippage_bps is None
     assert closed_evt.log_duration == pytest.approx(pytest.approx(5.3033, rel=1e-2))
     assert len(closed_evt.lifetime_ticks) == 3
     assert closed_evt.lifetime_ticks[0]["gross_spread_bps"] == pytest.approx(7.36)
@@ -172,6 +174,19 @@ def test_execution_simulator_vwap_and_pnl():
     )
     assert prof_result.status == "FILLED"
     assert prof_result.net_pnl_usdt > 0.0
+
+    zero_maker_result = simulator.execute_arbitrage(
+        "BTC/USDT", buy_snap, sell_snap, quantity=0.05,
+        fee_scenario="zero_maker", arrival_latency_ms=85.0,
+    )
+    assert zero_maker_result.buy_fee_usdt == pytest.approx(81504.0 * 0.05 * 7.5 / 10000)
+    assert zero_maker_result.injected_latency_ms == 85.0
+    short_depth_result = simulator.execute_arbitrage(
+        "BTC/USDT", buy_snap, sell_snap, quantity=0.085, fee_scenario="vip3",
+    )
+    assert short_depth_result.status == "INSUFFICIENT_LIQUIDITY"
+    assert short_depth_result.filled_quantity == 0.0
+    assert short_depth_result.net_pnl_usdt == 0.0
 
     # Also verify honest recording of losing trade when fees exceed gross alpha (Defect 3)
     bal_before = simulator.virtual_balance
@@ -383,6 +398,9 @@ def test_cumulative_tick_counter(tmp_path):
     assert db.get_tick_count() == 10
     assert db.get_cumulative_tick_count() == 10
 
+    assert db.prune_old_ticks() == 0
+    assert db.get_tick_count() == 10
+
     # Prune down to 3 ticks
     pruned = db.prune_old_ticks(keep_latest_per_symbol=3)
     assert pruned == 7
@@ -568,6 +586,9 @@ def test_redesigned_labels_and_depth_slippage(tmp_path):
         quote_age_buy_ms=5.0,
         quote_age_sell_ms=5.0,
     )
+    # This later quote must never enter the 1085 ms arrival calculation.
+    tracker.record_tick(OrderBookSnapshot("kraken", "BTC/USDT", "USDT", 1100, 1100, 0,
+                                          [OrderBookLevel(80400, 1)], [OrderBookLevel(80410, 1)]))
     tracker.process_candidate(cand_peak)
 
     # Spread collapses below hurdle (to 2.0 bps) at t = 1200.0 ms -> event closes!
@@ -595,23 +616,15 @@ def test_redesigned_labels_and_depth_slippage(tmp_path):
     assert closed_evt.duration_ms == pytest.approx(200.0)
     assert closed_evt.peak_spread_bps == pytest.approx(35.0)
 
-    # Slippage verification: depth walked at trade size (default 100 USDT)
-    # Trade size = 100 USDT << top level notional (80,000 USDT), so slippage ~ 0.0 bps
-    assert closed_evt.slippage_bps is not None
-    assert closed_evt.slippage_bps >= 0.0
+    # Both legs fit at the best price in the 1085 ms arrival books.
+    assert closed_evt.slippage_bps == pytest.approx(0)
+    assert closed_evt.is_executable
+    assert not closed_evt.is_profitable_retail
+    assert closed_evt.net_peak_retail < 0
 
-    # is_executable verification: duration (200ms) >= latency_threshold (85ms) and peak (35 bps) >= slippage (~0 bps)
-    assert closed_evt.is_executable == 1
-
-    # Scenarios:
-    # Retail fees for binance-kraken = ~51.5 bps hurdle
-    # Peak spread = 35.0 bps -> net_peak_retail = 35.0 - 51.5 = -16.5 bps < 0 -> is_profitable_retail = 0
-    assert closed_evt.is_profitable_retail == 0
-    assert closed_evt.net_peak_retail < 0.0
-
-    # Zero maker fees: hurdle = 29.0 bps -> net_peak_zero_maker = 35.0 - 29.0 = +6.0 bps > 0 -> is_profitable_zero_maker = 1
-    assert closed_evt.is_profitable_zero_maker == 1
-    assert closed_evt.net_peak_zero_maker == pytest.approx(6.0)
+    # At arrival the gross spread was 10 bps. Both depth-taking legs pay taker fees.
+    assert closed_evt.is_profitable_zero_maker == 0
+    assert closed_evt.net_peak_zero_maker == pytest.approx(10000 * (80080 / 80000 * (1 - 0.002) - (1 + 0.00075)))
 
     # Database verification
     cur = db._sqlite_conn.cursor()
@@ -625,8 +638,8 @@ def test_redesigned_labels_and_depth_slippage(tmp_path):
     assert row[0] == 1  # is_executable
     assert row[1] == pytest.approx(closed_evt.slippage_bps)
     assert row[3] == 0  # is_profitable_retail
-    assert row[5] == 1  # is_profitable_zero_maker
-    assert row[6] in ("v1.0", "v2.0", "v2.1")
+    assert row[5] == 0  # both depth-taking legs pay taker fees
+    assert row[6] == "v2.2"
     db.close()
 
 

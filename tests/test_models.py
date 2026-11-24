@@ -485,3 +485,13 @@ def test_dataset_version_filtering_and_invalid_v0_exclusion(tmp_path):
         )
 
 
+
+
+def test_tabular_inputs_exclude_arrival_slippage():
+    import numpy as np
+    from models.features import engineer_tabular_features
+    window = np.ones((20, 14))
+    event = {"open_time": 1000, "open_spread_bps": 3, "slippage_bps": None}
+    before = engineer_tabular_features(window, event)
+    event["slippage_bps"] = 100
+    np.testing.assert_array_equal(before, engineer_tabular_features(window, event))

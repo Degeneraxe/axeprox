@@ -98,7 +98,7 @@ class MarketsConfig:
 class DetectionConfig:
     gross_spread_threshold_bps: float = 1.0
     min_order_book_depth_levels: int = 10
-    depth_snapshot_throttle_ms: int = 100
+    depth_snapshot_throttle_ms: int = 0
 
 
 @dataclass
@@ -157,7 +157,7 @@ class AppConfig:
         detection = DetectionConfig(
             gross_spread_threshold_bps=float(dt_raw.get("gross_spread_threshold_bps", 1.0)),
             min_order_book_depth_levels=int(dt_raw.get("min_order_book_depth_levels", 10)),
-            depth_snapshot_throttle_ms=int(dt_raw.get("depth_snapshot_throttle_ms", 100)),
+            depth_snapshot_throttle_ms=int(dt_raw.get("depth_snapshot_throttle_ms", 0)),
         )
 
         return cls(
