@@ -217,9 +217,9 @@ class AutonomousPaperTrader:
             while self._running:
                 await asyncio.sleep(5.0)
 
-                # Periodic rolling tick pruner: keep recent 1500 ticks per symbol to prevent disk bloat
+                # Periodic rolling tick pruner: keep recent ticks per symbol from config
                 if (time.time() - last_prune_time) >= 60.0:
-                    pruned = self.db.prune_old_ticks(keep_latest_per_symbol=1500)
+                    pruned = self.db.prune_old_ticks()
                     last_prune_time = time.time()
                     if pruned > 0:
                         logger.info("[Storage Optimizer] Pruned %d old ticks (disk preserved)", pruned)

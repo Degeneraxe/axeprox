@@ -38,6 +38,7 @@ class OrderBookSnapshot:
     is_stale: bool = False
     quote_age_ms: float = 0.0
     is_crossed: bool = False
+    ts_source: str = "exchange"
 
     @property
     def best_bid(self) -> Optional[OrderBookLevel]:
@@ -206,10 +207,20 @@ class OrderBookNormalizer:
         asks: List[Tuple[float, float]],
         exchange_ts_ms: float,
         local_ts_ms: float,
+        ts_source: Optional[str] = None,
     ) -> OrderBookSnapshot:
         """Updates and sorts order book snapshot for an exchange pair."""
         norm_symbol = self.normalize_symbol(exchange, raw_symbol)
         quote_curr = "USD" if norm_symbol.endswith("/USD") else "USDT"
+
+        # Determine timestamp source
+        if ts_source is None:
+            if exchange.lower() == "binance":
+                ts_source = "estimated"
+            elif exchange.lower() == "coinbase" and exchange_ts_ms == local_ts_ms:
+                ts_source = "estimated"
+            else:
+                ts_source = "exchange"
 
         # Sort bids descending, asks ascending
         sorted_bids = [OrderBookLevel(p, a) for p, a in sorted(bids, key=lambda x: x[0], reverse=True)]
@@ -236,6 +247,7 @@ class OrderBookNormalizer:
             is_stale=False,
             quote_age_ms=0.0,
             is_crossed=is_crossed,
+            ts_source=ts_source,
         )
 
         self.books[(exchange.lower(), norm_symbol)] = snapshot
@@ -294,8 +306,10 @@ class OrderBookNormalizer:
 
             obi_b = float(b_snap.compute_imbalance(5))
             obi_s = float(s_snap.compute_imbalance(5))
-            lat_b = float(b_snap.transit_latency_ms)
-            lat_s = float(s_snap.transit_latency_ms)
+            b_ts_src = getattr(b_snap, "ts_source", "exchange")
+            s_ts_src = getattr(s_snap, "ts_source", "exchange")
+            lat_b = float(b_snap.transit_latency_ms) if b_ts_src == "exchange" else 0.0
+            lat_s = float(s_snap.transit_latency_ms) if s_ts_src == "exchange" else 0.0
             top_b = float(b_snap.top_spread)
             top_s = float(s_snap.top_spread)
             mp_b = float(b_snap.mid_price)

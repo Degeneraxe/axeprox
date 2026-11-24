@@ -31,12 +31,14 @@ class DatabaseManager:
         db_url: Optional[str] = None,
         sqlite_path: str = "data/arbsense.db",
         migrations_dir: str = "data/storage/migrations",
+        read_only: bool = False,
     ):
         self.db_url = db_url or os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/arbsense")
         p = Path(sqlite_path)
         self.sqlite_path = p if p.is_absolute() else (PROJECT_ROOT / p)
         m = Path(migrations_dir)
         self.migrations_dir = m if m.is_absolute() else (PROJECT_ROOT / m)
+        self.read_only = read_only
         self.backend_type: str = "unknown"
         self.is_connected: bool = False
         self.connection_diagnostic: str = ""
@@ -44,6 +46,16 @@ class DatabaseManager:
 
     def initialize(self) -> str:
         """Probes TimescaleDB connection, applies migrations, or falls back to SQLite."""
+        if self.read_only:
+            self.backend_type = "sqlite"
+            self.connection_diagnostic = f"Operating on Read-Only SQLite engine: {self.sqlite_path}"
+            logger.info("[Storage] %s", self.connection_diagnostic)
+            uri = f"file:{self.sqlite_path.resolve().as_posix()}?mode=ro"
+            self._sqlite_conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            self._sqlite_conn.row_factory = sqlite3.Row
+            self.is_connected = True
+            return self.backend_type
+
         # 1. Probe TimescaleDB / PostgreSQL
         ts_ok, ts_diag = self._probe_timescaledb()
         if ts_ok:
@@ -125,7 +137,16 @@ class DatabaseManager:
             exchange_ts_ms REAL NOT NULL,
             local_ts_ms REAL NOT NULL,
             transit_latency_ms REAL NOT NULL,
-            is_stale INTEGER NOT NULL DEFAULT 0
+            is_stale INTEGER NOT NULL DEFAULT 0,
+            ts_source TEXT NOT NULL DEFAULT 'exchange'
+        );
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS clock_offsets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            time TEXT NOT NULL,
+            offset_ms REAL NOT NULL
         );
         """)
 
@@ -240,9 +261,27 @@ class DatabaseManager:
             git_commit TEXT NOT NULL,
             latency_threshold_ms REAL NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            config_json TEXT
+            config_json TEXT,
+            clock_offset_ms REAL
         );
         """)
+
+        # Migration guards for existing databases
+        try:
+            cur.execute("PRAGMA table_info(orderbook_ticks);")
+            col_names = {row[1] for row in cur.fetchall()}
+            if "ts_source" not in col_names:
+                cur.execute("ALTER TABLE orderbook_ticks ADD COLUMN ts_source TEXT NOT NULL DEFAULT 'exchange';")
+        except Exception:
+            pass
+
+        try:
+            cur.execute("PRAGMA table_info(run_metadata);")
+            meta_cols = {row[1] for row in cur.fetchall()}
+            if "clock_offset_ms" not in meta_cols:
+                cur.execute("ALTER TABLE run_metadata ADD COLUMN clock_offset_ms REAL;")
+        except Exception:
+            pass
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ticks_exch_sym ON orderbook_ticks (exchange, symbol, id DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_spreads_time ON spread_events (open_time DESC);")
@@ -252,6 +291,8 @@ class DatabaseManager:
 
     def insert_ticks_batch(self, ticks: List[Dict[str, Any]]) -> int:
         """Batch inserts normalized order book ticks."""
+        if self.read_only:
+            raise RuntimeError("Database is in read-only mode")
         if not ticks:
             return 0
 
@@ -275,6 +316,7 @@ class DatabaseManager:
                         float(t.get("local_ts_ms", 0.0)),
                         float(t.get("transit_latency_ms", 0.0)),
                         1 if t.get("is_stale", False) else 0,
+                        str(t.get("ts_source", "exchange")),
                     ))
                 else:
                     rows.append((
@@ -293,6 +335,7 @@ class DatabaseManager:
                         float(t.local_ts_ms),
                         float(t.transit_latency_ms),
                         1 if t.is_stale else 0,
+                        str(getattr(t, "ts_source", "exchange")),
                     ))
 
             cur = self._sqlite_conn.cursor()
@@ -300,8 +343,8 @@ class DatabaseManager:
                 INSERT INTO orderbook_ticks (
                     time, exchange, symbol, quote_currency, best_bid, best_ask, mid_price,
                     top_spread, imbalance, bid_depth, ask_depth, exchange_ts_ms, local_ts_ms,
-                    transit_latency_ms, is_stale
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transit_latency_ms, is_stale, ts_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
             self._sqlite_conn.commit()
             return len(rows)
@@ -310,6 +353,8 @@ class DatabaseManager:
 
     def insert_spread_event(self, event: Dict[str, Any]) -> None:
         """Inserts a newly opened spread event with persisted point-in-time feature window (Requirement 1, 3, 4)."""
+        if self.read_only:
+            raise RuntimeError("Database is in read-only mode")
         if self._sqlite_conn:
             open_val = event["open_time"]
             if isinstance(open_val, (int, float)):
@@ -368,6 +413,8 @@ class DatabaseManager:
 
     def update_spread_event(self, event_id: str, updates: Dict[str, Any]) -> None:
         """Updates a spread event upon closure, storing the immutable viability threshold with the label (Requirement 4)."""
+        if self.read_only:
+            raise RuntimeError("Database is in read-only mode")
         if self._sqlite_conn:
             close_val = updates.get("close_time")
             if close_val is not None:
@@ -439,6 +486,8 @@ class DatabaseManager:
 
     def insert_simulated_trade(self, trade: Dict[str, Any]) -> None:
         """Inserts a paper trading trade execution record with epoch ms timestamp (Requirement 4)."""
+        if self.read_only:
+            raise RuntimeError("Database is in read-only mode")
         if self._sqlite_conn:
             ts_val = trade["timestamp"]
             if isinstance(ts_val, (int, float)):
@@ -522,15 +571,15 @@ class DatabaseManager:
         return 0
 
     def get_empirical_latency_stats(self, exchange: Optional[str] = None) -> Dict[str, float]:
-        """Derives empirical latency distribution and viability latency threshold from measured transit_latency_ms in DB.
+        """Derives empirical latency distribution and viability latency threshold strictly from exchange-timestamped ticks (ts_source='exchange').
         
-        Eliminates hardcoded latency assumptions (45/15/85) by computing live summary statistics
-        from real orderbook ticks recorded in the storage layer.
+        Item 3 requirement:
+        Latency features, thresholds, and simulator must use only ts_source='exchange' ticks.
         """
         if not self._sqlite_conn:
             return {}
         cur = self._sqlite_conn.cursor()
-        query = "SELECT transit_latency_ms FROM orderbook_ticks WHERE transit_latency_ms IS NOT NULL AND transit_latency_ms > 0"
+        query = "SELECT transit_latency_ms FROM orderbook_ticks WHERE ts_source = 'exchange' AND transit_latency_ms IS NOT NULL AND transit_latency_ms > 0"
         params: List[Any] = []
         if exchange:
             query += " AND exchange = ?"
@@ -558,13 +607,48 @@ class DatabaseManager:
             "viability_threshold_ms": viability_thresh,
         }
 
+    def get_tick_counts_by_source(self) -> Dict[str, int]:
+        """Reports how many ticks of each timestamp source type exist in the database (Item 3)."""
+        if not self._sqlite_conn:
+            return {"exchange": 0, "estimated": 0}
+        cur = self._sqlite_conn.cursor()
+        try:
+            cur.execute("SELECT ts_source, COUNT(*) FROM orderbook_ticks GROUP BY ts_source;")
+            counts = {str(r[0]): int(r[1]) for r in cur.fetchall()}
+            if "exchange" not in counts:
+                counts["exchange"] = 0
+            if "estimated" not in counts:
+                counts["estimated"] = 0
+            return counts
+        except Exception:
+            return {"exchange": 0, "estimated": 0}
 
-    def prune_old_ticks(self, keep_latest_per_symbol: int = 1500) -> int:
-        """Prunes old ticks from orderbook_ticks ONLY to prevent disk bloat (Requirement 1).
+    def record_clock_offset(self, offset_ms: float, time_str: Optional[str] = None) -> None:
+        """Records an NTP / reference clock offset sample in clock_offsets table (Item 4)."""
+        if self._sqlite_conn:
+            t_str = time_str or datetime.now(timezone.utc).isoformat()
+            cur = self._sqlite_conn.cursor()
+            cur.execute("""
+                INSERT INTO clock_offsets (time, offset_ms) VALUES (?, ?)
+            """, (t_str, float(offset_ms)))
+            self._sqlite_conn.commit()
+
+    def prune_old_ticks(self, keep_latest_per_symbol: Optional[int] = None) -> int:
+        """Prunes old ticks from orderbook_ticks ONLY to prevent disk bloat (Requirement 1 & Item 6).
         
+        Reads tick_prune_keep_count from config if keep_latest_per_symbol is None.
         Spread events and their persisted 20-step point-in-time feature windows are permanently
         retained and never pruned, guaranteeing permanent training dataset integrity.
         """
+        if self.read_only:
+            raise RuntimeError("Database is in read-only mode")
+        if keep_latest_per_symbol is None:
+            try:
+                from config.settings import AppConfig
+                keep_latest_per_symbol = int(AppConfig.load().raw.get("storage", {}).get("tick_prune_keep_count", 1500))
+            except Exception:
+                keep_latest_per_symbol = 1500
+
         if self._sqlite_conn:
             cur = self._sqlite_conn.cursor()
             cur.execute("""
@@ -588,10 +672,12 @@ class DatabaseManager:
         git_commit: str,
         latency_threshold_ms: float,
         config_json: str = "",
+        clock_offset_ms: Optional[float] = None,
     ) -> None:
-        """Validates configuration freeze against historical runs and records run metadata (Requirement 2).
+        """Validates configuration freeze against historical runs and records run metadata (Requirement 2 & Item 4).
         
         Refuses to start a new run under an existing dataset_version if config_hash differs.
+        Records initial clock offset if provided.
         """
         if self._sqlite_conn:
             cur = self._sqlite_conn.cursor()
@@ -611,9 +697,9 @@ class DatabaseManager:
             
             cur.execute("""
                 INSERT INTO run_metadata (
-                    dataset_version, config_hash, git_commit, latency_threshold_ms, config_json
-                ) VALUES (?, ?, ?, ?, ?)
-            """, (dataset_version, config_hash, git_commit, latency_threshold_ms, config_json))
+                    dataset_version, config_hash, git_commit, latency_threshold_ms, config_json, clock_offset_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (dataset_version, config_hash, git_commit, latency_threshold_ms, config_json, clock_offset_ms))
             self._sqlite_conn.commit()
             logger.info(
                 "[RunMetadata] Run metadata verified and recorded: dataset_version=%s, config_hash=%s, git=%s, latency_threshold=%.1fms",

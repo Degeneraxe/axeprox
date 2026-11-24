@@ -63,24 +63,24 @@ class ExecutionSimulator:
         self.config = config or AppConfig.load()
         self.cost_model = cost_model or CostModel(self.config)
 
-        # Empirical latency distribution parameters derived from measured transit_latency_ms in DB
+        # Single frozen viability latency threshold from config (Item 5)
+        self.viability_latency_threshold_ms = float(
+            self.config.raw.get("dataset", {}).get("viability_latency_threshold_ms", 85.0)
+        )
+
+        # Empirical latency distribution parameters derived strictly from exchange-timestamped ticks
         lat_stats = self.db.get_empirical_latency_stats() if self.db else {}
-        sim_cfg = self.config.raw.get("simulation", {})
-        cfg_lat = sim_cfg.get("latency", {})
-        lbl_cfg = self.config.raw.get("labeling", {})
 
         if lat_stats and lat_stats.get("count", 0) >= 10:
             self.latency_mean_ms = lat_stats["mean_ms"]
             self.latency_std_ms = lat_stats["std_ms"]
             self.latency_min_ms = lat_stats["min_ms"]
             self.latency_max_ms = lat_stats["max_ms"]
-            self.viability_latency_threshold_ms = lat_stats["viability_threshold_ms"]
         else:
-            self.latency_mean_ms = float(cfg_lat.get("mean_ms", 50.0))
-            self.latency_std_ms = float(cfg_lat.get("std_ms", 15.0))
-            self.latency_min_ms = float(cfg_lat.get("min_ms", 10.0))
-            self.latency_max_ms = float(cfg_lat.get("max_ms", 250.0))
-            self.viability_latency_threshold_ms = float(lbl_cfg.get("execution_latency_assumption_ms", 50.0))
+            self.latency_mean_ms = self.viability_latency_threshold_ms
+            self.latency_std_ms = 15.0
+            self.latency_min_ms = 5.0
+            self.latency_max_ms = max(250.0, self.viability_latency_threshold_ms * 2.0)
 
         # Capital and balance state (Pre-funded inventory assumption)
         sim_cfg = self.config.raw.get("simulation", {})

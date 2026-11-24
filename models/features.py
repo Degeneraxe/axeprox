@@ -86,9 +86,11 @@ def extract_step_features(
     obi_sell = snap_sell.compute_imbalance(5)
     obi_diff = obi_buy - obi_sell
 
-    # 3. Transit latency dynamics
-    lat_buy = float(snap_buy.transit_latency_ms)
-    lat_sell = float(snap_sell.transit_latency_ms)
+    # 3. Transit latency dynamics (strictly ts_source='exchange')
+    lat_b_src = getattr(snap_buy, "ts_source", snap_buy.get("ts_source", "exchange") if isinstance(snap_buy, dict) else "exchange")
+    lat_s_src = getattr(snap_sell, "ts_source", snap_sell.get("ts_source", "exchange") if isinstance(snap_sell, dict) else "exchange")
+    lat_buy = float(getattr(snap_buy, "transit_latency_ms", snap_buy.get("transit_latency_ms", 0.0) if isinstance(snap_buy, dict) else 0.0)) if lat_b_src == "exchange" else 0.0
+    lat_sell = float(getattr(snap_sell, "transit_latency_ms", snap_sell.get("transit_latency_ms", 0.0) if isinstance(snap_sell, dict) else 0.0)) if lat_s_src == "exchange" else 0.0
     lat_diff = lat_buy - lat_sell
 
     # 4. Internal venue spreads
@@ -190,4 +192,130 @@ def asof_join_ticks(
                 aligned_pairs.append((b_tick, s_tick))
 
     return aligned_pairs[-seq_len:]
+
+
+TABULAR_FEATURE_NAMES = [
+    "open_spread_bps",
+    "depth_walked_slippage",
+    "spread_vs_hurdle",
+    "spread_velocity_3",
+    "spread_velocity_5",
+    "spread_velocity_10",
+    "spread_accel_3",
+    "spread_accel_5",
+    "spread_accel_10",
+    "volatility_3",
+    "volatility_5",
+    "volatility_10",
+    "obi_buy_top5",
+    "obi_sell_top5",
+    "obi_diff",
+    "obi_buy_mean_5",
+    "obi_sell_mean_5",
+    "vol_diff_5",
+    "is_buy_leg_mover",
+    "transit_lat_buy_ms",
+    "transit_lat_sell_ms",
+    "transit_lat_diff_ms",
+    "time_since_prev_event_s",
+    "event_count_last_60s",
+    "hour_of_day",
+    "hour_sin",
+    "hour_cos",
+]
+
+
+def engineer_tabular_features(
+    seq_arr: np.ndarray,
+    event_dict: Dict[str, Any],
+    prev_event_open_ts: Optional[float] = None,
+    recent_event_times: Optional[List[float]] = None,
+) -> np.ndarray:
+    """Computes all point-in-time tabular microstructure features from 20-step window and event fields.
+    
+    Unified feature engineering module in models.features shared by training and inference.
+    """
+    from datetime import datetime, timezone
+
+    open_ts = float(event_dict.get("open_time", 0.0))
+    time_since_prev_s = min(600.0, (open_ts - prev_event_open_ts) / 1000.0) if prev_event_open_ts else 600.0
+    
+    if recent_event_times is not None:
+        event_count_60s = sum(1 for t in recent_event_times if t >= open_ts - 60000.0)
+    else:
+        event_count_60s = 1
+
+    dt_utc = datetime.fromtimestamp(open_ts / 1000.0, tz=timezone.utc)
+    hour = dt_utc.hour + dt_utc.minute / 60.0
+    hour_sin = math.sin(2.0 * math.pi * hour / 24.0)
+    hour_cos = math.cos(2.0 * math.pi * hour / 24.0)
+
+    s = seq_arr[:, 0]  # gross spread bps across window
+    open_bps = float(event_dict.get("open_spread_bps", s[-1] if len(s) > 0 else 0.0))
+    hurdle_bps = float(event_dict.get("cost_hurdle_bps", 0.0))
+    slippage = float(event_dict.get("slippage_bps", 0.0))
+    spread_vs_hurdle = open_bps - hurdle_bps
+
+    # Velocities and accelerations over 3, 5, 10 steps
+    vel_3 = float(s[-1] - s[-3]) if len(s) >= 3 else 0.0
+    vel_5 = float(s[-1] - s[-5]) if len(s) >= 5 else 0.0
+    vel_10 = float(s[-1] - s[-10]) if len(s) >= 10 else 0.0
+    acc_3 = float((s[-1] - s[-3]) - (s[-3] - s[-5])) if len(s) >= 5 else 0.0
+    acc_5 = float((s[-1] - s[-5]) - (s[-5] - s[-9])) if len(s) >= 9 else 0.0
+    acc_10 = float((s[-1] - s[-10]) - (s[-10] - s[-19])) if len(s) >= 19 else 0.0
+
+    # Multi-scale volatility
+    vol_3 = float(np.std(s[-3:])) if len(s) >= 3 else 1.0
+    vol_5 = float(np.std(s[-5:])) if len(s) >= 5 else 1.0
+    vol_10 = float(np.std(s[-10:])) if len(s) >= 10 else 1.0
+
+    # Order book imbalances across scales
+    obi_b_top5 = float(seq_arr[-1, 3])
+    obi_s_top5 = float(seq_arr[-1, 4])
+    obi_diff = float(seq_arr[-1, 5])
+    obi_b_mean5 = float(np.mean(seq_arr[-5:, 3])) if len(seq_arr) >= 5 else obi_b_top5
+    obi_s_mean5 = float(np.mean(seq_arr[-5:, 4])) if len(seq_arr) >= 5 else obi_s_top5
+
+    # Which leg moved most in last 5 steps
+    vol_b_5 = float(np.mean(seq_arr[-5:, 6])) if len(seq_arr) >= 5 else 1.0
+    vol_s_5 = float(np.mean(seq_arr[-5:, 7])) if len(seq_arr) >= 5 else 1.0
+    vol_diff_5 = vol_b_5 - vol_s_5
+    is_buy_mover = 1.0 if vol_b_5 >= vol_s_5 else 0.0
+
+    # Latency features at open (strictly ts_source='exchange')
+    lat_b = float(seq_arr[-1, 8])
+    lat_s = float(seq_arr[-1, 9])
+    lat_diff = float(seq_arr[-1, 10])
+
+    tabular_vec = [
+        open_bps,
+        slippage,
+        spread_vs_hurdle,
+        vel_3,
+        vel_5,
+        vel_10,
+        acc_3,
+        acc_5,
+        acc_10,
+        vol_3,
+        vol_5,
+        vol_10,
+        obi_b_top5,
+        obi_s_top5,
+        obi_diff,
+        obi_b_mean5,
+        obi_s_mean5,
+        vol_diff_5,
+        is_buy_mover,
+        lat_b,
+        lat_s,
+        lat_diff,
+        time_since_prev_s,
+        float(event_count_60s),
+        float(hour),
+        hour_sin,
+        hour_cos,
+    ]
+    return np.array(tabular_vec, dtype=np.float32)
+
 

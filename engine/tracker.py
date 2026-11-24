@@ -112,12 +112,19 @@ class SpreadTracker:
         # Pair key: (symbol, buy_exchange, sell_exchange) -> ActiveSpreadEvent
         self.active_events: Dict[Tuple[str, str, str], ActiveSpreadEvent] = {}
 
-        # Fixed viability latency threshold per dataset version (Requirement 3: never recompute at startup)
+        # Fixed viability latency threshold per dataset version (Item 5: ONE frozen threshold)
         ds_cfg = self.config.raw.get("dataset", {})
         lbl_cfg = self.config.raw.get("labeling", {})
+        trk_cfg = self.config.raw.get("tracking", {})
         self.dataset_version = ds_cfg.get("version", "v1.0")
         self.latency_hurdle_ms = float(
-            ds_cfg.get("viability_latency_threshold_ms", lbl_cfg.get("execution_latency_assumption_ms", 85.0))
+            ds_cfg.get("viability_latency_threshold_ms", 85.0)
+        )
+        self.max_staleness_ms = float(
+            trk_cfg.get("max_staleness_ms", getattr(self.config.time_sync, "max_quote_age_ms", 1500.0))
+        )
+        self.inactivity_timeout_ms = float(
+            trk_cfg.get("inactivity_timeout_ms", 1500.0)
         )
 
         self.max_window_ms = float(lbl_cfg.get("right_censored_max_window_ms", 30000.0))
@@ -160,7 +167,7 @@ class SpreadTracker:
         vol_s = compute_rolling_volatility_bps(s_prices) if s_prices else 1.0
 
         # As-of join by timestamp with max staleness (Requirement 2 & 3)
-        aligned_pairs = asof_join_ticks(b_ticks, s_ticks, max_staleness_ms=1500.0, seq_len=seq_len)
+        aligned_pairs = asof_join_ticks(b_ticks, s_ticks, max_staleness_ms=self.max_staleness_ms, seq_len=seq_len)
         if len(aligned_pairs) < seq_len:
             return [], vol_b, vol_s
 
@@ -192,8 +199,10 @@ class SpreadTracker:
 
             obi_b = float(b_tick.compute_imbalance(5) if hasattr(b_tick, "compute_imbalance") else b_tick.get("imbalance", 0.0))
             obi_s = float(s_tick.compute_imbalance(5) if hasattr(s_tick, "compute_imbalance") else s_tick.get("imbalance", 0.0))
-            lat_b = float(b_tick.transit_latency_ms if hasattr(b_tick, "transit_latency_ms") else b_tick.get("transit_latency_ms", 0.0))
-            lat_s = float(s_tick.transit_latency_ms if hasattr(s_tick, "transit_latency_ms") else s_tick.get("transit_latency_ms", 0.0))
+            b_ts_src = getattr(b_tick, "ts_source", b_tick.get("ts_source", "exchange") if isinstance(b_tick, dict) else "exchange")
+            s_ts_src = getattr(s_tick, "ts_source", s_tick.get("ts_source", "exchange") if isinstance(s_tick, dict) else "exchange")
+            lat_b = float(b_tick.transit_latency_ms if hasattr(b_tick, "transit_latency_ms") else b_tick.get("transit_latency_ms", 0.0)) if b_ts_src == "exchange" else 0.0
+            lat_s = float(s_tick.transit_latency_ms if hasattr(s_tick, "transit_latency_ms") else s_tick.get("transit_latency_ms", 0.0)) if s_ts_src == "exchange" else 0.0
             top_b = float(b_tick.top_spread if hasattr(b_tick, "top_spread") else b_tick.get("top_spread", 0.0))
             top_s = float(s_tick.top_spread if hasattr(s_tick, "top_spread") else s_tick.get("top_spread", 0.0))
             mp_b = float(b_tick.mid_price if hasattr(b_tick, "mid_price") else b_tick.get("mid_price", 0.0))
@@ -360,8 +369,8 @@ class SpreadTracker:
             time_since_last = current_time_ms - event.last_seen_ms
             total_duration = current_time_ms - event.open_time_ms
 
-            # Inactivity closure (no ticks for > 1500ms means spread closed)
-            if time_since_last > 1500.0:
+            # Inactivity closure (no ticks for > inactivity_timeout_ms means spread closed)
+            if time_since_last > self.inactivity_timeout_ms:
                 closed_evt = self._close_event(key, event.last_seen_ms, right_censored=False)
                 if closed_evt:
                     closed.append(closed_evt)

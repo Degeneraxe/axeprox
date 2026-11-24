@@ -27,6 +27,9 @@ logs/
 *.db-shm
 *.sqlite3-wal
 *.sqlite3-shm
+*-wal
+*-shm
+backups/
 
 # Environment & Secrets
 .env

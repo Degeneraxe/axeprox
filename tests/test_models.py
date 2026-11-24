@@ -244,23 +244,41 @@ def test_predictor_checkpoint_strictness(tmp_path):
     with pytest.raises(FileNotFoundError, match="Model checkpoint not found"):
         LiveSpreadPredictor(checkpoint_path=str(missing_path))
 
-    # Create unified checkpoint dictionary
+    # Create valid unified checkpoint dictionary with complete metadata
     model = MultiHeadSpreadLSTM(input_dim=14, hidden_dim=64, num_layers=2)
-    ckpt_path = tmp_path / "lstm_best.pt"
-    torch.save({
+    ckpt_path = tmp_path / "lstm_valid.pt"
+    valid_payload = {
         "model_state_dict": model.state_dict(),
+        "dataset_version": "v2.0",
+        "git_commit": "d9a00e1",
         "decision_threshold": 0.45,
         "scaler": {
             "means": [0.0] * 14,
             "stds": [1.0] * 14,
         },
         "feature_names": FEATURE_NAMES,
-    }, ckpt_path)
+    }
+    torch.save(valid_payload, ckpt_path)
 
-    predictor = LiveSpreadPredictor(checkpoint_path=str(ckpt_path))
+    predictor = LiveSpreadPredictor(checkpoint_path=str(ckpt_path), expected_dataset_version="v2.0")
     assert predictor.is_loaded is True
     assert predictor.decision_threshold == pytest.approx(0.45)
     assert len(predictor.feature_names) == 14
+    assert predictor.dataset_version == "v2.0"
+    assert predictor.git_commit == "d9a00e1"
+
+    # Test rejection on dataset version mismatch
+    with pytest.raises(ValueError, match="Dataset version mismatch"):
+        LiveSpreadPredictor(checkpoint_path=str(ckpt_path), expected_dataset_version="v9.9")
+
+    # Test rejection on missing metadata
+    for key in ["dataset_version", "git_commit", "decision_threshold", "scaler", "feature_names"]:
+        incomplete = dict(valid_payload)
+        del incomplete[key]
+        inc_path = tmp_path / f"lstm_missing_{key}.pt"
+        torch.save(incomplete, inc_path)
+        with pytest.raises(ValueError, match="missing required metadata"):
+            LiveSpreadPredictor(checkpoint_path=str(inc_path), expected_dataset_version="v2.0")
 
 
 def test_asof_join_ticks():

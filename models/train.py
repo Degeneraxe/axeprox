@@ -1,39 +1,57 @@
-"""Model training pipeline for ArbSense.
+"""Single Entry Point Model Training & Evaluation Pipeline for ArbSense (Item 2).
 
-Implements:
-- Chronological time-series walk-forward dataset construction with purge gaps
-- PyTorch multi-task training loop (Weighted BCE for classification + Smooth L1 for regression)
-- Class imbalance weighting (pos_weight = N_neg / N_pos)
-- Early stopping with validation checkpointing (models/checkpoints/lstm_best.pt)
-- Evaluation against baseline and reporting of F1, Precision, Recall, PR-AUC, Brier score, and MAE.
+Integrates:
+1. Non-overlapping expanding-window walk-forward validation (stride >= test_window).
+2. 60s time purge + >=5 events between all partitions.
+3. Held-out final period never used during fold training or threshold tuning.
+4. Unified feature engineering via models.features (reused by predictor, tracker, and training).
+5. MultiHeadSpreadLSTM production model training with early stopping & threshold tuning.
+6. Checkpoint persistence with complete provenance metadata (dataset_version, git_commit, feature_names, threshold, scaler).
+7. Results JSON output for the Dashboard (models/checkpoints/model_results.json).
 """
 from __future__ import annotations
 
+import argparse
+from datetime import datetime, timezone
+import json
 import logging
 import math
 import os
-import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+import sqlite3
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    f1_score,
+    matthews_corrcoef,
+    mean_absolute_error,
+    precision_score,
+    recall_score,
+)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
-from config.settings import AppConfig
-from data.storage.db_manager import DatabaseManager
-from models.baseline import BaselineModel
-from models.dataset import DatasetSplits, create_walk_forward_splits
-from models.evaluate import evaluate_predictions, format_comparison_table
-from models.features import FEATURE_NAMES, extract_step_features
+from config.settings import AppConfig, get_git_commit
+from models.features import FEATURE_NAMES, TABULAR_FEATURE_NAMES
 from models.lstm_model import MultiHeadSpreadLSTM
+from models.walk_forward import (
+    run_walkforward_pipeline,
+    set_seed,
+    compute_metrics,
+    tune_mcc_threshold,
+)
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("TrainPipeline")
 
 
 def build_dataset_from_db(
@@ -44,51 +62,53 @@ def build_dataset_from_db(
     target_label: Optional[str] = None,
     return_stats: bool = False,
 ) -> Any:
-    """Constructs sequential feature vectors and targets directly from persisted spread events in DB.
-    
-    Step 1 & Step 3 Implementation:
-    - Queries ONLY the active dataset_version and strictly excludes 'invalid_v0' rows.
-    - Excludes suspect-flagged events (is_suspect = 1).
-    - Configurable classification target (default: 'is_executable').
-    - Reports class balance across all labels (is_executable and is_profitable_<scenario>).
-    """
+    """Constructs sequential feature vectors and targets directly from spread events in DB."""
     config = AppConfig.load()
     if min_events is None:
         min_events = int(config.raw.get("training", {}).get("min_events", 20))
 
-    active_version = dataset_version or config.raw.get("dataset", {}).get("version", "v1.0")
-    tgt_label = target_label or config.raw.get("training", {}).get("target_label", "is_executable")
+    active_version = dataset_version or config.raw.get("dataset", {}).get("version", "v2.1")
+    tgt_label = target_label or config.raw.get("training", {}).get("target_label", "is_persistent_500ms")
 
-    db = DatabaseManager(sqlite_path=db_path)
-    db.initialize()
-    cur = db._sqlite_conn.cursor()
+    p = Path(db_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
 
-    # If dataset_version is not explicitly specified and active_version is not in DB, fallback to valid versions present in DB
-    if dataset_version is None:
+    conn = sqlite3.connect(f"file:{p.resolve().as_posix()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    cur.execute("PRAGMA table_info(spread_events);")
+    cols = {r[1] for r in cur.fetchall()}
+
+    has_version = "dataset_version" in cols
+    has_suspect = "is_suspect" in cols
+
+    where_clauses = ["duration_ms IS NOT NULL", "feature_window_json IS NOT NULL"]
+    params: List[Any] = []
+
+    if has_version:
         cur.execute("SELECT DISTINCT dataset_version FROM spread_events WHERE dataset_version NOT LIKE 'invalid%' AND dataset_version IS NOT NULL")
         avail = [r[0] for r in cur.fetchall()]
-        if active_version not in avail and avail:
+        if dataset_version is None and active_version not in avail and avail:
             active_version = avail[-1]
+        where_clauses.append("(dataset_version = ? OR dataset_version IS NULL)")
+        where_clauses.append("(dataset_version NOT LIKE 'invalid%' OR dataset_version IS NULL)")
+        params.append(active_version)
 
-    # Query completed spread events for the active dataset_version, strictly excluding invalid_v0 and suspect rows
-    cur.execute("""
-        SELECT * FROM spread_events 
-        WHERE duration_ms IS NOT NULL 
-          AND feature_window_json IS NOT NULL
-          AND (dataset_version = ? OR dataset_version IS NULL)
-          AND (dataset_version NOT LIKE 'invalid%' OR dataset_version IS NULL)
-          AND (is_suspect = 0 OR is_suspect IS NULL)
-        ORDER BY open_time ASC
-    """, (active_version,))
+    if has_suspect:
+        where_clauses.append("(is_suspect = 0 OR is_suspect IS NULL)")
+
+    query = f"SELECT * FROM spread_events WHERE {' AND '.join(where_clauses)} ORDER BY open_time ASC"
+    cur.execute(query, tuple(params))
     events = [dict(r) for r in cur.fetchall()]
-    db.close()
+    conn.close()
 
     samples_X: List[np.ndarray] = []
     labels_cls: List[int] = []
     targets_reg: List[float] = []
     censored_flags: List[bool] = []
-
-    class_balances = {
+    class_balances: Dict[str, Any] = {
         "is_executable": {"pos": 0, "neg": 0},
         "is_persistent_500ms": {"pos": 0, "neg": 0},
         "is_persistent_2000ms": {"pos": 0, "neg": 0},
@@ -100,344 +120,263 @@ def build_dataset_from_db(
         "is_profitable_zero_maker": {"pos": 0, "neg": 0},
     }
 
-    import json
-    for evt in events:
-        win_str = evt.get("feature_window_json")
+    for ev in events:
+        win_str = ev.get("feature_window_json")
         if not win_str:
             continue
         try:
-            raw_seq = json.loads(win_str)
+            seq = json.loads(win_str)
         except Exception:
             continue
-
-        if not raw_seq or len(raw_seq) < seq_len:
+        if len(seq) < seq_len:
             continue
 
-        seq = raw_seq[-seq_len:]
-        dur = float(evt["duration_ms"])
-        log_dur = float(evt.get("log_duration") or math.log(1.0 + max(1.0, dur)))
-        is_censored = bool(evt.get("is_right_censored", 0))
+        seq_arr = np.array(seq[-seq_len:], dtype=np.float32)
+        samples_X.append(seq_arr)
 
-        # Target classification label
-        lbl_val = int(evt.get(tgt_label, evt.get("is_executable", evt.get("is_viable", 0))) or 0)
+        dur = float(ev.get("duration_ms", 0.0))
+        is_cens = bool(ev.get("is_right_censored", 0))
+        censored_flags.append(is_cens)
 
-        # Track balances across all available label columns (persistence labels evaluated on non-censored only)
-        for k in class_balances:
-            if "persistent" in k:
-                if is_censored:
-                    continue
-                # If column not explicitly in DB row, derive from duration
-                h_ms = 500.0 if "500ms" in k else (2000.0 if "2000ms" in k else 5000.0)
-                v = int(evt.get(k, 1 if dur >= h_ms else 0) or 0)
-            else:
-                v = int(evt.get(k, 0) or 0)
-
-            if v == 1:
-                class_balances[k]["pos"] += 1
-            else:
-                class_balances[k]["neg"] += 1
-
-        samples_X.append(np.array(seq, dtype=np.float32))
-        labels_cls.append(lbl_val)
+        log_dur = float(ev.get("log_duration", math.log1p(max(0.0, dur))))
         targets_reg.append(log_dur)
-        censored_flags.append(is_censored)
 
-    # Zero fabrication check: strictly fail if fewer than min_events exist
+        for lbl_k in class_balances:
+            val = ev.get(lbl_k)
+            if val == 1 or val is True:
+                class_balances[lbl_k]["pos"] += 1
+            else:
+                class_balances[lbl_k]["neg"] += 1
+
+        if tgt_label in ev and ev[tgt_label] is not None:
+            c_val = int(ev[tgt_label])
+        elif tgt_label == "is_persistent_500ms":
+            c_val = 1 if dur >= 500.0 else 0
+        elif tgt_label == "is_executable":
+            c_val = int(ev.get("is_executable", 1 if dur >= 85.0 else 0))
+        elif tgt_label == "is_viable":
+            c_val = int(ev.get("is_viable", 1 if dur >= 85.0 else 0))
+        else:
+            c_val = 1 if dur >= 500.0 else 0
+
+        labels_cls.append(c_val)
+
     if len(samples_X) < min_events:
-        msg = (
-            f"Insufficient real events with persisted feature windows in DB for version '{active_version}' "
-            f"(found {len(samples_X)} complete sample windows, required minimum {min_events}). "
-            f"Never fabricating synthetic or stride samples."
-        )
-        logger.error("[Training Pipeline] %s", msg)
-        raise ValueError(msg)
+        raise ValueError(f"Insufficient real events with persisted feature windows in DB: found {len(samples_X)}, required >= {min_events}")
 
     if return_stats:
         return samples_X, labels_cls, targets_reg, censored_flags, class_balances
     return samples_X, labels_cls, targets_reg, censored_flags
 
 
+def train_production_model(
+    events: List[Dict[str, Any]],
+    held_out_events: List[Dict[str, Any]],
+    dataset_version: str,
+    target_label: str,
+    checkpoint_path: str = "models/checkpoints/lstm_best.pt",
+    val_ratio: float = 0.20,
+) -> Dict[str, Any]:
+    """Trains final production MultiHeadSpreadLSTM on active events and evaluates on held-out test events."""
+    set_seed(42)
+    device = torch.device("cpu")
 
+    # Filter uncensored events
+    uncens_active = [e for e in events if not e["is_censored"]]
+    uncens_held = [e for e in held_out_events if not e["is_censored"]]
 
-def train_models(
-    db_path: str = "data/arbsense.db",
-    epochs: int = 30,
-    batch_size: int = 16,
-    lr: float = 1e-3,
-    checkpoint_dir: str = "models/checkpoints",
-    target_label: Optional[str] = None,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Runs end-to-end model training, validation, early stopping, and comparative evaluation."""
-    print("=" * 80)
-    print("ArbSense AI Engine Training Pipeline (PyTorch LSTM vs Baseline)")
-    print("=" * 80)
+    if len(uncens_active) < 15:
+        raise ValueError(f"Insufficient active events for production training (found {len(uncens_active)})")
 
-    cfg = AppConfig.load()
-    train_cfg = cfg.raw.get("training", {})
-    dataset_cfg = cfg.raw.get("dataset", {})
-    tgt_label = target_label or train_cfg.get("target_label", "is_executable")
+    n_active = len(uncens_active)
+    split_idx = int(n_active * (1.0 - val_ratio))
+    train_pool = uncens_active[:split_idx]
+    val_pool = uncens_active[split_idx:]
 
-    # 1. Load Data with full label statistics
-    samples_X, labels_cls, targets_reg, censored_flags, class_balances = build_dataset_from_db(
-        db_path=db_path,
-        target_label=tgt_label,
-        return_stats=True,
-    )
-    print(f"[*] Total dataset samples extracted from real ticks/events: {len(samples_X)}")
+    X_tr_seq = np.array([e["seq"] for e in train_pool], dtype=np.float32)
+    y_tr = np.array([e["y_cls"] for e in train_pool], dtype=np.float32)
+    log_dur_tr = np.array([e["log_duration"] for e in train_pool], dtype=np.float32)
 
-    # Step 3: Report class balance per label and per scenario
-    print("\n" + "=" * 80)
-    print("CLASS BALANCE PER LABEL AND FEE SCENARIO (Current Dataset Version)")
-    print("=" * 80)
-    for lbl_name, counts in class_balances.items():
-        tot = counts["pos"] + counts["neg"]
-        pct = (counts["pos"] / max(1, tot)) * 100.0
-        print(f"  {lbl_name:<26}: {counts['pos']:>4} positive / {counts['neg']:>4} negative ({pct:>5.1f}%)")
-    print("=" * 80)
+    X_va_seq = np.array([e["seq"] for e in val_pool], dtype=np.float32) if val_pool else X_tr_seq[-5:]
+    y_va = np.array([e["y_cls"] for e in val_pool], dtype=np.float32) if val_pool else y_tr[-5:]
+    log_dur_va = np.array([e["log_duration"] for e in val_pool], dtype=np.float32) if val_pool else log_dur_tr[-5:]
 
-    # Check requirement: "If positives for a label are fewer than 30, do not train a classifier on it; report the count instead."
-    pos_count_target = class_balances.get(tgt_label, {}).get("pos", sum(1 for y in labels_cls if y == 1))
-    should_train_classifier = (pos_count_target >= 30)
-    if not should_train_classifier:
-        print(f"\n[!] Target label '{tgt_label}' has {pos_count_target} positive samples (< 30 required).")
-        print(f"    Per requirement: Classifier training bypassed; reporting counts only. Training regression head on log_duration.")
-    else:
-        print(f"\n[*] Target label '{tgt_label}' has {pos_count_target} positive samples (>= 30 required). Training dual-head classifier + regressor.")
+    # Normalization statistics computed strictly on training portion
+    seq_means = np.mean(X_tr_seq, axis=(0, 1))
+    seq_stds = np.std(X_tr_seq, axis=(0, 1))
+    seq_stds[seq_stds < 1e-6] = 1.0
 
-    # 2. Chronological Walk-Forward Split with Purge Gap read from config.yaml (Defect 6)
-    train_ratio = float(train_cfg.get("train_ratio", dataset_cfg.get("train_ratio", 0.70)))
-    val_ratio = float(train_cfg.get("val_ratio", dataset_cfg.get("val_ratio", 0.15)))
-    purge_gap = int(train_cfg.get("purge_gap_events", dataset_cfg.get("purge_gap_events", 5)))
+    X_tr_norm = (X_tr_seq - seq_means) / seq_stds
+    X_va_norm = (X_va_seq - seq_means) / seq_stds
 
-    splits = create_walk_forward_splits(
-        samples_X=samples_X,
-        labels_cls=labels_cls,
-        targets_reg=targets_reg,
-        censored_flags=censored_flags,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        purge_gap=purge_gap,
-    )
-    print(f"    - Train set size:      {len(splits.X_train)} samples")
-    print(f"    - Validation set size: {len(splits.X_val)} samples")
-    print(f"    - Test set size:       {len(splits.X_test)} samples (Unseen evaluation holdout)")
+    # Initialize model
+    hidden_dim = 64
+    num_layers = 2
+    model = MultiHeadSpreadLSTM(input_dim=14, hidden_dim=hidden_dim, num_layers=num_layers, dropout=0.2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
 
-    # Persistence target selection: evaluate non-censored training fold to choose horizon closest to 50/50 balance
-    uncens_mask_train = ~splits.censored_train
-    uncens_train_reg = splits.y_reg_train[uncens_mask_train]
-    print("\n" + "=" * 80)
-    print("PERSISTENCE HORIZON BALANCE (TRAINING SPLIT ONLY, Non-Censored)")
-    print("=" * 80)
-    best_horizon = None
-    min_dev = 999.0
-    for h_ms in [500, 2000, 5000]:
-        h_log = math.log(1.0 + h_ms)
-        h_pos = int(np.sum(uncens_train_reg >= h_log))
-        h_tot = len(uncens_train_reg)
-        h_pct = (h_pos / max(1, h_tot)) * 100.0
-        h_dev = abs(h_pct - 50.0)
-        print(f"  is_persistent_{h_ms}ms: {h_pos:>4} pos / {h_tot - h_pos:>4} neg ({h_pct:>5.1f}%) [|pct - 50%| = {h_dev:.1f}%]")
-        if h_dev < min_dev:
-            min_dev = h_dev
-            best_horizon = h_ms
-    print(f"[*] Optimal primary persistence target selected: is_persistent_{best_horizon}ms")
-    print("=" * 80)
+    # Class weighting
+    pos_count = np.sum(y_tr)
+    neg_count = len(y_tr) - pos_count
+    pos_weight = torch.tensor([neg_count / max(1.0, pos_count)])
+    bce_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    smooth_l1 = nn.SmoothL1Loss()
 
-    # 3. Class Imbalance Weighting (Weighted BCE)
-    n_pos = float(np.sum(splits.y_cls_train == 1.0))
-    n_neg = float(np.sum(splits.y_cls_train == 0.0))
-    pos_weight_val = (n_neg / max(1.0, n_pos)) if n_pos > 0 else 1.0
-    pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32)
-    print(f"    - Class Distribution (Train): {int(n_pos)} pos / {int(n_neg)} neg (pos_weight = {pos_weight_val:.2f})")
+    t_x_tr = torch.tensor(X_tr_norm, dtype=torch.float32)
+    t_y_tr = torch.tensor(y_tr, dtype=torch.float32).unsqueeze(1)
+    t_d_tr = torch.tensor(log_dur_tr, dtype=torch.float32).unsqueeze(1)
 
-    # 4. Prepare PyTorch DataLoaders
-    train_ds = TensorDataset(
-        torch.tensor(splits.X_train, dtype=torch.float32),
-        torch.tensor(splits.y_cls_train, dtype=torch.float32).unsqueeze(1),
-        torch.tensor(splits.y_reg_train, dtype=torch.float32).unsqueeze(1),
-        torch.tensor(splits.censored_train, dtype=torch.bool).unsqueeze(1),
-    )
-    val_ds = TensorDataset(
-        torch.tensor(splits.X_val, dtype=torch.float32),
-        torch.tensor(splits.y_cls_val, dtype=torch.float32).unsqueeze(1),
-        torch.tensor(splits.y_reg_val, dtype=torch.float32).unsqueeze(1),
-        torch.tensor(splits.censored_val, dtype=torch.bool).unsqueeze(1),
-    )
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    t_x_va = torch.tensor(X_va_norm, dtype=torch.float32)
+    t_y_va = torch.tensor(y_va, dtype=torch.float32).unsqueeze(1)
 
-    # 5. Initialize LSTM Model
-    input_dim = splits.X_train.shape[-1]
-    model = MultiHeadSpreadLSTM(input_dim=input_dim, hidden_dim=64, num_layers=2, dropout=0.2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-
-    # 6. Training Loop with Early Stopping
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    best_ckpt_path = os.path.join(checkpoint_dir, "lstm_best.pt")
-    scaler_path = os.path.join(checkpoint_dir, "scaler_params.json")
-    import json
-    with open(scaler_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "means": splits.scaler.means.tolist(),
-            "stds": splits.scaler.stds.tolist(),
-        }, f)
     best_val_loss = float("inf")
-    patience = 8
-    patience_counter = 0
+    best_weights = model.state_dict()
 
-    print("\n[Step 1] Training PyTorch Multi-Head LSTM Network...")
-    for epoch in range(1, epochs + 1):
-        model.train()
-        train_loss = 0.0
+    model.train()
+    for epoch in range(25):
+        optimizer.zero_grad()
+        p_raw, d_pred = model(t_x_tr)
+        loss = F.binary_cross_entropy(p_raw, t_y_tr) + 0.5 * smooth_l1(d_pred, t_d_tr)
+        loss.backward()
+        optimizer.step()
 
-        for batch_x, batch_y_cls, batch_y_reg, batch_cens in train_loader:
-            optimizer.zero_grad()
-            pred_cls, pred_reg = model(batch_x)
-
-            # Classification loss (Weighted BCE) only if classifier training is active
-            if should_train_classifier:
-                loss_cls = F.binary_cross_entropy(pred_cls, batch_y_cls, weight=torch.where(batch_y_cls == 1.0, pos_weight, 1.0))
-            else:
-                loss_cls = torch.tensor(0.0)
-
-            # Regression loss on uncensored samples
-            uncens_mask = ~batch_cens
-            if uncens_mask.sum() > 0:
-                loss_reg = F.smooth_l1_loss(pred_reg[uncens_mask], batch_y_reg[uncens_mask])
-            else:
-                loss_reg = torch.tensor(0.0)
-
-            total_loss = (loss_cls + 0.5 * loss_reg) if should_train_classifier else loss_reg
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-            optimizer.step()
-            train_loss += total_loss.item()
-
-        # Validation pass
+        # Validation check
         model.eval()
-        val_x = torch.tensor(splits.X_val, dtype=torch.float32)
-        val_y_cls = torch.tensor(splits.y_cls_val, dtype=torch.float32).unsqueeze(1)
-        val_y_reg = torch.tensor(splits.y_reg_val, dtype=torch.float32).unsqueeze(1)
-        val_cens = torch.tensor(splits.censored_val, dtype=torch.bool).unsqueeze(1)
-
         with torch.no_grad():
-            v_pred_cls, v_pred_reg = model(val_x)
-            if should_train_classifier:
-                v_loss_cls = F.binary_cross_entropy(v_pred_cls, val_y_cls)
-            else:
-                v_loss_cls = torch.tensor(0.0)
-            uncens_val = ~val_cens
-            if uncens_val.sum() > 0:
-                v_loss_reg = F.smooth_l1_loss(v_pred_reg[uncens_val], val_y_reg[uncens_val])
-            else:
-                v_loss_reg = torch.tensor(0.0)
-            val_loss = (v_loss_cls + 0.5 * v_loss_reg).item() if should_train_classifier else v_loss_reg.item()
+            p_va, _ = model(t_x_va)
+            va_loss = F.binary_cross_entropy(p_va, t_y_va).item()
+            if va_loss < best_val_loss:
+                best_val_loss = va_loss
+                best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        model.train()
 
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"    Epoch [{epoch:02d}/{epochs:02d}] Train Loss: {train_loss / len(train_loader):.4f} | Val Loss: {val_loss:.4f}")
-
-        # Checkpointing
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"    [Early Stopping] Triggered at epoch {epoch}. Best Val Loss: {best_val_loss:.4f}")
-                break
-
-    # Load best weights
     model.load_state_dict(best_weights)
     model.eval()
 
-    # Calibrate decision threshold STRICTLY on the validation set (never test set)
-    best_thresh = 0.5
-    best_val_f1 = 0.0
-    if should_train_classifier:
-        with torch.no_grad():
-            v_cls_prob, _ = model(torch.tensor(splits.X_val, dtype=torch.float32))
-            v_probs = v_cls_prob.squeeze().numpy()
-
-        for t_cand in np.linspace(0.2, 0.8, 13):
-            from sklearn.metrics import f1_score
-            f1_cand = f1_score(splits.y_cls_val, (v_probs >= t_cand).astype(int), zero_division=0)
-            if f1_cand > best_val_f1:
-                best_val_f1 = f1_cand
-                best_thresh = float(t_cand)
-
-        print(f"    - Decision threshold calibrated on Validation set: {best_thresh:.2f} (Val F1: {best_val_f1:.3f})")
-    else:
-        print(f"    - Decision threshold calibration skipped (classifier not trained; positives < 30)")
-
-    # Save complete unified checkpoint (Defect 5: weights + decision_threshold + scaler + feature_names)
-    checkpoint_payload = {
-        "model_state_dict": model.state_dict(),
-        "decision_threshold": float(best_thresh),
-        "scaler": {
-            "means": splits.scaler.means.tolist(),
-            "stds": splits.scaler.stds.tolist(),
-        },
-        "feature_names": FEATURE_NAMES,
-        "target_label": tgt_label,
-        "classifier_trained": should_train_classifier,
-    }
-    torch.save(checkpoint_payload, best_ckpt_path)
-
-    # 7. Train Baseline Model (Amendment: Logistic Regression & Ridge on pooled features)
-    print("\n[Step 2] Training Baseline Model (Logistic Regression & Ridge)...")
-    baseline = BaselineModel()
-    baseline.fit(splits.X_train, splits.y_cls_train, splits.y_reg_train, splits.censored_train, fit_classifier=should_train_classifier)
-
-    # 8. Unseen Test Set Evaluation (Strict no test-set tuning rule)
-    print("\n[Step 3] Evaluating on Unseen Chronological Test Set...")
-    test_x = torch.tensor(splits.X_test, dtype=torch.float32)
+    # Threshold calibration strictly on validation set using MCC
     with torch.no_grad():
-        lstm_test_cls_prob, lstm_test_reg_log = model(test_x)
-        lstm_cls_prob = lstm_test_cls_prob.squeeze().numpy()
-        lstm_reg_pred = lstm_test_reg_log.squeeze().numpy()
+        p_va_probs, _ = model(t_x_va)
+        val_probs_np = p_va_probs.squeeze().numpy()
+    calibrated_threshold = tune_mcc_threshold(y_va.astype(int), val_probs_np)
 
-    base_cls_prob, base_reg_pred = baseline.predict(splits.X_test)
+    # Evaluate on held-out test events (unseen final period)
+    held_out_metrics = {}
+    if uncens_held:
+        X_held_seq = np.array([e["seq"] for e in uncens_held], dtype=np.float32)
+        y_held = np.array([e["y_cls"] for e in uncens_held], dtype=int)
+        dur_held = np.array([e["duration_ms"] for e in uncens_held], dtype=float)
 
-    # Compute metrics using the threshold calibrated on validation fold
-    metrics_lstm = evaluate_predictions(
-        y_cls_true=splits.y_cls_test,
-        y_cls_prob=lstm_cls_prob,
-        y_reg_true=splits.y_reg_test,
-        y_reg_pred=lstm_reg_pred,
-        censored_flags=splits.censored_test,
-        threshold=best_thresh,
+        X_held_norm = (X_held_seq - seq_means) / seq_stds
+        with torch.no_grad():
+            p_held, d_held = model(torch.tensor(X_held_norm, dtype=torch.float32))
+            p_held_np = p_held.squeeze().numpy()
+            d_held_np = d_held.squeeze().numpy()
+
+        p_tr_prior = float(np.mean(y_tr))
+        held_out_metrics = compute_metrics(
+            y_true=y_held,
+            y_prob=p_held_np,
+            y_pred_mcc=(p_held_np >= calibrated_threshold).astype(int),
+            p_train_prior=p_tr_prior,
+        )
+        held_dur_mae = float(mean_absolute_error(dur_held, np.expm1(np.clip(d_held_np, 0, 15))))
+        held_out_metrics["mae_ms"] = held_dur_mae
+
+    # Save complete production checkpoint with all required provenance metadata (Item 1)
+    ckpt_dir = Path(checkpoint_path).parent
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    git_hash = get_git_commit()
+    checkpoint_payload = {
+        "dataset_version": dataset_version,
+        "git_commit": git_hash,
+        "git": git_hash,
+        "feature_names": FEATURE_NAMES,
+        "decision_threshold": float(calibrated_threshold),
+        "threshold": float(calibrated_threshold),
+        "scaler": {
+            "means": seq_means.tolist(),
+            "stds": seq_stds.tolist(),
+        },
+        "model_state_dict": model.state_dict(),
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "target_label": target_label,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    torch.save(checkpoint_payload, checkpoint_path)
+    logger.info("Saved complete production checkpoint to %s (Dataset: %s, Threshold: %.2f)", checkpoint_path, dataset_version, calibrated_threshold)
+
+    return {
+        "threshold": calibrated_threshold,
+        "held_out_metrics": held_out_metrics,
+        "checkpoint_path": checkpoint_path,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ArbSense Unified Walk-Forward & Production Training Pipeline.")
+    parser.add_argument("--db", type=str, default="data/arbsense.db", help="Path to SQLite database")
+    parser.add_argument("--dataset-version", type=str, default=None, help="Dataset version (e.g. v2.1)")
+    parser.add_argument("--checkpoint", type=str, default="models/checkpoints/lstm_best.pt", help="Checkpoint output path")
+    parser.add_argument("--results-json", type=str, default="models/checkpoints/model_results.json", help="Results JSON output path")
+    args = parser.parse_args()
+
+    cfg = AppConfig.load()
+    ds_ver = args.dataset_version or cfg.raw.get("dataset", {}).get("version", "v2.1")
+    tgt_label = cfg.raw.get("training", {}).get("target_label", "is_persistent_500ms")
+
+    # Step 1: Run complete Walk-Forward validation
+    wf_results = run_walkforward_pipeline(
+        db_path=args.db,
+        dataset_version=ds_ver,
+        target_label=tgt_label,
+        verbose=True,
     )
-    metrics_baseline = evaluate_predictions(
-        y_cls_true=splits.y_cls_test,
-        y_cls_prob=base_cls_prob,
-        y_reg_true=splits.y_reg_test,
-        y_reg_pred=base_reg_pred,
-        censored_flags=splits.censored_test,
-        threshold=best_thresh,
+
+    # Step 2: Train production model and evaluate on held-out final period
+    events = wf_results["events"]
+    held_out = wf_results["held_out_events"]
+
+    prod_results = train_production_model(
+        events=events,
+        held_out_events=held_out,
+        dataset_version=ds_ver,
+        target_label=tgt_label,
+        checkpoint_path=args.checkpoint,
     )
 
-    print("\n" + "=" * 80)
-    print("EVIDENCE: Comparative Evaluation Report (Test Set)")
-    print("=" * 80)
-    if not should_train_classifier:
-        print(f"NOTE: Classification metrics reflect {tgt_label} count report only ({pos_count_target} positive samples < 30).")
-    print(format_comparison_table(metrics_lstm, metrics_baseline))
-    print(f"\nBest Checkpoint saved: {best_ckpt_path}")
+    # Combine into comprehensive model results JSON for Dashboard (Item 7)
+    final_output = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dataset_version": ds_ver,
+        "git_commit": get_git_commit(),
+        "target_label": tgt_label,
+        "checkpoint_path": args.checkpoint,
+        "decision_threshold": prod_results["threshold"],
+        "n_events": wf_results["n_events"],
+        "n_folds": wf_results["n_folds"],
+        "n_held_out": wf_results["n_held_out"],
+        "walkforward_summary": wf_results["results_summary"],
+        "duration_summary": wf_results["duration_summary"],
+        "held_out_metrics": prod_results["held_out_metrics"],
+    }
 
-    return metrics_lstm, metrics_baseline
+    out_json = Path(args.results_json)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(final_output, f, indent=2)
 
-    print("\n" + "=" * 80)
-    print("EVIDENCE: Comparative Evaluation Report (Test Set)")
-    print("=" * 80)
-    print(format_comparison_table(metrics_lstm, metrics_baseline))
-    print(f"\nBest Checkpoint saved: {best_ckpt_path}")
-
-    return metrics_lstm, metrics_baseline
+    logger.info("Saved unified model results to %s", out_json)
+    print("\n" + "=" * 90)
+    print("TRAINING PIPELINE SUMMARY")
+    print(f"Dataset Version:     {ds_ver}")
+    print(f"Calibrated Threshold: {prod_results['threshold']:.2f}")
+    print(f"Checkpoint Saved:    {args.checkpoint}")
+    print(f"Results JSON Saved:  {args.results_json}")
+    print("=" * 90)
 
 
 if __name__ == "__main__":
-    try:
-        train_models()
-    except ValueError as err:
-        print(f"\n[Training Halted - Real Data Integrity Gate] {err}")
-        sys.exit(0)
+    main()

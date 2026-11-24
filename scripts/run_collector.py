@@ -104,9 +104,9 @@ class MarketDataCollector:
                 await asyncio.sleep(10.0)
                 uptime_sec = int(time.time() - start_time)
 
-                # Periodic rolling tick pruner: keep recent 1500 ticks per symbol
+                # Periodic rolling tick pruner: keep recent ticks per symbol from config
                 if (time.time() - last_prune_time) >= 60.0:
-                    self.db.prune_old_ticks(keep_latest_per_symbol=1500)
+                    self.db.prune_old_ticks()
                     last_prune_time = time.time()
 
                 db_count = self.db.get_tick_count()

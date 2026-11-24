@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from config.settings import AppConfig
 from models.features import extract_step_features
 from models.lstm_model import MultiHeadSpreadLSTM
 
@@ -24,14 +25,29 @@ logger = logging.getLogger(__name__)
 class LiveSpreadPredictor:
     """Performs sub-millisecond AI inference on live streaming order books."""
 
-    def __init__(self, checkpoint_path: str = "models/checkpoints/lstm_best.pt", seq_len: int = 20):
+    def __init__(
+        self,
+        checkpoint_path: str = "models/checkpoints/lstm_best.pt",
+        seq_len: int = 20,
+        expected_dataset_version: Optional[str] = None,
+    ):
         self.checkpoint_path = Path(checkpoint_path)
-        self.scaler_path = self.checkpoint_path.parent / "scaler_params.json"
         self.seq_len = seq_len
+        if expected_dataset_version is not None:
+            self.expected_dataset_version = expected_dataset_version
+        else:
+            try:
+                cfg = AppConfig.load()
+                self.expected_dataset_version = cfg.raw.get("dataset", {}).get("version", "v2.0")
+            except Exception:
+                self.expected_dataset_version = "v2.0"
+
         self.model: Optional[MultiHeadSpreadLSTM] = None
         self.device = torch.device("cpu")
         self.history: Dict[Tuple[str, str, str], List[List[float]]] = {}
         self.is_loaded = False
+        self.dataset_version: str = ""
+        self.git_commit: str = ""
         self.decision_threshold: float = 0.50
         self.feature_names: List[str] = []
         self.means: Optional[np.ndarray] = None
@@ -39,44 +55,82 @@ class LiveSpreadPredictor:
         self._load_model()
 
     def _load_model(self) -> None:
-        """Loads trained PyTorch LSTM checkpoint with unified decision threshold, scaler, and feature list.
+        """Loads trained PyTorch LSTM checkpoint requiring complete provenance metadata.
         
-        Strictness guarantee (Defect 5):
-        Heuristic fallbacks are disabled. Raises FileNotFoundError if checkpoint is missing.
+        Strictness guarantee (Item 1):
+        - File must exist.
+        - Checkpoint dictionary must contain complete metadata:
+          'dataset_version', 'git_commit', 'feature_names', 'threshold' (or 'decision_threshold'),
+          and 'scaler' (with 'means' and 'stds').
+        - Refuses to load on missing metadata or dataset_version mismatch.
         """
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(
                 f"Model checkpoint not found at {self.checkpoint_path}. "
-                f"Heuristic fallback is disabled; real trained checkpoint required."
+                f"Real trained checkpoint required."
             )
 
         try:
-            self.model = MultiHeadSpreadLSTM(input_dim=14, hidden_dim=64, num_layers=2)
             payload = torch.load(self.checkpoint_path, map_location=self.device)
-
-            if isinstance(payload, dict) and "model_state_dict" in payload:
-                self.model.load_state_dict(payload["model_state_dict"])
-                self.decision_threshold = float(payload.get("decision_threshold", 0.50))
-                scaler_dict = payload.get("scaler", {})
-                if "means" in scaler_dict and "stds" in scaler_dict:
-                    self.means = np.array(scaler_dict["means"], dtype=np.float32)
-                    self.stds = np.array(scaler_dict["stds"], dtype=np.float32)
-                    self.stds[self.stds < 1e-6] = 1.0
-                self.feature_names = payload.get("feature_names", [])
-            else:
-                self.model.load_state_dict(payload)
-                self.decision_threshold = 0.50
-
-            self.model.eval()
-            self.is_loaded = True
-            logger.info(
-                "[AI Predictor] Loaded PyTorch LSTM checkpoint from %s (Threshold: %.2f)",
-                self.checkpoint_path, self.decision_threshold
-            )
         except Exception as e:
-            logger.error("[AI Predictor] Failed loading checkpoint: %s", e)
-            self.is_loaded = False
             raise RuntimeError(f"Failed loading checkpoint from {self.checkpoint_path}: {e}") from e
+
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Invalid checkpoint format at {self.checkpoint_path}. Expected dict with metadata, got {type(payload)}."
+            )
+
+        # Check required metadata
+        required_keys = ["dataset_version", "feature_names", "model_state_dict"]
+        missing = [k for k in required_keys if k not in payload]
+
+        # git_commit check
+        if "git_commit" not in payload and "git" not in payload:
+            missing.append("git_commit")
+
+        # threshold check
+        threshold_val = payload.get("threshold", payload.get("decision_threshold"))
+        if threshold_val is None:
+            missing.append("threshold")
+
+        # scaler check
+        scaler_dict = payload.get("scaler")
+        if not isinstance(scaler_dict, dict) or "means" not in scaler_dict or "stds" not in scaler_dict:
+            missing.append("scaler")
+
+        if missing:
+            raise ValueError(
+                f"Checkpoint at {self.checkpoint_path} is missing required metadata: {', '.join(missing)}"
+            )
+
+        # Validate dataset_version mismatch
+        ckpt_version = str(payload["dataset_version"])
+        if ckpt_version != self.expected_dataset_version:
+            raise ValueError(
+                f"Dataset version mismatch: checkpoint is for '{ckpt_version}', but expected '{self.expected_dataset_version}'. Refusing to load."
+            )
+
+        input_dim = len(payload["feature_names"]) if payload.get("feature_names") else 14
+        hidden_dim = int(payload.get("hidden_dim", 64))
+        num_layers = int(payload.get("num_layers", 2))
+        self.model = MultiHeadSpreadLSTM(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers)
+        self.model.load_state_dict(payload["model_state_dict"])
+        self.model.eval()
+
+        self.dataset_version = ckpt_version
+        self.git_commit = str(payload.get("git_commit", payload.get("git", "")))
+        self.feature_names = list(payload["feature_names"])
+        self.decision_threshold = float(threshold_val)
+
+        self.means = np.array(scaler_dict["means"], dtype=np.float32)
+        self.stds = np.array(scaler_dict["stds"], dtype=np.float32)
+        self.stds[self.stds < 1e-6] = 1.0
+
+        self.is_loaded = True
+        logger.info(
+            "[AI Predictor] Loaded PyTorch LSTM checkpoint from %s (Dataset: %s, Threshold: %.2f, Features: %d)",
+            self.checkpoint_path, self.dataset_version, self.decision_threshold, len(self.feature_names)
+        )
 
     def predict_opportunity(
         self,

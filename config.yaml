@@ -108,30 +108,39 @@ dynamic_hurdle:
   rolling_window_ticks: 50
   volatility_multiplier_k: 1.5      # k * sigma added to hurdle
 
-# Event Tracking & Machine Learning (Amendments 5 & 6)
+# Event Tracking & Staleness Parameters (Item 6)
+tracking:
+  max_staleness_ms: 1500.0          # Max staleness for as-of join quote matching (1.5s)
+  inactivity_timeout_ms: 1500.0     # Spread event close on quote inactivity (1.5s)
+
+# Event Labeling (Item 5: execution_latency_assumption_ms removed; ONE frozen threshold in dataset)
 labeling:
-  execution_latency_assumption_ms: 50.0 # Default fallback if DB has < 10 measured transit ticks
   right_censored_max_window_ms: 30000   # Max tracking duration before flagging right-censored
   use_log_duration: true                # Target = log(1 + duration_ms)
   persistence_horizons_ms: [500, 2000, 5000] # Persistence targets: duration_ms >= h
 
 dataset:
-  version: "v2.0"
-  viability_latency_threshold_ms: 85.0  # Fixed viability latency threshold per dataset version (Requirement 3: never recomputed at startup)
-  train_ratio: 0.70
-  val_ratio: 0.15
-  test_ratio: 0.15
-  purge_gap_events: 5                   # Purge gap between train, val, and test splits (Amendment 6)
+  version: "v2.1"
+  viability_latency_threshold_ms: 85.0  # ONE fixed viability latency threshold per dataset version (Item 5)
   sequence_length: 20                   # LSTM lookback window
 
 training:
-  train_ratio: 0.70
-  val_ratio: 0.15
-  test_ratio: 0.15
-  purge_gap_events: 5                   # Purge gap between train, val, and test splits (Amendment 6)
+  target_label: "is_persistent_500ms"   # Configurable primary classification target
+  persistence_horizons_ms: [500, 2000, 5000]
+  loss_weight: "auto"                   # Configurable loss weight (Item 6)
+  held_out_ratio: 0.15                  # Held-out final period never used during fold training or tuning
+  purge_gap_seconds: 60.0               # 60s time purge between splits inside each fold
   min_events: 20                        # Strictly fail training if fewer than N real events exist
-  target_label: "is_persistent_500ms"   # Configurable primary classification target (frozen based on train split 50/50 balance)
-
+  fold_fractions:                       # Non-overlapping walk-forward folds (stride >= test_window) (Item 2 & 6)
+    - train_ratio: 0.40
+      val_ratio: 0.15
+      test_ratio: 0.15
+    - train_ratio: 0.55
+      val_ratio: 0.15
+      test_ratio: 0.15
+    - train_ratio: 0.70
+      val_ratio: 0.15
+      test_ratio: 0.15
 
 # Execution Simulator (Amendment 7)
 simulation:
@@ -146,9 +155,10 @@ simulation:
   pre_funded_balance_assumption: true   # Assumes inventory pre-allocated across venues
   depth_walking_slippage: true          # VWAP calculated from real order book levels (no double-count)
 
-# Storage
+# Storage (Item 6: tick_prune_keep_count in config)
 storage:
   backend: "auto"                       # "timescaledb", "sqlite", or "auto" (tries TimescaleDB, falls back)
   sqlite_path: "data/arbsense.db"
   batch_size: 50
   flush_interval_ms: 500
+  tick_prune_keep_count: 1500           # Rolling tick buffer kept per symbol

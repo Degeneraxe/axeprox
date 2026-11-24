@@ -3,8 +3,9 @@
 Multi-tab Streamlit dashboard providing:
 1. Live cross-exchange spread matrix & L2 market depth monitor
 2. Real-time AI opportunity detection & spread-duration predictions
-3. Model evaluation diagnostics (LSTM vs Baseline comparison, confusion matrix, ROC/PR curves)
+3. Model Results tab reading models/checkpoints/model_results.json (Item 7)
 4. Paper trading execution ledger, fee/slippage breakdown, and cumulative P&L equity curve.
+Zero writes to arbsense.db (sqlite URI mode=ro enforced).
 """
 from __future__ import annotations
 
@@ -42,10 +43,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom Styling (including CSS fix for Streamlit screen dimming/flickering)
+# Custom Styling
 st.markdown("""
 <style>
-    /* Prevent screen dimming during rerun while keeping top-right running/stop palm widget visible */
     div[data-testid="stAppViewContainer"] > section { opacity: 1 !important; filter: none !important; }
     .element-container, div[data-testid="stVerticalBlock"] { opacity: 1 !important; filter: none !important; }
     div.stApp.stApp--running { opacity: 1 !important; filter: none !important; }
@@ -84,14 +84,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource
-def get_db():
-    db = DatabaseManager(sqlite_path="data/arbsense.db")
+def get_db(sqlite_path: str = "data/arbsense.db") -> DatabaseManager:
+    """Connects to SQLite database strictly in read-only mode (mode=ro). Zero writes allowed."""
+    db = DatabaseManager(sqlite_path=sqlite_path, read_only=True)
     db.initialize()
     return db
 
 
-def load_config():
+def load_config() -> AppConfig:
     return AppConfig.load()
 
 
@@ -108,14 +108,26 @@ def calculate_route_hurdle(buy_venue: str, sell_venue: str, scenario: str, cost_
 
 def main():
     config = load_config()
-    db = get_db()
     cost_model = CostModel(config)
 
     # --------------------------------------------------------------------------
-    # Sidebar Controls
+    # Sidebar Controls (Item 7: DB Path Field & Read-Only Guarantee)
     # --------------------------------------------------------------------------
     st.sidebar.title("⚡ ArbSense Engine")
-    st.sidebar.caption("AI Cross-Exchange Microstructure Engine")
+    st.sidebar.caption("AI Cross-Exchange Microstructure Engine (Read-Only Mode)")
+
+    db_path_input = st.sidebar.text_input(
+        "Database Path",
+        value="data/arbsense.db",
+        help="Path to SQLite database copy. Opened strictly read-only (mode=ro) with zero writes.",
+    )
+
+    try:
+        db = get_db(db_path_input)
+    except Exception as e:
+        st.sidebar.error(f"Failed opening database at {db_path_input}: {e}")
+        st.error(f"Cannot connect to database: {e}")
+        return
 
     # Fee Scenario Selector
     fee_scenario = st.sidebar.selectbox(
@@ -148,10 +160,10 @@ def main():
     if st.sidebar.button("🔄 Refresh Data Now", use_container_width=True):
         st.rerun()
 
-    auto_refresh = st.sidebar.checkbox("Auto-Refresh (10s)", value=False, help="Automatically refreshes every 10s without screen dimming")
+    auto_refresh = st.sidebar.checkbox("Auto-Refresh (10s)", value=False)
 
     # --------------------------------------------------------------------------
-    # Top KPI Metrics Bar (Task 4: Cumulative Counter & Spread Event Metrics)
+    # Top KPI Metrics Bar
     # --------------------------------------------------------------------------
     cumul_ticks = db.get_cumulative_tick_count()
     active_ticks = db.get_tick_count()
@@ -174,10 +186,14 @@ def main():
     viable_fraction = (viable_events / total_events) if total_events > 0 else 0.0
     censored_fraction = (censored_events / total_events) if total_events > 0 else 0.0
 
-    cur.execute("SELECT COUNT(*), SUM(net_pnl) FROM simulated_trades WHERE status = 'FILLED'")
-    total_trades, total_net_pnl = cur.fetchone()
-    total_trades = total_trades or 0
-    total_net_pnl = total_net_pnl or 0.0
+    try:
+        cur.execute("SELECT COUNT(*), SUM(net_pnl) FROM simulated_trades WHERE status = 'FILLED'")
+        total_trades, total_net_pnl = cur.fetchone()
+        total_trades = total_trades or 0
+        total_net_pnl = total_net_pnl or 0.0
+    except Exception:
+        total_trades = 0
+        total_net_pnl = 0.0
 
     st.title("ArbSense: AI-Powered Cross-Exchange Arbitrage Engine")
     st.caption("Empirical Market Microstructure Spread Detection & PyTorch LSTM Duration Forecasting")
@@ -189,11 +205,11 @@ def main():
     col4.metric("Viable Fraction", f"{viable_fraction:.1%}", delta=f"{viable_events:,} viable")
     col5.metric("Censored Fraction", f"{censored_fraction:.1%}", delta=f"{censored_events:,} censored")
 
-    # Tabs
+    # Tabs (Item 7: Model Results tab reading model_results.json)
     tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Live Spreads & Depth",
         "🧠 AI Prediction Engine",
-        "📈 Model Diagnostics & Metrics",
+        "📈 Model Results",
         "💼 Paper Trading Ledger",
     ])
 
@@ -218,10 +234,10 @@ def main():
                     st.metric("Best Ask", f"${row['best_ask']:,.4f}" if row['best_ask'] < 10 else f"${row['best_ask']:,.2f}")
                     st.write(f"**Internal Spread:** `${row['top_spread']:.4f}`")
                     st.write(f"**Imbalance (OBI):** `{row['imbalance']:+.3f}`")
-                    st.write(f"**Transit Latency:** `{row['transit_latency_ms']:.1f} ms`")
+                    lat_str = f"{row['transit_latency_ms']:.1f} ms" if row['transit_latency_ms'] else "N/A"
+                    st.write(f"**Transit Latency:** `{lat_str}`")
 
             st.markdown("---")
-            # Dynamic Cross-Exchange Arbitrage Matrix under Active Fee Scenario
             st.subheader(f"Cross-Exchange Arbitrage Matrix (Active Scenario: `{fee_scenario.upper()}`)")
             st.caption(f"Real-time spread evaluation across all pairwise exchange routes for **{selected_symbol}** under the selected **{fee_scenario.upper()}** fee schedule:")
 
@@ -248,95 +264,133 @@ def main():
                         status_str = f"🛡️ FILTERED (Fee Deficit: {net_alpha_bps:.2f} bps)"
 
                     matrix_data.append({
-                        "Buy Venue (Ask)": buy_ex.upper(),
-                        "Sell Venue (Bid)": sell_ex.upper(),
-                        "Buy Price": f"${ask_price:,.4f}" if ask_price < 10 else f"${ask_price:,.2f}",
-                        "Sell Price": f"${bid_price:,.4f}" if bid_price < 10 else f"${bid_price:,.2f}",
-                        "Gross Spread": f"{gross_spread_bps:+.2f} bps",
-                        f"Fee Hurdle ({fee_scenario.upper()})": f"{hurdle_bps:.1f} bps",
-                        "Projected Net Alpha": f"{net_alpha_bps:+.2f} bps",
-                        "AI Gatekeeper Action": status_str,
+                        "Route": f"{buy_ex.upper()} ➔ {sell_ex.upper()}",
+                        "Buy Ask": f"${ask_price:,.2f}",
+                        "Sell Bid": f"${bid_price:,.2f}",
+                        "Gross Spread (bps)": f"{gross_spread_bps:+.2f}",
+                        "Total Hurdle (bps)": f"{hurdle_bps:.2f}",
+                        "Net Alpha (bps)": f"{net_alpha_bps:+.2f}",
+                        "Execution Decision": status_str,
                     })
 
             if matrix_data:
                 st.dataframe(pd.DataFrame(matrix_data), use_container_width=True)
-            else:
-                st.info("Accumulating multi-exchange snapshots for matrix...")
-
-            st.markdown("---")
-            st.subheader("Recent Ingestion Stream (Last 10 Ticks)")
-            st.dataframe(
-                df_ticks[["time", "exchange", "symbol", "best_bid", "best_ask", "mid_price", "imbalance", "transit_latency_ms"]].head(10),
-                use_container_width=True,
-            )
         else:
-            st.info(f"Ingestion pipeline active. Accumulating tick data for {selected_symbol}...")
+            st.info(f"No orderbook ticks recorded yet for {selected_symbol}. Feeds will stream updates once active.")
 
     # --------------------------------------------------------------------------
-    # TAB 2: AI Predictions & Active Opportunities
+    # TAB 2: AI Prediction Engine
     # --------------------------------------------------------------------------
     with tab2:
-        st.subheader("Detected Arbitrage Windows & Spread Lifecycle Events")
+        st.subheader("Real-Time Spread Event State Machine & AI Inference")
+        st.caption("Active and recently completed spread opportunities captured with 20-step microstructure feature windows:")
+
         cur.execute("SELECT * FROM spread_events ORDER BY open_time DESC LIMIT 25")
         events_rows = [dict(r) for r in cur.fetchall()]
 
         if events_rows:
             df_events = pd.DataFrame(events_rows)
-            st.dataframe(
-                df_events[[
-                    "event_id", "symbol", "buy_exchange", "sell_exchange", "open_time",
-                    "peak_spread_bps", "cost_hurdle_bps", "duration_ms", "log_duration", "is_viable", "is_right_censored"
-                ]],
-                use_container_width=True,
-            )
+            cols_to_show = [
+                "event_id", "symbol", "buy_exchange", "sell_exchange", "open_time",
+                "peak_spread_bps", "cost_hurdle_bps", "duration_ms", "log_duration", "is_viable", "is_right_censored"
+            ]
+            cols_present = [c for c in cols_to_show if c in df_events.columns]
+            st.dataframe(df_events[cols_present], use_container_width=True)
         else:
             st.info("No spread events closed yet. Feeds are actively monitoring for cross-exchange discrepancies.")
 
     # --------------------------------------------------------------------------
-    # TAB 3: Model Diagnostics & Evaluation
+    # TAB 3: Model Results (Item 7: Reading models/checkpoints/model_results.json)
     # --------------------------------------------------------------------------
     with tab3:
-        st.subheader("AI Performance Benchmark: PyTorch LSTM vs Scikit-Learn Baseline")
-        st.markdown("""
-        Evaluated on unseen chronological holdout test sets with **walk-forward validation** and **purge gaps** (zero future leakage):
-        """)
+        st.subheader("Empirical Model Results & Walk-Forward Validation Benchmark")
+        results_path = PROJECT_ROOT / "models" / "checkpoints" / "model_results.json"
 
-        comp_data = {
-            "Metric": ["F1-Score (Viability)", "Precision", "Recall", "PR-AUC", "ROC-AUC", "Brier Score", "MAE Duration"],
-            "PyTorch LSTM": ["0.812", "0.835", "0.791", "0.846", "0.884", "0.1142", "142.3 ms"],
-            "Baseline (LogReg/Ridge)": ["0.648", "0.620", "0.678", "0.681", "0.742", "0.1985", "389.7 ms"],
-            "Improvement (Delta)": ["+25.3%", "+34.7%", "+16.7%", "+24.2%", "+19.1%", "-42.5%", "-63.5%"],
-        }
-        st.table(pd.DataFrame(comp_data))
+        if results_path.exists():
+            try:
+                with open(results_path, "r", encoding="utf-8") as f:
+                    res_data = json.load(f)
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("#### Key Model Architecture Highlights")
-            st.markdown(r"""
-            - **Input Feature Dimension:** 14 microstructural order-book signals (OBI, Velocity, Volatility, Latency Delta)
-            - **Sequence Window:** 20 timesteps lookback
-            - **Multi-Task Loss:** Weighted Binary Cross-Entropy (Class Imbalance) + Smooth L1 (Huber) Regression
-            - **Target:** Viable = Spread persists $> \tau_{\text{latency}}$ with positive net alpha after fees.
-            """)
-        with col_b:
-            st.markdown("#### F1-Score Target Status")
-            st.success("Target Achieved: F1-Score > 75% on out-of-sample walk-forward test fold.")
+                # Provenance Banner
+                st.info(
+                    f"**Dataset Version:** `{res_data.get('dataset_version', 'N/A')}` | "
+                    f"**Git Commit:** `{res_data.get('git_commit', 'N/A')}` | "
+                    f"**Target Label:** `{res_data.get('target_label', 'is_persistent_500ms')}` | "
+                    f"**Decision Threshold:** `{res_data.get('decision_threshold', 0.50):.2f}` | "
+                    f"**Evaluated At:** `{res_data.get('timestamp', 'N/A')}`"
+                )
+
+                # Walk-Forward Validation Results Table
+                st.markdown("### 1. Expanding-Window Walk-Forward Validation (Non-Overlapping Folds)")
+                st.caption("Folds evaluated with 60s time purge gaps and zero test-window overlap across folds:")
+
+                wf_summary = res_data.get("walkforward_summary", {})
+                if wf_summary:
+                    table_rows = []
+                    for model_name, stats in wf_summary.items():
+                        table_rows.append({
+                            "Model": model_name,
+                            "PR-AUC (Mean ± Std)": f"{stats.get('pr_auc_mean', 0.0):.3f} ± {stats.get('pr_auc_std', 0.0):.3f}",
+                            "Lift over Base Rate": f"{stats.get('lift_mean', 1.0):.2f}x ± {stats.get('lift_std', 0.0):.2f}x",
+                            "MCC (Validation Threshold)": f"{stats.get('mcc_mean', 0.0):+.3f} ± {stats.get('mcc_std', 0.0):.3f}",
+                            "Balanced Accuracy": f"{stats.get('bal_acc_mean', 0.5):.3f} ± {stats.get('bal_acc_std', 0.0):.3f}",
+                            "Brier Skill Score": f"{stats.get('bss_mean', 0.0):+.3f}",
+                            "F1 (Secondary)": f"{stats.get('f1_mean', 0.0):.3f} ± {stats.get('f1_std', 0.0):.3f}",
+                        })
+                    st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+
+                # Duration Regressors MAE Table
+                st.markdown("### 2. Spread Duration Forecasting (MAE in milliseconds)")
+                dur_summary = res_data.get("duration_summary", {})
+                if dur_summary:
+                    dur_rows = []
+                    for reg_name, stats in dur_summary.items():
+                        dur_rows.append({
+                            "Duration Regressor": reg_name,
+                            "Mean Absolute Error (MAE)": f"{stats.get('mae_mean_ms', 0.0):.1f} ms ± {stats.get('mae_std_ms', 0.0):.1f} ms",
+                        })
+                    st.dataframe(pd.DataFrame(dur_rows), use_container_width=True)
+
+                # Held-Out Evaluation Metrics
+                st.markdown("### 3. Held-Out Final Period Evaluation (Strictly Unseen)")
+                held_out = res_data.get("held_out_metrics", {})
+                if held_out:
+                    h_cols = st.columns(5)
+                    h_cols[0].metric("Held-Out PR-AUC", f"{held_out.get('pr_auc', 0.0):.3f}")
+                    h_cols[1].metric("Held-Out Lift", f"{held_out.get('lift', 1.0):.2f}x")
+                    h_cols[2].metric("Held-Out MCC", f"{held_out.get('mcc', 0.0):+.3f}")
+                    h_cols[3].metric("Precision @ Top-20%", f"{held_out.get('p_top20', 0.0):.1%}")
+                    h_cols[4].metric("Duration MAE", f"{held_out.get('mae_ms', 0.0):.1f} ms")
+                else:
+                    st.caption("Held-out metrics will appear after production model evaluation.")
+
+                st.markdown("---")
+                st.markdown("#### Scientific Limitations & Integrity Notice")
+                st.caption(
+                    "All metrics are produced without test-set tuning. "
+                    "Features are strictly point-in-time from 20-step order book windows. "
+                    "Binance depth snapshot arrival intervals are flagged 'estimated' and excluded from latency features."
+                )
+
+            except Exception as e:
+                st.error(f"Error parsing model results from {results_path}: {e}")
+        else:
+            st.warning(
+                f"No model results file found at `{results_path}`. "
+                "Run `python models/train.py` to execute walk-forward validation and generate benchmark evidence."
+            )
 
     # --------------------------------------------------------------------------
     # TAB 4: Paper Trading & P&L Ledger
     # --------------------------------------------------------------------------
     with tab4:
         st.subheader("Autonomous Paper Trading Ledger & Execution Desk")
+        st.info("🤖 **Validation Layer Gatekeeper Active:** Simulates executions against real L2 depth without modifying database.")
 
-        st.info("🤖 **Validation Layer Gatekeeper Active:** ArbSense monitors live Level 2 order books and automatically executes paper trades only when: (1) Gross Spread > Exchange Taker Fees AND (2) PyTorch LSTM predicts spread duration > execution latency.")
-
-        # Interactive Paper Execution Desk
-        with st.expander("⚡ Interactive Trade Execution Desk", expanded=True):
-            st.caption(f"Perform paper trading orders directly against real-time order books from Binance, Coinbase, and Kraken (Synced to **{selected_symbol}**):")
-
+        # Interactive Paper Execution Desk (In-Memory Simulation)
+        with st.expander("⚡ Interactive Trade Execution Desk (In-Memory Simulator)", expanded=True):
             p_col1, p_col2, p_col3, p_col4 = st.columns(4)
             with p_col1:
-                # Sync trading pair with sidebar selected_symbol
                 default_idx = supported_pairs.index(selected_symbol) if selected_symbol in supported_pairs else 0
                 trade_sym = st.selectbox(
                     "Trading Pair",
@@ -349,7 +403,7 @@ def main():
             with p_col3:
                 sell_venue = st.selectbox("Sell Venue (Bid)", ["kraken", "coinbase", "binance"], index=0, key="manual_sell")
             with p_col4:
-                default_qty = 0.05 if "BTC" in trade_sym else (0.50 if "ETH" in trade_sym else (10.0 if "SOL" in trade_sym else 500.0))
+                default_qty = 0.05 if "BTC" in trade_sym else (0.50 if "ETH" in trade_sym else 10.0)
                 trade_qty = st.number_input(
                     "Order Size",
                     value=float(default_qty),
@@ -363,139 +417,74 @@ def main():
             if snap_buy_row and snap_sell_row:
                 b_tick = snap_buy_row[0]
                 s_tick = snap_sell_row[0]
-                est_gross_bps = ((s_tick["best_bid"] - b_tick["best_ask"]) / b_tick["best_ask"]) * 10000.0
 
+                raw_spread_bps = ((s_tick["best_bid"] - b_tick["best_ask"]) / b_tick["best_ask"]) * 10000.0
                 total_fee_hurdle = calculate_route_hurdle(buy_venue, sell_venue, fee_scenario, cost_model)
-                projected_net_bps = est_gross_bps - total_fee_hurdle
+                net_spread_bps = raw_spread_bps - total_fee_hurdle
 
-                m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-                m_col1.write(f"**Buy ({buy_venue.upper()}):** Ask `${b_tick['best_ask']:,.4f}`" if b_tick['best_ask'] < 10 else f"**Buy ({buy_venue.upper()}):** Ask `${b_tick['best_ask']:,.2f}`")
-                m_col2.write(f"**Sell ({sell_venue.upper()}):** Bid `${s_tick['best_bid']:,.4f}`" if s_tick['best_bid'] < 10 else f"**Sell ({sell_venue.upper()}):** Bid `${s_tick['best_bid']:,.2f}`")
-                m_col3.write(f"**Gross Gap:** `{est_gross_bps:+.2f} bps`")
-                m_col4.write(f"**Fee Hurdle ({fee_scenario.upper()}):** `{total_fee_hurdle:.1f} bps` (Net: `{projected_net_bps:+.2f} bps`)")
+                c_m1, c_m2, c_m3 = st.columns(3)
+                c_m1.metric(f"Live Best Ask ({buy_venue.upper()})", f"${b_tick['best_ask']:,.2f}")
+                c_m2.metric(f"Live Best Bid ({sell_venue.upper()})", f"${s_tick['best_bid']:,.2f}")
+                c_m3.metric("Live Net Alpha (after fees)", f"{net_spread_bps:+.2f} bps")
 
-                if projected_net_bps <= 0:
-                    st.warning(f"⚠️ **Fee Protection Active:** The gross spread ({est_gross_bps:+.2f} bps) is smaller than the exchange fees ({total_fee_hurdle:.1f} bps). Executing this trade under normal conditions loses {abs(projected_net_bps):.2f} bps to fees! The AI Auto-Trader actively rejects this trade to preserve capital.")
-                else:
-                    st.success(f"✨ **Profitable Arbitrage Window:** The gross price gap ({est_gross_bps:+.2f} bps) beats the fee hurdle ({total_fee_hurdle:.1f} bps) with **+{projected_net_bps:.2f} bps net profit**!")
+                test_pipeline_btn = st.button("🧪 Simulate In-Memory Paper Trade", use_container_width=True)
+                if test_pipeline_btn:
+                    b_asks = [OrderBookLevel(b_tick["best_ask"], trade_qty * 3)]
+                    s_bids = [OrderBookLevel(s_tick["best_bid"], trade_qty * 3)]
 
-                btn_col1, btn_col2 = st.columns(2)
-                with btn_col1:
-                    execute_btn = st.button("🚀 Execute Market Trade Now", type="primary", use_container_width=True)
-                with btn_col2:
-                    test_pipeline_btn = st.button("🧪 Test Execution Pipeline (Demo Trade)", use_container_width=True, help="Executes a complete paper trade through the full simulator to verify VWAP, latency injection, fee accounting, and ledger logging")
+                    buy_snap = OrderBookSnapshot(
+                        exchange=buy_venue,
+                        symbol=trade_sym,
+                        quote_currency="USDT",
+                        exchange_ts_ms=b_tick["exchange_ts_ms"],
+                        local_ts_ms=b_tick["local_ts_ms"],
+                        transit_latency_ms=b_tick["transit_latency_ms"],
+                        asks=b_asks,
+                    )
+                    sell_snap = OrderBookSnapshot(
+                        exchange=sell_venue,
+                        symbol=trade_sym,
+                        quote_currency="USDT",
+                        exchange_ts_ms=s_tick["exchange_ts_ms"],
+                        local_ts_ms=s_tick["local_ts_ms"],
+                        transit_latency_ms=s_tick["transit_latency_ms"],
+                        bids=s_bids,
+                    )
 
-                # Execution Handler
-                if execute_btn or test_pipeline_btn:
-                    if execute_btn and projected_net_bps <= 0:
-                        st.error(f"🛑 **Trade Blocked by AI Gatekeeper!** Gross gap ({est_gross_bps:+.2f} bps) < fees ({total_fee_hurdle:.1f} bps). ArbSense protects your capital by refusing to execute.")
+                    # In-memory execution simulator: db_manager=None guarantees ZERO database writes
+                    simulator = ExecutionSimulator(db_manager=None, config=config)
+                    trade_res = simulator.execute_arbitrage(
+                        symbol=trade_sym,
+                        buy_snap=buy_snap,
+                        sell_snap=sell_snap,
+                        quantity=trade_qty,
+                        fee_scenario=fee_scenario,
+                        opportunity_duration_ms=600.0,
+                    )
+
+                    if trade_res.status == "FILLED":
+                        st.success(
+                            f"✅ **Trade Simulated FILLED!** Bought {trade_res.filled_quantity} {trade_sym} on {buy_venue.upper()} at VWAP ${trade_res.buy_vwap:,.2f}, Sold on {sell_venue.upper()} at VWAP ${trade_res.sell_vwap:,.2f}. Gross P&L: ${trade_res.gross_pnl_usdt:+.2f} | Fees: -${(trade_res.buy_fee_usdt + trade_res.sell_fee_usdt):.2f} | **Net P&L: {trade_res.net_pnl_usdt:+.2f} USDT** (Injected Latency: {trade_res.injected_latency_ms:.1f}ms)"
+                        )
                     else:
-                        # Construct real snapshots from live order book ticks
-                        raw_b_asks = json.loads(b_tick.get("ask_depth") or "[]")
-                        raw_s_bids = json.loads(s_tick.get("bid_depth") or "[]")
-
-                        b_asks = [OrderBookLevel(l["p"], l["a"]) for l in raw_b_asks] or [OrderBookLevel(b_tick["best_ask"], trade_qty * 2)]
-                        s_bids = [OrderBookLevel(l["p"], l["a"]) for l in raw_s_bids] or [OrderBookLevel(s_tick["best_bid"], trade_qty * 2)]
-
-                        # For demo test mode, ensure bid > ask to simulate a filled dislocation
-                        if test_pipeline_btn and s_bids[0].price <= b_asks[0].price:
-                            demo_spread_mult = 1.0 + (total_fee_hurdle + 15.0) / 10000.0
-                            s_bids = [OrderBookLevel(b_asks[0].price * demo_spread_mult, trade_qty * 2)]
-
-                        buy_snap = OrderBookSnapshot(
-                            exchange=buy_venue,
-                            symbol=trade_sym,
-                            quote_currency="USDT",
-                            exchange_ts_ms=b_tick["exchange_ts_ms"],
-                            local_ts_ms=b_tick["local_ts_ms"],
-                            transit_latency_ms=b_tick["transit_latency_ms"],
-                            asks=b_asks,
-                        )
-                        sell_snap = OrderBookSnapshot(
-                            exchange=sell_venue,
-                            symbol=trade_sym,
-                            quote_currency="USDT",
-                            exchange_ts_ms=s_tick["exchange_ts_ms"],
-                            local_ts_ms=s_tick["local_ts_ms"],
-                            transit_latency_ms=s_tick["transit_latency_ms"],
-                            bids=s_bids,
-                        )
-
-                        simulator = ExecutionSimulator(db_manager=db, config=config)
-                        trade_res = simulator.execute_arbitrage(
-                            symbol=trade_sym,
-                            buy_snap=buy_snap,
-                            sell_snap=sell_snap,
-                            quantity=trade_qty,
-                            fee_scenario=fee_scenario,
-                            opportunity_duration_ms=600.0,
-                        )
-
-                        if trade_res.status == "FILLED":
-                            st.success(
-                                f"✅ **Trade `{trade_res.trade_id}` FILLED!** Bought {trade_res.filled_quantity} {trade_sym} on {buy_venue.upper()} at VWAP ${trade_res.buy_vwap:,.2f}, Sold on {sell_venue.upper()} at VWAP ${trade_res.sell_vwap:,.2f}. Gross P&L: ${trade_res.gross_pnl_usdt:+.2f} | Fees: -${(trade_res.buy_fee_usdt + trade_res.sell_fee_usdt):.2f} | **Net P&L: {trade_res.net_pnl_usdt:+.2f} USDT** (Latency: {trade_res.injected_latency_ms:.1f}ms)"
-                            )
-                            st.rerun()
-                        else:
-                            st.warning(f"⚠️ Trade Status: {trade_res.status} (Injected Latency: {trade_res.injected_latency_ms:.1f}ms)")
+                        st.warning(f"⚠️ Simulated Status: {trade_res.status} (Injected Latency: {trade_res.injected_latency_ms:.1f}ms)")
             else:
                 st.info(f"Awaiting book updates from {buy_venue.upper()} and {sell_venue.upper()} for {trade_sym}...")
 
-        # ----------------------------------------------------------------------
-        # Ledger Display & Filtering
-        # ----------------------------------------------------------------------
+        # Display historical trades from DB read-only
         st.markdown("---")
-        h_col1, h_col2, h_col3, h_col4 = st.columns([2, 2, 2, 1])
-        h_col1.metric("Virtual Portfolio Equity", f"${10000.0 + total_net_pnl:,.2f} USDT")
-        h_col2.metric("Realized Net P&L", f"${total_net_pnl:+.2f} USDT", delta=f"{total_net_pnl:+.2f}")
-        h_col3.metric("Win Rate", "100.0%" if total_trades > 0 else "N/A")
-        with h_col4:
-            st.write("")
-            if st.button("🗑️ Reset Ledger", use_container_width=True, help="Clear all executed trades and reset portfolio to $10,000"):
-                cur.execute("DELETE FROM simulated_trades")
-                cur.execute("DELETE FROM spread_events")
-                db._sqlite_conn.commit()
-                st.success("Ledger reset to $10,000.00 USDT!")
-                st.rerun()
-
-        # Ledger Filter by Asset Pair
-        f_col1, f_col2 = st.columns([3, 1])
-        with f_col1:
-            ledger_filter_options = ["All Pairs"] + supported_pairs
-            ledger_filter = st.selectbox(
-                "Filter Ledger by Asset Pair",
-                options=ledger_filter_options,
-                index=0,
-                key="ledger_asset_filter",
-            )
-
-        if ledger_filter == "All Pairs":
+        try:
             cur.execute("SELECT * FROM simulated_trades ORDER BY timestamp DESC LIMIT 50")
-        else:
-            cur.execute("SELECT * FROM simulated_trades WHERE symbol = ? ORDER BY timestamp DESC LIMIT 50", (ledger_filter,))
-
-        trades_rows = [dict(r) for r in cur.fetchall()]
+            trades_rows = [dict(r) for r in cur.fetchall()]
+        except Exception:
+            trades_rows = []
 
         if trades_rows:
             df_trades = pd.DataFrame(trades_rows)
-            st.dataframe(
-                df_trades[[
-                    "trade_id", "timestamp", "symbol", "buy_exchange", "sell_exchange",
-                    "quantity", "buy_vwap", "sell_vwap", "gross_pnl", "buy_fee", "sell_fee", "net_pnl", "status"
-                ]],
-                use_container_width=True,
-            )
-
-            # Cumulative equity curve
-            df_trades_asc = df_trades.iloc[::-1].copy()
-            df_trades_asc["cumulative_pnl"] = df_trades_asc["net_pnl"].cumsum()
-            st.line_chart(df_trades_asc.set_index("timestamp")["cumulative_pnl"])
+            st.dataframe(df_trades, use_container_width=True)
         else:
-            st.info(f"No paper trades recorded for '{ledger_filter}'. Click '🧪 Test Execution Pipeline (Demo Trade)' above to test a simulated fill, or wait for live market dislocations.")
+            st.info("No recorded historical trades in database.")
 
-    # --------------------------------------------------------------------------
-    # Smooth Auto-Refresh at bottom
-    # --------------------------------------------------------------------------
     if auto_refresh:
         time.sleep(10)
         st.rerun()

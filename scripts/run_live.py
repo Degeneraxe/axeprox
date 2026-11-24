@@ -188,6 +188,9 @@ class UnifiedLiveService:
         backend = self.db.initialize()
         logger.info("Database initialized: backend=%s (%s)", backend, self.db.connection_diagnostic)
 
+        # Store initial NTP offset sample
+        self.db.record_clock_offset(clock_sync.offset_ms)
+
         # 3. Governance: Freeze Validation & Run Metadata Registration (Item 2)
         dataset_ver = self.config.raw.get("dataset", {}).get("version", "v2.0")
         latency_thresh_ms = float(self.config.raw.get("dataset", {}).get("viability_latency_threshold_ms", 85.0))
@@ -200,6 +203,7 @@ class UnifiedLiveService:
             git_commit=git_hash,
             latency_threshold_ms=latency_thresh_ms,
             config_json=cfg_json,
+            clock_offset_ms=clock_sync.offset_ms,
         )
 
         # 4. Start High-Throughput Batch Writer
@@ -228,6 +232,7 @@ class UnifiedLiveService:
         start_time = time.time()
         last_log_time = time.time()
         last_prune_time = time.time()
+        last_ntp_sync_time = time.time()
 
         try:
             while self._running:
@@ -238,16 +243,22 @@ class UnifiedLiveService:
                 await asyncio.sleep(0.5)
                 now_ms = clock_sync.get_corrected_time_ms()
 
-                # Periodically check timeouts for active spread windows (1500ms inactivity / 30s right-censoring)
+                # Periodically check timeouts for active spread windows (inactivity / right-censoring)
                 closed_events = self.tracker.check_timeouts(now_ms)
                 if closed_events:
                     self.events_closed_session += len(closed_events)
 
                 now_sec = time.time()
 
+                # 5-Minute (300s) Periodic NTP Re-sync & Offset Recording (Item 4)
+                if (now_sec - last_ntp_sync_time) >= 300.0:
+                    clock_sync.sync()
+                    self.db.record_clock_offset(clock_sync.offset_ms)
+                    last_ntp_sync_time = now_sec
+
                 # 60-Second Periodic Tick Pruning (raw ticks only; events/windows permanently preserved)
                 if (now_sec - last_prune_time) >= 60.0:
-                    pruned = self.db.prune_old_ticks(keep_latest_per_symbol=1500)
+                    pruned = self.db.prune_old_ticks()
                     last_prune_time = now_sec
 
                 # 60-Second Periodic Status Line Logging (Task 2 & 10 Requirement)
@@ -268,8 +279,8 @@ class UnifiedLiveService:
                                 SUM(is_persistent_2000ms = 1),
                                 SUM(is_persistent_5000ms = 1)
                             FROM spread_events
-                            WHERE dataset_version = 'v2.0'
-                        """)
+                            WHERE dataset_version = ?
+                        """, (dataset_ver,))
                         row = cur.fetchone()
                         tot_ev = row[0] or 0
                         with_win = row[1] or 0
