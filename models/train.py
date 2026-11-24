@@ -41,7 +41,13 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from config.settings import AppConfig, get_git_commit
-from models.features import FEATURE_NAMES, TABULAR_FEATURE_NAMES
+from models.features import (
+    FEATURE_NAMES,
+    TABULAR_FEATURE_NAMES,
+    get_feature_names,
+    get_tabular_feature_names,
+    parse_feature_window,
+)
 from models.lstm_model import MultiHeadSpreadLSTM
 from models.walk_forward import (
     run_walkforward_pipeline,
@@ -120,19 +126,18 @@ def build_dataset_from_db(
         "is_profitable_zero_maker": {"pos": 0, "neg": 0},
     }
 
+    use_latency = bool(config.raw.get("features", {}).get("use_latency", False))
+    imputed_lat_ms = float(config.raw.get("dataset", {}).get("viability_latency_threshold_ms", 85.0))
+
     for ev in events:
         win_str = ev.get("feature_window_json")
         if not win_str:
             continue
-        try:
-            seq = json.loads(win_str)
-        except Exception:
-            continue
-        if len(seq) < seq_len:
+        seq_arr = parse_feature_window(win_str, use_latency=use_latency, imputed_latency_ms=imputed_lat_ms)
+        if len(seq_arr) < seq_len:
             continue
 
-        seq_arr = np.array(seq[-seq_len:], dtype=np.float32)
-        samples_X.append(seq_arr)
+        samples_X.append(seq_arr[-seq_len:])
 
         dur = float(ev.get("duration_ms", 0.0))
         is_cens = bool(ev.get("is_right_censored", 0))
@@ -209,11 +214,20 @@ def train_production_model(
     X_tr_norm = (X_tr_seq - seq_means) / seq_stds
     X_va_norm = (X_va_seq - seq_means) / seq_stds
 
-    # Initialize model
-    hidden_dim = 64
-    num_layers = 2
-    model = MultiHeadSpreadLSTM(input_dim=14, hidden_dim=hidden_dim, num_layers=num_layers, dropout=0.2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+    # Initialize model using config hyperparameters (Item 3)
+    use_latency = bool(cfg.raw.get("features", {}).get("use_latency", False))
+    feat_names = get_feature_names(use_latency=use_latency)
+    input_dim = X_tr_seq.shape[2] if len(X_tr_seq.shape) == 3 and X_tr_seq.shape[2] > 0 else len(feat_names)
+
+    lstm_cfg = cfg.raw.get("model", {}).get("lstm", {})
+    hidden_dim = int(lstm_cfg.get("hidden_dim", 64))
+    num_layers = int(lstm_cfg.get("layers", 2))
+    dropout = float(lstm_cfg.get("dropout", 0.2))
+    lr = float(lstm_cfg.get("lr", 1e-3))
+    epochs = int(lstm_cfg.get("epochs", 25))
+
+    model = MultiHeadSpreadLSTM(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
 
     # Class weighting
     pos_count = np.sum(y_tr)
@@ -233,7 +247,7 @@ def train_production_model(
     best_weights = model.state_dict()
 
     model.train()
-    for epoch in range(25):
+    for epoch in range(epochs):
         optimizer.zero_grad()
         p_raw, d_pred = model(t_x_tr)
         loss = F.binary_cross_entropy(p_raw, t_y_tr) + 0.5 * smooth_l1(d_pred, t_d_tr)
@@ -291,7 +305,7 @@ def train_production_model(
         "dataset_version": dataset_version,
         "git_commit": git_hash,
         "git": git_hash,
-        "feature_names": FEATURE_NAMES,
+        "feature_names": feat_names,
         "decision_threshold": float(calibrated_threshold),
         "threshold": float(calibrated_threshold),
         "scaler": {

@@ -192,7 +192,7 @@ class AutonomousPaperTrader:
         logger.info("Pairs Tracked: %s", ", ".join(self.config.markets.supported_pairs))
         logger.info("=" * 70)
 
-        clock_sync.sync()
+        await asyncio.to_thread(clock_sync.sync)
         self.feeds = [
             BinanceFeed(
                 symbols=["btcusdt", "ethusdt", "xrpusdt", "adausdt", "solusdt"],

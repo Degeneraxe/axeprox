@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from config.settings import AppConfig
-from models.features import extract_step_features
+from models.features import extract_step_features, parse_feature_window
 from models.lstm_model import MultiHeadSpreadLSTM
 
 logger = logging.getLogger(__name__)
@@ -33,14 +33,17 @@ class LiveSpreadPredictor:
     ):
         self.checkpoint_path = Path(checkpoint_path)
         self.seq_len = seq_len
+        try:
+            self.config = AppConfig.load()
+        except Exception:
+            self.config = AppConfig()
+
         if expected_dataset_version is not None:
             self.expected_dataset_version = expected_dataset_version
         else:
-            try:
-                cfg = AppConfig.load()
-                self.expected_dataset_version = cfg.raw.get("dataset", {}).get("version", "v2.0")
-            except Exception:
-                self.expected_dataset_version = "v2.0"
+            self.expected_dataset_version = self.config.raw.get("dataset", {}).get("version", "v2.1")
+
+        self.use_latency = bool(self.config.raw.get("features", {}).get("use_latency", False))
 
         self.model: Optional[MultiHeadSpreadLSTM] = None
         self.device = torch.device("cpu")
@@ -165,6 +168,7 @@ class LiveSpreadPredictor:
             gross_spread_bps=gross_spread_bps,
             vol_buy_bps=vol_buy_bps,
             vol_sell_bps=vol_sell_bps,
+            use_latency=self.use_latency,
         )
         self.history[key].append(step_feats)
         if len(self.history[key]) > self.seq_len:
@@ -177,7 +181,7 @@ class LiveSpreadPredictor:
             while len(current_seq) < self.seq_len:
                 current_seq.insert(0, step_feats)
 
-        arr_in = np.array(current_seq, dtype=np.float32)
+        arr_in = parse_feature_window(current_seq, use_latency=self.use_latency)
 
         if self.means is not None and self.stds is not None:
             arr_in = (arr_in - self.means) / self.stds

@@ -70,6 +70,11 @@ class ExecutionSimulator:
 
         # Empirical latency distribution parameters derived strictly from exchange-timestamped ticks
         lat_stats = self.db.get_empirical_latency_stats() if self.db else {}
+        sim_cfg = self.config.raw.get("simulation", {})
+        sim_lat = sim_cfg.get("latency", {})
+        fallback_std = float(sim_lat.get("fallback_std_ms", 15.0))
+        fallback_min = float(sim_lat.get("fallback_min_ms", 5.0))
+        fallback_max = float(sim_lat.get("fallback_max_ms", 250.0))
 
         if lat_stats and lat_stats.get("count", 0) >= 10:
             self.latency_mean_ms = lat_stats["mean_ms"]
@@ -78,12 +83,11 @@ class ExecutionSimulator:
             self.latency_max_ms = lat_stats["max_ms"]
         else:
             self.latency_mean_ms = self.viability_latency_threshold_ms
-            self.latency_std_ms = 15.0
-            self.latency_min_ms = 5.0
-            self.latency_max_ms = max(250.0, self.viability_latency_threshold_ms * 2.0)
+            self.latency_std_ms = fallback_std
+            self.latency_min_ms = fallback_min
+            self.latency_max_ms = max(fallback_max, self.viability_latency_threshold_ms * 2.0)
 
         # Capital and balance state (Pre-funded inventory assumption)
-        sim_cfg = self.config.raw.get("simulation", {})
         self.initial_capital = float(sim_cfg.get("initial_capital_usdt", 10000.0))
         self.virtual_balance = self.initial_capital
         self.trade_sizes = sim_cfg.get("trade_sizes", {"BTC/USDT": 0.05, "ETH/USDT": 0.5})

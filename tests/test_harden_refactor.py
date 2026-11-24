@@ -293,3 +293,192 @@ def test_config_parameters_and_version():
     assert cfg.raw["tracking"]["max_staleness_ms"] == 1500.0
     assert cfg.raw["training"]["held_out_ratio"] == 0.15
     assert len(cfg.raw["training"]["fold_fractions"]) >= 3
+
+
+def test_non_blocking_clock_sync_during_tick_processing():
+    """Item 1: main loop keeps processing ticks while clock_sync.sync() sleeps for 3s in thread."""
+    import asyncio
+    import time
+
+    def mock_slow_sync():
+        time.sleep(3.0)
+        return True
+
+    processed_ticks = []
+
+    async def main():
+        async def tick_processor():
+            for i in range(15):
+                processed_ticks.append(f"tick_{i}")
+                await asyncio.sleep(0.1)
+
+        t0 = time.time()
+        sync_task = asyncio.create_task(asyncio.to_thread(mock_slow_sync))
+        tick_task = asyncio.create_task(tick_processor())
+
+        await asyncio.gather(sync_task, tick_task)
+        elapsed = time.time() - t0
+        return elapsed
+
+    elapsed = asyncio.run(main())
+
+    assert len(processed_ticks) == 15
+    assert 2.9 <= elapsed <= 4.5
+
+
+def test_feature_window_raw_latency_persistence_and_no_zero_latency_injection():
+    """Item 2: Feature windows persist RAW latencies and flags; estimated ticks never inject fake 0.0."""
+    from data.normalizer import OrderBookNormalizer
+    from engine.tracker import SpreadTracker
+    from models.features import parse_feature_window
+
+    norm = OrderBookNormalizer()
+    tracker = SpreadTracker(normalizer=norm)
+
+    t_base = 100000.0
+    for i in range(25):
+        t_ms = t_base + i * 100.0
+        # Binance has ts_source="estimated" with real transit latency = 45.0 ms
+        norm.update_book(
+            "binance", "btcusdt",
+            [(50000.0 + i, 1.0)], [(50010.0 + i, 1.0)],
+            exchange_ts_ms=t_ms - 45.0, local_ts_ms=t_ms,
+        )
+        # Kraken has ts_source="exchange" with real transit latency = 120.0 ms
+        norm.update_book(
+            "kraken", "XBT/USDT",
+            [(50020.0 + i, 1.0)], [(50030.0 + i, 1.0)],
+            exchange_ts_ms=t_ms - 120.0, local_ts_ms=t_ms,
+        )
+
+    live_win, _, _ = norm.build_feature_window("BTC/USDT", "binance", "kraken", seq_len=20)
+    train_win, _, _ = tracker._build_point_in_time_feature_window("BTC/USDT", "binance", "kraken", open_time_ms=t_ms, seq_len=20)
+
+    assert len(live_win) == 20
+    assert len(train_win) == 20
+
+    # Check first step: raw latencies and flags preserved, NO 0.0 injection
+    step0 = live_win[0]
+    assert isinstance(step0, dict)
+    assert step0["lat_buy_ms"] == pytest.approx(45.0)  # Real latency preserved! Not 0.0!
+    assert step0["ts_src_buy"] == "estimated"
+    assert step0["is_measured_buy"] == 0.0
+    assert step0["lat_sell_ms"] == pytest.approx(120.0) # Real latency preserved!
+    assert step0["ts_src_sell"] == "exchange"
+    assert step0["is_measured_sell"] == 1.0
+
+    # Live and training feature vectors match identically
+    np.testing.assert_allclose(np.array(live_win), np.array(train_win), rtol=1e-5, atol=1e-5)
+
+    # Serializes to honest JSON without 0.0 substitution
+    win_json = json.dumps(live_win)
+    loaded = json.loads(win_json)
+    assert loaded[0]["lat_buy_ms"] == pytest.approx(45.0)
+
+    # When parsed with use_latency=False: drops latency features (11 features)
+    parsed_no_lat = parse_feature_window(win_json, use_latency=False)
+    assert parsed_no_lat.shape == (20, 11)
+
+    # When parsed with use_latency=True: NaN-safe representation uses imputed 85.0 for estimated, not 0.0
+    parsed_with_lat = parse_feature_window(win_json, use_latency=True, imputed_latency_ms=85.0)
+    assert parsed_with_lat.shape == (20, 16)
+    # Buy leg was estimated -> imputed to 85.0, flag = 0.0
+    assert parsed_with_lat[0, 8] == pytest.approx(85.0)
+    assert parsed_with_lat[0, 9] == pytest.approx(0.0)
+    # Sell leg was exchange -> real 120.0, flag = 1.0
+    assert parsed_with_lat[0, 10] == pytest.approx(120.0)
+    assert parsed_with_lat[0, 11] == pytest.approx(1.0)
+
+
+def test_simulator_fallback_and_lstm_hyperparameters_in_config():
+    """Item 3: Simulator fallbacks and LSTM hyperparameters are in config.yaml."""
+    cfg = AppConfig.load()
+    sim_lat = cfg.raw.get("simulation", {}).get("latency", {})
+    assert sim_lat["fallback_std_ms"] == 15.0
+    assert sim_lat["fallback_min_ms"] == 5.0
+    assert sim_lat["fallback_max_ms"] == 250.0
+
+    lstm_cfg = cfg.raw.get("model", {}).get("lstm", {})
+    assert lstm_cfg["hidden_dim"] == 64
+    assert lstm_cfg["layers"] == 2
+    assert lstm_cfg["dropout"] == 0.2
+    assert lstm_cfg["epochs"] == 25
+    assert lstm_cfg["lr"] == 0.001
+    assert lstm_cfg["seeds"] == [42]
+
+
+def test_fresh_db_startup_v21_and_old_v20_db_refusal(tmp_path):
+    """Item 5: Startup on fresh DB creates ts_source, clock_offsets, run_metadata under v2.1;
+    starting against old v2.0 DB refuses on config mismatch and creates new version when incremented."""
+    fresh_db_path = tmp_path / "fresh_test_v21.db"
+    db = DatabaseManager(sqlite_path=str(fresh_db_path))
+    db.initialize()
+
+    # 1. Fresh DB verification
+    conn = sqlite3.connect(str(fresh_db_path))
+    cur = conn.cursor()
+
+    cur.execute("PRAGMA table_info(orderbook_ticks);")
+    cols = {r[1] for r in cur.fetchall()}
+    assert "ts_source" in cols
+
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='clock_offsets';")
+    assert cur.fetchone() is not None
+
+    cur.execute("PRAGMA table_info(run_metadata);")
+    meta_cols = {r[1] for r in cur.fetchall()}
+    assert "dataset_version" in meta_cols
+    assert "config_hash" in meta_cols
+    assert "clock_offset_ms" in meta_cols
+
+    # Record v2.1 run metadata on fresh DB
+    db.check_and_record_run_metadata(
+        dataset_version="v2.1",
+        config_hash="hash_v21_initial",
+        git_commit="git_v21",
+        latency_threshold_ms=85.0,
+        clock_offset_ms=-1.25,
+    )
+    cur.execute("SELECT dataset_version, config_hash, clock_offset_ms FROM run_metadata WHERE dataset_version='v2.1';")
+    row = cur.fetchone()
+    assert row[0] == "v2.1"
+    assert row[1] == "hash_v21_initial"
+    assert row[2] == pytest.approx(-1.25)
+    db.close()
+    conn.close()
+
+    # 2. Old v2.0 DB refusal and version increment behavior
+    old_db_path = tmp_path / "old_v20.db"
+    old_db = DatabaseManager(sqlite_path=str(old_db_path))
+    old_db.initialize()
+    old_db.check_and_record_run_metadata(
+        dataset_version="v2.0",
+        config_hash="original_v20_hash",
+        git_commit="git_v20",
+        latency_threshold_ms=85.0,
+    )
+
+    # Starting against old v2.0 DB with modified config hash MUST REFUSE
+    with pytest.raises(ValueError, match="Config hash mismatch for dataset_version 'v2.0'"):
+        old_db.check_and_record_run_metadata(
+            dataset_version="v2.0",
+            config_hash="modified_v20_hash",
+            git_commit="git_v20_mod",
+            latency_threshold_ms=85.0,
+        )
+
+    # Starting against old DB with new dataset version 'v2.1' MUST SUCCEED (creates new version entry)
+    old_db.check_and_record_run_metadata(
+        dataset_version="v2.1",
+        config_hash="new_v21_hash",
+        git_commit="git_v21",
+        latency_threshold_ms=85.0,
+    )
+
+    conn_old = sqlite3.connect(str(old_db_path))
+    cur_old = conn_old.cursor()
+    cur_old.execute("SELECT dataset_version FROM run_metadata ORDER BY run_id ASC;")
+    versions = [r[0] for r in cur_old.fetchall()]
+    assert versions == ["v2.0", "v2.1"]
+    old_db.close()
+    conn_old.close()

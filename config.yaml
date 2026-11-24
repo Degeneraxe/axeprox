@@ -142,8 +142,26 @@ training:
       val_ratio: 0.15
       test_ratio: 0.15
 
+# Feature Engineering (Item 2)
+features:
+  use_latency: false                    # Config switch: drop latency features until ablation is done
+
+# Model Architecture & Hyperparameters (Item 3)
+model:
+  lstm:
+    hidden_dim: 64
+    layers: 2
+    dropout: 0.2
+    epochs: 25
+    lr: 0.001
+    seeds: [42]
+
 # Execution Simulator (Amendment 7)
 simulation:
+  latency:
+    fallback_std_ms: 15.0
+    fallback_min_ms: 5.0
+    fallback_max_ms: 250.0
   initial_capital_usdt: 10000.0
   trade_sizes:
     "BTC/USDT": 0.05                    # 0.05 BTC (~$3,400)

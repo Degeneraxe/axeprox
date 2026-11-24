@@ -44,13 +44,42 @@ def test_feature_extraction():
         vol_sell_bps=1.2,
     )
 
-    assert len(feats) == 14
+    feats_no_lat = extract_step_features(
+        snap_buy=snap_buy,
+        snap_sell=snap_sell,
+        gross_spread_bps=8.5,
+        prev_spread_bps=6.5,
+        prev_velocity=1.0,
+        vol_buy_bps=1.5,
+        vol_sell_bps=1.2,
+        use_latency=False,
+    )
+    assert len(feats_no_lat) == 11
+    assert feats_no_lat[0] == pytest.approx(8.5)      # gross spread
+    assert feats_no_lat[1] == pytest.approx(2.0)      # velocity (8.5 - 6.5)
+    assert feats_no_lat[2] == pytest.approx(1.0)      # accel (2.0 - 1.0)
+
+    # When use_latency=True: NaN-safe latency representation (value + is_measured)
+    feats = extract_step_features(
+        snap_buy=snap_buy,
+        snap_sell=snap_sell,
+        gross_spread_bps=8.5,
+        prev_spread_bps=6.5,
+        prev_velocity=1.0,
+        vol_buy_bps=1.5,
+        vol_sell_bps=1.2,
+        use_latency=True,
+    )
+
+    assert len(feats) == 16
     assert feats[0] == pytest.approx(8.5)      # gross spread
     assert feats[1] == pytest.approx(2.0)      # velocity (8.5 - 6.5)
     assert feats[2] == pytest.approx(1.0)      # accel (2.0 - 1.0)
     assert feats[8] == pytest.approx(25.0)     # buy transit latency
-    assert feats[9] == pytest.approx(140.0)    # sell transit latency
-    assert feats[10] == pytest.approx(-115.0)  # latency diff
+    assert feats[9] == pytest.approx(1.0)      # buy is_measured flag
+    assert feats[10] == pytest.approx(140.0)   # sell transit latency
+    assert feats[11] == pytest.approx(1.0)     # sell is_measured flag
+    assert feats[12] == pytest.approx(-115.0)  # latency diff
 
 
 def test_walk_forward_splits_with_purge_gap():
@@ -182,7 +211,7 @@ def test_train_raises_insufficient_data(tmp_path):
 
 def test_feature_label_leakage():
     """Verifies zero lookahead leakage: features use strictly point-in-time data preceding open_time (Defect 7)."""
-    from models.features import extract_step_features
+    from models.features import extract_step_features, FEATURE_NAMES
     from data.normalizer import OrderBookSnapshot, OrderBookLevel
 
     event_open_time_ms = 5000.0
@@ -218,7 +247,7 @@ def test_feature_label_leakage():
         snap_sell=pre_snap_sell,
         gross_spread_bps=8.5,
     )
-    assert len(feats1) == 14
+    assert len(feats1) == len(FEATURE_NAMES)
 
     # Now verify that modifying future post-open event outcome (future duration, closing time, peak spread)
     # has ZERO impact on point-in-time feature extraction
@@ -245,7 +274,8 @@ def test_predictor_checkpoint_strictness(tmp_path):
         LiveSpreadPredictor(checkpoint_path=str(missing_path))
 
     # Create valid unified checkpoint dictionary with complete metadata
-    model = MultiHeadSpreadLSTM(input_dim=14, hidden_dim=64, num_layers=2)
+    feat_dim = len(FEATURE_NAMES)
+    model = MultiHeadSpreadLSTM(input_dim=feat_dim, hidden_dim=64, num_layers=2)
     ckpt_path = tmp_path / "lstm_valid.pt"
     valid_payload = {
         "model_state_dict": model.state_dict(),
@@ -253,8 +283,8 @@ def test_predictor_checkpoint_strictness(tmp_path):
         "git_commit": "d9a00e1",
         "decision_threshold": 0.45,
         "scaler": {
-            "means": [0.0] * 14,
-            "stds": [1.0] * 14,
+            "means": [0.0] * feat_dim,
+            "stds": [1.0] * feat_dim,
         },
         "feature_names": FEATURE_NAMES,
     }
@@ -263,7 +293,7 @@ def test_predictor_checkpoint_strictness(tmp_path):
     predictor = LiveSpreadPredictor(checkpoint_path=str(ckpt_path), expected_dataset_version="v2.0")
     assert predictor.is_loaded is True
     assert predictor.decision_threshold == pytest.approx(0.45)
-    assert len(predictor.feature_names) == 14
+    assert len(predictor.feature_names) == feat_dim
     assert predictor.dataset_version == "v2.0"
     assert predictor.git_commit == "d9a00e1"
 
@@ -311,6 +341,7 @@ def test_build_dataset_from_persisted_feature_windows(tmp_path):
     import json
     import sqlite3
     from models.train import build_dataset_from_db
+    from models.features import FEATURE_NAMES
 
     db_file = tmp_path / "persisted_test.db"
     conn = sqlite3.connect(db_file)
@@ -353,7 +384,7 @@ def test_build_dataset_from_persisted_feature_windows(tmp_path):
     samples_X, labels_cls, targets_reg, censored_flags = build_dataset_from_db(db_path=str(db_file), min_events=20)
     assert len(samples_X) == 25
     assert len(labels_cls) == 25
-    assert samples_X[0].shape == (20, 14)
+    assert samples_X[0].shape == (20, len(FEATURE_NAMES))
 
 
 def test_dataset_version_filtering_and_invalid_v0_exclusion(tmp_path):
@@ -361,6 +392,7 @@ def test_dataset_version_filtering_and_invalid_v0_exclusion(tmp_path):
     import json
     import sqlite3
     from models.train import build_dataset_from_db
+    from models.features import FEATURE_NAMES
 
     db_file = tmp_path / "version_test.db"
     conn = sqlite3.connect(db_file)

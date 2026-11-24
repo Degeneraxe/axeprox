@@ -176,8 +176,8 @@ class UnifiedLiveService:
             logger.info("Configured Run Duration: %d seconds (%.1f minutes)", duration_sec, duration_sec / 60.0)
         logger.info("=" * 80)
 
-        # 1. Sync Clock via NTP / REST fallback
-        clock_sync.sync()
+        # 1. Sync Clock via NTP / REST fallback (non-blocking in thread)
+        await asyncio.to_thread(clock_sync.sync)
         logger.info(
             "Clock sync verified: offset=%.2fms via %s (transit latency correction active)",
             clock_sync.offset_ms,
@@ -192,7 +192,7 @@ class UnifiedLiveService:
         self.db.record_clock_offset(clock_sync.offset_ms)
 
         # 3. Governance: Freeze Validation & Run Metadata Registration (Item 2)
-        dataset_ver = self.config.raw.get("dataset", {}).get("version", "v2.0")
+        dataset_ver = self.config.raw.get("dataset", {}).get("version", "v2.1")
         latency_thresh_ms = float(self.config.raw.get("dataset", {}).get("viability_latency_threshold_ms", 85.0))
         cfg_hash = self.config.get_config_hash()
         git_hash = get_git_commit()
@@ -250,9 +250,9 @@ class UnifiedLiveService:
 
                 now_sec = time.time()
 
-                # 5-Minute (300s) Periodic NTP Re-sync & Offset Recording (Item 4)
+                # 5-Minute (300s) Periodic NTP Re-sync & Offset Recording (Item 4 & Non-blocking)
                 if (now_sec - last_ntp_sync_time) >= 300.0:
-                    clock_sync.sync()
+                    await asyncio.to_thread(clock_sync.sync)
                     self.db.record_clock_offset(clock_sync.offset_ms)
                     last_ntp_sync_time = now_sec
 
@@ -370,13 +370,16 @@ class UnifiedLiveService:
 
 def main():
     duration = None
+    db_path = "data/arbsense.db"
     if len(sys.argv) > 1:
         try:
             duration = int(sys.argv[1])
         except ValueError:
             pass
+    if len(sys.argv) > 2:
+        db_path = sys.argv[2]
 
-    service = UnifiedLiveService(sqlite_path="data/arbsense.db")
+    service = UnifiedLiveService(sqlite_path=db_path)
 
     def _handle_signal(*_):
         logger.info("Signal received. Triggering graceful shutdown...")

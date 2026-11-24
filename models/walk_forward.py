@@ -47,6 +47,8 @@ from models.features import (
     FEATURE_NAMES,
     TABULAR_FEATURE_NAMES,
     engineer_tabular_features,
+    get_tabular_feature_names,
+    parse_feature_window,
 )
 from models.lstm_model import MultiHeadSpreadLSTM
 
@@ -108,6 +110,8 @@ def load_events_from_db(
     cfg = AppConfig.load()
     if dataset_version is None:
         dataset_version = cfg.raw.get("dataset", {}).get("version", "v2.1")
+    use_latency = bool(cfg.raw.get("features", {}).get("use_latency", False))
+    imputed_lat_ms = float(cfg.raw.get("dataset", {}).get("viability_latency_threshold_ms", 85.0))
 
     # Discover valid dataset versions in DB if active not present
     cur.execute("SELECT DISTINCT dataset_version FROM spread_events WHERE dataset_version NOT LIKE 'invalid%' AND dataset_version IS NOT NULL")
@@ -153,14 +157,10 @@ def load_events_from_db(
         win_str = r["feature_window_json"]
         if not win_str:
             continue
-        try:
-            seq = json.loads(win_str)
-        except Exception:
-            continue
-        if len(seq) < 20:
+        seq_arr = parse_feature_window(win_str, use_latency=use_latency, imputed_latency_ms=imputed_lat_ms)
+        if len(seq_arr) < 20:
             continue
 
-        seq_arr = np.array(seq[-20:], dtype=np.float32)
         open_ts = float(r["open_time"])
         dur = float(r["duration_ms"])
         is_cens = bool(r["is_right_censored"])
@@ -200,6 +200,8 @@ def load_events_from_db(
             event_dict=event_dict,
             prev_event_open_ts=prev_ts,
             recent_event_times=recent_times,
+            use_latency=use_latency,
+            imputed_latency_ms=imputed_lat_ms,
         )
 
         events.append({
@@ -215,7 +217,7 @@ def load_events_from_db(
             "tabular": tabular_vec,
         })
 
-    return events, TABULAR_FEATURE_NAMES
+    return events, get_tabular_feature_names(use_latency=use_latency)
 
 
 def create_non_overlapping_folds(
@@ -531,11 +533,20 @@ def run_walkforward_pipeline(
             fold_metrics["HistGradientBoosting"].append(m_hgb)
 
         # 5. Compact PyTorch LSTM
-        set_seed(42)
-        lstm = CompactSpreadLSTM(input_dim=14, hidden_dim=32, dropout=0.3)
+        lstm_cfg = cfg.raw.get("model", {}).get("lstm", {})
+        lstm_hidden = int(lstm_cfg.get("hidden_dim", 32))
+        lstm_dropout = float(lstm_cfg.get("dropout", 0.3))
+        lstm_epochs = int(lstm_cfg.get("epochs", 15))
+        lstm_lr = float(lstm_cfg.get("lr", 1e-3))
+        lstm_seed = int(lstm_cfg.get("seeds", [42])[0])
+
+        set_seed(lstm_seed)
         X_tr_seq = np.array([e["seq"] for e in tr_uncens], dtype=np.float32)
         X_va_seq = np.array([e["seq"] for e in va_uncens], dtype=np.float32)
         X_te_seq = np.array([e["seq"] for e in te_uncens], dtype=np.float32)
+
+        input_dim = X_tr_seq.shape[2] if len(X_tr_seq.shape) == 3 and X_tr_seq.shape[2] > 0 else (16 if use_latency else 11)
+        lstm = CompactSpreadLSTM(input_dim=input_dim, hidden_dim=lstm_hidden, dropout=lstm_dropout)
 
         # Normalize sequences using train sequence statistics
         seq_means = np.mean(X_tr_seq, axis=(0, 1))
@@ -546,7 +557,7 @@ def run_walkforward_pipeline(
         X_va_seq_norm = (X_va_seq - seq_means) / seq_stds
         X_te_seq_norm = (X_te_seq - seq_means) / seq_stds
 
-        optimizer = torch.optim.AdamW(lstm.parameters(), lr=1e-3, weight_decay=1e-3)
+        optimizer = torch.optim.AdamW(lstm.parameters(), lr=lstm_lr, weight_decay=1e-3)
         bce_loss_fn = nn.BCELoss()
         smooth_l1 = nn.SmoothL1Loss()
 
@@ -555,7 +566,7 @@ def run_walkforward_pipeline(
         t_d_tr = torch.tensor(log_dur_tr, dtype=torch.float32).unsqueeze(1)
 
         lstm.train()
-        for epoch in range(15):
+        for epoch in range(lstm_epochs):
             optimizer.zero_grad()
             p_out, d_out = lstm(t_x_tr)
             loss = bce_loss_fn(p_out, t_y_tr) + 0.5 * smooth_l1(d_out, t_d_tr)

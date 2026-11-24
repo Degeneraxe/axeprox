@@ -21,7 +21,7 @@ from config.settings import AppConfig
 from data.storage.db_manager import DatabaseManager
 from engine.cost_model import CostModel
 from engine.detector import SpreadCandidate
-from models.features import asof_join_ticks, compute_rolling_volatility_bps, extract_step_features
+from models.features import asof_join_ticks, compute_rolling_volatility_bps, extract_step_features, build_feature_step
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class ActiveSpreadEvent:
     last_seen_ms: float
     tick_count: int = 1
     features_at_open: Dict[str, float] = field(default_factory=dict)
-    feature_window: List[List[float]] = field(default_factory=list)
+    feature_window: List[Any] = field(default_factory=list)
     vol_buy_bps: float = 1.0
     vol_sell_bps: float = 1.0
     latency_threshold_ms: float = 85.0
@@ -144,8 +144,15 @@ class SpreadTracker:
         sell_exch: str,
         open_time_ms: float,
         seq_len: int = 20,
-    ) -> Tuple[List[List[float]], float, float]:
+        use_latency: Optional[bool] = None,
+        imputed_latency_ms: Optional[float] = None,
+    ) -> Tuple[List[Any], float, float]:
         """Builds 20-step feature window directly from in-memory ring buffer using as-of timestamp join (Requirement 1, 2, 3)."""
+        if use_latency is None:
+            use_latency = bool(self.config.raw.get("features", {}).get("use_latency", False))
+        if imputed_latency_ms is None:
+            imputed_latency_ms = self.latency_hurdle_ms
+
         b_key = (buy_exch.lower(), symbol)
         s_key = (sell_exch.lower(), symbol)
 
@@ -171,7 +178,7 @@ class SpreadTracker:
         if len(aligned_pairs) < seq_len:
             return [], vol_b, vol_s
 
-        seq: List[List[float]] = []
+        seq: List[Any] = []
         prev_spread = None
         prev_vel = None
         basis_rate = getattr(self.normalizer, "usdt_usd_basis_rate", 1.0000) if self.normalizer else 1.0000
@@ -199,32 +206,35 @@ class SpreadTracker:
 
             obi_b = float(b_tick.compute_imbalance(5) if hasattr(b_tick, "compute_imbalance") else b_tick.get("imbalance", 0.0))
             obi_s = float(s_tick.compute_imbalance(5) if hasattr(s_tick, "compute_imbalance") else s_tick.get("imbalance", 0.0))
-            b_ts_src = getattr(b_tick, "ts_source", b_tick.get("ts_source", "exchange") if isinstance(b_tick, dict) else "exchange")
-            s_ts_src = getattr(s_tick, "ts_source", s_tick.get("ts_source", "exchange") if isinstance(s_tick, dict) else "exchange")
-            lat_b = float(b_tick.transit_latency_ms if hasattr(b_tick, "transit_latency_ms") else b_tick.get("transit_latency_ms", 0.0)) if b_ts_src == "exchange" else 0.0
-            lat_s = float(s_tick.transit_latency_ms if hasattr(s_tick, "transit_latency_ms") else s_tick.get("transit_latency_ms", 0.0)) if s_ts_src == "exchange" else 0.0
+            b_ts_src = str(getattr(b_tick, "ts_source", b_tick.get("ts_source", "exchange") if isinstance(b_tick, dict) else "exchange"))
+            s_ts_src = str(getattr(s_tick, "ts_source", s_tick.get("ts_source", "exchange") if isinstance(s_tick, dict) else "exchange"))
+            lat_b = float(b_tick.transit_latency_ms if hasattr(b_tick, "transit_latency_ms") else b_tick.get("transit_latency_ms", 0.0))
+            lat_s = float(s_tick.transit_latency_ms if hasattr(s_tick, "transit_latency_ms") else s_tick.get("transit_latency_ms", 0.0))
             top_b = float(b_tick.top_spread if hasattr(b_tick, "top_spread") else b_tick.get("top_spread", 0.0))
             top_s = float(s_tick.top_spread if hasattr(s_tick, "top_spread") else s_tick.get("top_spread", 0.0))
             mp_b = float(b_tick.mid_price if hasattr(b_tick, "mid_price") else b_tick.get("mid_price", 0.0))
             mp_s = float(s_tick.mid_price if hasattr(s_tick, "mid_price") else s_tick.get("mid_price", 0.0))
             mp_diff = ((mp_s - mp_b) / mp_b * 10000.0) if mp_b > 0 else 0.0
 
-            seq.append([
-                float(gross_bps),
-                float(vel),
-                float(acc),
-                float(obi_b),
-                float(obi_s),
-                float(obi_b - obi_s),
-                float(vol_b),
-                float(vol_s),
-                float(lat_b),
-                float(lat_s),
-                float(lat_b - lat_s),
-                float(top_b),
-                float(top_s),
-                float(mp_diff),
-            ])
+            step = build_feature_step(
+                gross_bps=gross_bps,
+                vel=vel,
+                acc=acc,
+                obi_b=obi_b,
+                obi_s=obi_s,
+                vol_b=vol_b,
+                vol_s=vol_s,
+                top_b=top_b,
+                top_s=top_s,
+                mp_diff=mp_diff,
+                raw_lat_b=lat_b,
+                raw_lat_s=lat_s,
+                ts_src_b=b_ts_src,
+                ts_src_s=s_ts_src,
+                use_latency=use_latency,
+                imputed_latency_ms=imputed_latency_ms,
+            )
+            seq.append(step)
 
         return seq, vol_b, vol_s
 

@@ -63,8 +63,8 @@ class MarketDataCollector:
         logger.info("Starting ArbSense Continuous Live Data Collector Service")
         logger.info("=" * 70)
 
-        # 1. Sync Clock
-        clock_sync.sync()
+        # 1. Sync Clock (non-blocking)
+        await asyncio.to_thread(clock_sync.sync)
         logger.info("Clock sync completed: offset=%.2fms via %s", clock_sync.offset_ms, clock_sync.method_used)
 
         # 2. Init Storage

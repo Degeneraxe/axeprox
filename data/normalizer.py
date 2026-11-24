@@ -266,9 +266,19 @@ class OrderBookNormalizer:
         sell_exchange: str,
         seq_len: int = 20,
         max_staleness_ms: float = 1500.0,
-    ) -> Tuple[List[List[float]], float, float]:
+        use_latency: Optional[bool] = None,
+        imputed_latency_ms: Optional[float] = None,
+    ) -> Tuple[List[Any], float, float]:
         """Builds a 20-step LSTM feature window from in-memory ring buffers using asof_join_ticks (Requirement 1 & 3)."""
-        from models.features import asof_join_ticks, compute_rolling_volatility_bps
+        from models.features import asof_join_ticks, compute_rolling_volatility_bps, build_feature_step
+        from config.settings import AppConfig
+
+        if use_latency is None:
+            cfg = getattr(self, "config", None) or AppConfig.load()
+            use_latency = bool(cfg.raw.get("features", {}).get("use_latency", False))
+        if imputed_latency_ms is None:
+            cfg = getattr(self, "config", None) or AppConfig.load()
+            imputed_latency_ms = float(cfg.raw.get("dataset", {}).get("viability_latency_threshold_ms", 85.0))
 
         norm_sym = self.normalize_symbol(buy_exchange, symbol)
         b_ticks = self.get_ring_buffer(buy_exchange, norm_sym)
@@ -285,7 +295,7 @@ class OrderBookNormalizer:
         if len(aligned_pairs) < seq_len:
             return [], vol_b, vol_s
 
-        seq: List[List[float]] = []
+        seq: List[Any] = []
         prev_spread = None
         prev_vel = None
         basis_rate = getattr(self, "usdt_usd_basis_rate", 1.0000)
@@ -306,32 +316,35 @@ class OrderBookNormalizer:
 
             obi_b = float(b_snap.compute_imbalance(5))
             obi_s = float(s_snap.compute_imbalance(5))
-            b_ts_src = getattr(b_snap, "ts_source", "exchange")
-            s_ts_src = getattr(s_snap, "ts_source", "exchange")
-            lat_b = float(b_snap.transit_latency_ms) if b_ts_src == "exchange" else 0.0
-            lat_s = float(s_snap.transit_latency_ms) if s_ts_src == "exchange" else 0.0
+            b_ts_src = str(getattr(b_snap, "ts_source", "exchange"))
+            s_ts_src = str(getattr(s_snap, "ts_source", "exchange"))
+            lat_b = float(b_snap.transit_latency_ms)
+            lat_s = float(s_snap.transit_latency_ms)
             top_b = float(b_snap.top_spread)
             top_s = float(s_snap.top_spread)
             mp_b = float(b_snap.mid_price)
             mp_s = float(s_snap.mid_price)
             mp_diff = ((mp_s - mp_b) / mp_b * 10000.0) if mp_b > 0 else 0.0
 
-            seq.append([
-                float(gross_bps),
-                float(vel),
-                float(acc),
-                float(obi_b),
-                float(obi_s),
-                float(obi_b - obi_s),
-                float(vol_b),
-                float(vol_s),
-                float(lat_b),
-                float(lat_s),
-                float(lat_b - lat_s),
-                float(top_b),
-                float(top_s),
-                float(mp_diff),
-            ])
+            step = build_feature_step(
+                gross_bps=gross_bps,
+                vel=vel,
+                acc=acc,
+                obi_b=obi_b,
+                obi_s=obi_s,
+                vol_b=vol_b,
+                vol_s=vol_s,
+                top_b=top_b,
+                top_s=top_s,
+                mp_diff=mp_diff,
+                raw_lat_b=lat_b,
+                raw_lat_s=lat_s,
+                ts_src_b=b_ts_src,
+                ts_src_s=s_ts_src,
+                use_latency=use_latency,
+                imputed_latency_ms=imputed_latency_ms,
+            )
+            seq.append(step)
 
         return seq, vol_b, vol_s
 

@@ -9,27 +9,121 @@ Extracts time-series features from order book depth snapshots:
 """
 from __future__ import annotations
 
+import json
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 
-FEATURE_NAMES = [
-    "gross_spread_bps",
-    "spread_velocity",
-    "spread_acceleration",
-    "obi_buy_top5",
-    "obi_sell_top5",
-    "obi_differential",
-    "rolling_vol_buy_bps",
-    "rolling_vol_sell_bps",
-    "transit_lat_buy_ms",
-    "transit_lat_sell_ms",
-    "transit_lat_diff_ms",
-    "internal_spread_buy",
-    "internal_spread_sell",
-    "microprice_diff_bps",
-]
+class FeatureStep(dict):
+    """Dictionary representing a single timestep in a feature window.
+
+    Persists raw metadata (real transit latencies, ts_source strings, is_measured flags)
+    and point-in-time microstructure fields. Implements sequence, slicing, and numpy
+    array protocols so np.array(feature_window) and legacy indexing continue to work seamlessly.
+    """
+    def __init__(self, data: Dict[str, Any], vector: List[float]):
+        super().__init__(data)
+        self.vector = [float(v) for v in vector]
+
+    def __iter__(self):
+        return iter(self.vector)
+
+    def __len__(self):
+        return len(self.vector)
+
+    def __getitem__(self, item: Any) -> Any:
+        if isinstance(item, (int, slice)):
+            return self.vector[item]
+        return super().__getitem__(item)
+
+    def __array__(self, dtype=None):
+        return np.array(self.vector, dtype=dtype)
+
+
+def get_feature_names(use_latency: bool = False) -> List[str]:
+    """Returns sequence feature column names based on features.use_latency switch."""
+    if use_latency:
+        return [
+            "gross_spread_bps",
+            "spread_velocity",
+            "spread_acceleration",
+            "obi_buy_top5",
+            "obi_sell_top5",
+            "obi_differential",
+            "rolling_vol_buy_bps",
+            "rolling_vol_sell_bps",
+            "transit_lat_buy_ms",
+            "is_measured_buy",
+            "transit_lat_sell_ms",
+            "is_measured_sell",
+            "transit_lat_diff_ms",
+            "internal_spread_buy",
+            "internal_spread_sell",
+            "microprice_diff_bps",
+        ]
+    return [
+        "gross_spread_bps",
+        "spread_velocity",
+        "spread_acceleration",
+        "obi_buy_top5",
+        "obi_sell_top5",
+        "obi_differential",
+        "rolling_vol_buy_bps",
+        "rolling_vol_sell_bps",
+        "internal_spread_buy",
+        "internal_spread_sell",
+        "microprice_diff_bps",
+    ]
+
+
+FEATURE_NAMES = get_feature_names(use_latency=False)
+
+
+def get_tabular_feature_names(use_latency: bool = False) -> List[str]:
+    """Returns tabular feature column names based on features.use_latency switch."""
+    base = [
+        "open_spread_bps",
+        "depth_walked_slippage",
+        "spread_vs_hurdle",
+        "spread_velocity_3",
+        "spread_velocity_5",
+        "spread_velocity_10",
+        "spread_accel_3",
+        "spread_accel_5",
+        "spread_accel_10",
+        "volatility_3",
+        "volatility_5",
+        "volatility_10",
+        "obi_buy_top5",
+        "obi_sell_top5",
+        "obi_diff",
+        "obi_buy_mean_5",
+        "obi_sell_mean_5",
+        "vol_diff_5",
+        "is_buy_leg_mover",
+    ]
+    if use_latency:
+        lat = [
+            "transit_lat_buy_ms",
+            "is_measured_buy",
+            "transit_lat_sell_ms",
+            "is_measured_sell",
+            "transit_lat_diff_ms",
+        ]
+    else:
+        lat = []
+    tail = [
+        "time_since_prev_event_s",
+        "event_count_last_60s",
+        "hour_of_day",
+        "hour_sin",
+        "hour_cos",
+    ]
+    return base + lat + tail
+
+
+TABULAR_FEATURE_NAMES = get_tabular_feature_names(use_latency=False)
 
 
 def compute_microprice(snap: Any) -> float:
@@ -66,6 +160,89 @@ def compute_rolling_volatility_bps(prices: Any, min_observations: int = 5) -> fl
     return float(std_ret * 10000.0)
 
 
+def build_feature_step(
+    gross_bps: float,
+    vel: float,
+    acc: float,
+    obi_b: float,
+    obi_s: float,
+    vol_b: float,
+    vol_s: float,
+    top_b: float,
+    top_s: float,
+    mp_diff: float,
+    raw_lat_b: float,
+    raw_lat_s: float,
+    ts_src_b: str,
+    ts_src_s: str,
+    use_latency: bool = False,
+    imputed_latency_ms: float = 85.0,
+) -> FeatureStep:
+    """Builds a FeatureStep dict with raw latency persistence and numerical vector."""
+    is_meas_b = 1.0 if ts_src_b == "exchange" else 0.0
+    is_meas_s = 1.0 if ts_src_s == "exchange" else 0.0
+
+    # Raw dictionary holding honest latency values and flags
+    step_dict = {
+        "gross_spread_bps": float(gross_bps),
+        "spread_velocity": float(vel),
+        "spread_acceleration": float(acc),
+        "obi_buy_top5": float(obi_b),
+        "obi_sell_top5": float(obi_s),
+        "obi_differential": float(obi_b - obi_s),
+        "rolling_vol_buy_bps": float(vol_b),
+        "rolling_vol_sell_bps": float(vol_s),
+        "lat_buy_ms": float(raw_lat_b),
+        "lat_sell_ms": float(raw_lat_s),
+        "ts_src_buy": str(ts_src_b),
+        "ts_src_sell": str(ts_src_s),
+        "is_measured_buy": float(is_meas_b),
+        "is_measured_sell": float(is_meas_s),
+        "internal_spread_buy": float(top_b),
+        "internal_spread_sell": float(top_s),
+        "microprice_diff_bps": float(mp_diff),
+    }
+
+    if not use_latency:
+        vector = [
+            float(gross_bps),
+            float(vel),
+            float(acc),
+            float(obi_b),
+            float(obi_s),
+            float(obi_b - obi_s),
+            float(vol_b),
+            float(vol_s),
+            float(top_b),
+            float(top_s),
+            float(mp_diff),
+        ]
+    else:
+        # NaN-safe representation: value + is_measured indicator, with imputed value for estimated ticks
+        safe_lat_b = float(raw_lat_b) if (is_meas_b == 1.0 and not math.isnan(raw_lat_b)) else float(imputed_latency_ms)
+        safe_lat_s = float(raw_lat_s) if (is_meas_s == 1.0 and not math.isnan(raw_lat_s)) else float(imputed_latency_ms)
+        safe_lat_diff = safe_lat_b - safe_lat_s
+        vector = [
+            float(gross_bps),
+            float(vel),
+            float(acc),
+            float(obi_b),
+            float(obi_s),
+            float(obi_b - obi_s),
+            float(vol_b),
+            float(vol_s),
+            float(safe_lat_b),
+            float(is_meas_b),
+            float(safe_lat_s),
+            float(is_meas_s),
+            float(safe_lat_diff),
+            float(top_b),
+            float(top_s),
+            float(mp_diff),
+        ]
+
+    return FeatureStep(step_dict, vector)
+
 
 def extract_step_features(
     snap_buy: Any,
@@ -75,49 +252,145 @@ def extract_step_features(
     prev_velocity: Optional[float] = None,
     vol_buy_bps: float = 1.0,
     vol_sell_bps: float = 1.0,
+    use_latency: bool = False,
+    imputed_latency_ms: float = 85.0,
 ) -> List[float]:
-    """Extracts a 14-dimensional feature vector for a single timestep."""
+    """Extracts a feature vector for a single timestep with use_latency support."""
     # 1. Spread dynamics
     velocity = (gross_spread_bps - prev_spread_bps) if prev_spread_bps is not None else 0.0
     accel = (velocity - prev_velocity) if prev_velocity is not None else 0.0
 
     # 2. Order book imbalance
-    obi_buy = snap_buy.compute_imbalance(5)
-    obi_sell = snap_sell.compute_imbalance(5)
-    obi_diff = obi_buy - obi_sell
+    obi_buy = snap_buy.compute_imbalance(5) if hasattr(snap_buy, "compute_imbalance") else snap_buy.get("imbalance", 0.0)
+    obi_sell = snap_sell.compute_imbalance(5) if hasattr(snap_sell, "compute_imbalance") else snap_sell.get("imbalance", 0.0)
 
-    # 3. Transit latency dynamics (strictly ts_source='exchange')
-    lat_b_src = getattr(snap_buy, "ts_source", snap_buy.get("ts_source", "exchange") if isinstance(snap_buy, dict) else "exchange")
-    lat_s_src = getattr(snap_sell, "ts_source", snap_sell.get("ts_source", "exchange") if isinstance(snap_sell, dict) else "exchange")
-    lat_buy = float(getattr(snap_buy, "transit_latency_ms", snap_buy.get("transit_latency_ms", 0.0) if isinstance(snap_buy, dict) else 0.0)) if lat_b_src == "exchange" else 0.0
-    lat_sell = float(getattr(snap_sell, "transit_latency_ms", snap_sell.get("transit_latency_ms", 0.0) if isinstance(snap_sell, dict) else 0.0)) if lat_s_src == "exchange" else 0.0
-    lat_diff = lat_buy - lat_sell
+    # 3. Transit latency dynamics
+    b_ts_src = getattr(snap_buy, "ts_source", snap_buy.get("ts_source", "exchange") if isinstance(snap_buy, dict) else "exchange")
+    s_ts_src = getattr(snap_sell, "ts_source", snap_sell.get("ts_source", "exchange") if isinstance(snap_sell, dict) else "exchange")
+    raw_lat_b = float(getattr(snap_buy, "transit_latency_ms", snap_buy.get("transit_latency_ms", 0.0) if isinstance(snap_buy, dict) else 0.0))
+    raw_lat_s = float(getattr(snap_sell, "transit_latency_ms", snap_sell.get("transit_latency_ms", 0.0) if isinstance(snap_sell, dict) else 0.0))
 
     # 4. Internal venue spreads
-    top_spread_buy = float(snap_buy.top_spread)
-    top_spread_sell = float(snap_sell.top_spread)
+    top_spread_buy = float(getattr(snap_buy, "top_spread", snap_buy.get("top_spread", 0.0) if isinstance(snap_buy, dict) else 0.0))
+    top_spread_sell = float(getattr(snap_sell, "top_spread", snap_sell.get("top_spread", 0.0) if isinstance(snap_sell, dict) else 0.0))
 
     # 5. Micro-price differential
-    mp_buy = compute_microprice(snap_buy)
-    mp_sell = compute_microprice(snap_sell)
+    mp_buy = compute_microprice(snap_buy) if not isinstance(snap_buy, dict) else float(snap_buy.get("mid_price", 0.0))
+    mp_sell = compute_microprice(snap_sell) if not isinstance(snap_sell, dict) else float(snap_sell.get("mid_price", 0.0))
     mp_diff_bps = ((mp_sell - mp_buy) / mp_buy * 10000.0) if mp_buy > 0 else 0.0
 
-    return [
-        float(gross_spread_bps),
-        float(velocity),
-        float(accel),
-        float(obi_buy),
-        float(obi_sell),
-        float(obi_diff),
-        float(vol_buy_bps),
-        float(vol_sell_bps),
-        float(lat_buy),
-        float(lat_sell),
-        float(lat_diff),
-        float(top_spread_buy),
-        float(top_spread_sell),
-        float(mp_diff_bps),
-    ]
+    step = build_feature_step(
+        gross_bps=gross_spread_bps,
+        vel=velocity,
+        acc=accel,
+        obi_b=obi_buy,
+        obi_s=obi_sell,
+        vol_b=vol_buy_bps,
+        vol_s=vol_sell_bps,
+        top_b=top_spread_buy,
+        top_s=top_spread_sell,
+        mp_diff=mp_diff_bps,
+        raw_lat_b=raw_lat_b,
+        raw_lat_s=raw_lat_s,
+        ts_src_b=b_ts_src,
+        ts_src_s=s_ts_src,
+        use_latency=use_latency,
+        imputed_latency_ms=imputed_latency_ms,
+    )
+    return step.vector
+
+
+def parse_feature_window(
+    win_data: Any,
+    use_latency: bool = False,
+    imputed_latency_ms: float = 85.0,
+) -> np.ndarray:
+    """Parses raw feature window (JSON string, list of dicts, or legacy list) into a 2D float32 ndarray."""
+    if win_data is None:
+        dim = 11 if not use_latency else 16
+        return np.zeros((0, dim), dtype=np.float32)
+
+    if isinstance(win_data, str):
+        try:
+            win_data = json.loads(win_data)
+        except Exception:
+            dim = 11 if not use_latency else 16
+            return np.zeros((0, dim), dtype=np.float32)
+
+    rows: List[List[float]] = []
+    for step in win_data:
+        if isinstance(step, FeatureStep):
+            rows.append(step.vector)
+        elif isinstance(step, dict):
+            gross_bps = float(step.get("gross_spread_bps", 0.0))
+            vel = float(step.get("spread_velocity", 0.0))
+            acc = float(step.get("spread_acceleration", 0.0))
+            obi_b = float(step.get("obi_buy_top5", 0.0))
+            obi_s = float(step.get("obi_sell_top5", 0.0))
+            obi_diff = float(step.get("obi_differential", obi_b - obi_s))
+            vol_b = float(step.get("rolling_vol_buy_bps", 1.0))
+            vol_s = float(step.get("rolling_vol_sell_bps", 1.0))
+            top_b = float(step.get("internal_spread_buy", 0.0))
+            top_s = float(step.get("internal_spread_sell", 0.0))
+            mp_diff = float(step.get("microprice_diff_bps", 0.0))
+
+            if not use_latency:
+                rows.append([
+                    gross_bps, vel, acc, obi_b, obi_s, obi_diff,
+                    vol_b, vol_s, top_b, top_s, mp_diff,
+                ])
+            else:
+                raw_lat_b = float(step.get("lat_buy_ms", imputed_latency_ms))
+                raw_lat_s = float(step.get("lat_sell_ms", imputed_latency_ms))
+                ts_src_b = str(step.get("ts_src_buy", "exchange"))
+                ts_src_s = str(step.get("ts_src_sell", "exchange"))
+                is_meas_b = float(step.get("is_measured_buy", 1.0 if ts_src_b == "exchange" else 0.0))
+                is_meas_s = float(step.get("is_measured_sell", 1.0 if ts_src_s == "exchange" else 0.0))
+
+                safe_lat_b = raw_lat_b if (is_meas_b == 1.0 and not math.isnan(raw_lat_b)) else float(imputed_latency_ms)
+                safe_lat_s = raw_lat_s if (is_meas_s == 1.0 and not math.isnan(raw_lat_s)) else float(imputed_latency_ms)
+                safe_lat_diff = safe_lat_b - safe_lat_s
+
+                rows.append([
+                    gross_bps, vel, acc, obi_b, obi_s, obi_diff,
+                    vol_b, vol_s,
+                    safe_lat_b, is_meas_b, safe_lat_s, is_meas_s, safe_lat_diff,
+                    top_b, top_s, mp_diff,
+                ])
+        elif isinstance(step, (list, tuple)):
+            if len(step) >= 14:
+                # Legacy 14-element list:
+                # 0: gross, 1: vel, 2: acc, 3: obi_b, 4: obi_s, 5: obi_diff, 6: vol_b, 7: vol_s,
+                # 8: lat_b, 9: lat_s, 10: lat_diff, 11: top_b, 12: top_s, 13: mp_diff
+                if not use_latency:
+                    rows.append([
+                        float(step[0]), float(step[1]), float(step[2]), float(step[3]),
+                        float(step[4]), float(step[5]), float(step[6]), float(step[7]),
+                        float(step[11]), float(step[12]), float(step[13])
+                    ])
+                else:
+                    lat_b = float(step[8])
+                    lat_s = float(step[9])
+                    is_b = 1.0 if lat_b != 0.0 else 0.0
+                    is_s = 1.0 if lat_s != 0.0 else 0.0
+                    safe_b = lat_b if is_b == 1.0 else float(imputed_latency_ms)
+                    safe_s = lat_s if is_s == 1.0 else float(imputed_latency_ms)
+                    rows.append([
+                        float(step[0]), float(step[1]), float(step[2]), float(step[3]),
+                        float(step[4]), float(step[5]), float(step[6]), float(step[7]),
+                        safe_b, is_b, safe_s, is_s, safe_b - safe_s,
+                        float(step[11]), float(step[12]), float(step[13])
+                    ])
+            elif len(step) == 11 and not use_latency:
+                rows.append([float(x) for x in step])
+            elif len(step) == 16 and use_latency:
+                rows.append([float(x) for x in step])
+            else:
+                rows.append([float(x) for x in step])
+        else:
+            rows.append(step)
+
+    return np.array(rows, dtype=np.float32)
 
 
 def _extract_ts(tick: Any) -> float:
@@ -194,42 +467,13 @@ def asof_join_ticks(
     return aligned_pairs[-seq_len:]
 
 
-TABULAR_FEATURE_NAMES = [
-    "open_spread_bps",
-    "depth_walked_slippage",
-    "spread_vs_hurdle",
-    "spread_velocity_3",
-    "spread_velocity_5",
-    "spread_velocity_10",
-    "spread_accel_3",
-    "spread_accel_5",
-    "spread_accel_10",
-    "volatility_3",
-    "volatility_5",
-    "volatility_10",
-    "obi_buy_top5",
-    "obi_sell_top5",
-    "obi_diff",
-    "obi_buy_mean_5",
-    "obi_sell_mean_5",
-    "vol_diff_5",
-    "is_buy_leg_mover",
-    "transit_lat_buy_ms",
-    "transit_lat_sell_ms",
-    "transit_lat_diff_ms",
-    "time_since_prev_event_s",
-    "event_count_last_60s",
-    "hour_of_day",
-    "hour_sin",
-    "hour_cos",
-]
-
-
 def engineer_tabular_features(
     seq_arr: np.ndarray,
     event_dict: Dict[str, Any],
     prev_event_open_ts: Optional[float] = None,
     recent_event_times: Optional[List[float]] = None,
+    use_latency: bool = False,
+    imputed_latency_ms: float = 85.0,
 ) -> np.ndarray:
     """Computes all point-in-time tabular microstructure features from 20-step window and event fields.
     
@@ -282,12 +526,7 @@ def engineer_tabular_features(
     vol_diff_5 = vol_b_5 - vol_s_5
     is_buy_mover = 1.0 if vol_b_5 >= vol_s_5 else 0.0
 
-    # Latency features at open (strictly ts_source='exchange')
-    lat_b = float(seq_arr[-1, 8])
-    lat_s = float(seq_arr[-1, 9])
-    lat_diff = float(seq_arr[-1, 10])
-
-    tabular_vec = [
+    base_vec = [
         open_bps,
         slippage,
         spread_vs_hurdle,
@@ -307,15 +546,31 @@ def engineer_tabular_features(
         obi_s_mean5,
         vol_diff_5,
         is_buy_mover,
-        lat_b,
-        lat_s,
-        lat_diff,
+    ]
+
+    if use_latency:
+        if seq_arr.shape[1] >= 16:
+            lat_b = float(seq_arr[-1, 8])
+            is_meas_b = float(seq_arr[-1, 9])
+            lat_s = float(seq_arr[-1, 10])
+            is_meas_s = float(seq_arr[-1, 11])
+            lat_diff = float(seq_arr[-1, 12])
+        else:
+            lat_b = float(imputed_latency_ms)
+            is_meas_b = 0.0
+            lat_s = float(imputed_latency_ms)
+            is_meas_s = 0.0
+            lat_diff = 0.0
+        lat_vec = [lat_b, is_meas_b, lat_s, is_meas_s, lat_diff]
+    else:
+        lat_vec = []
+
+    tail_vec = [
         time_since_prev_s,
         float(event_count_60s),
         float(hour),
         hour_sin,
         hour_cos,
     ]
-    return np.array(tabular_vec, dtype=np.float32)
 
-
+    return np.array(base_vec + lat_vec + tail_vec, dtype=np.float32)
