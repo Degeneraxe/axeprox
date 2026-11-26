@@ -398,7 +398,7 @@ def test_cumulative_tick_counter(tmp_path):
     assert db.get_tick_count() == 10
     assert db.get_cumulative_tick_count() == 10
 
-    assert db.prune_old_ticks() == 0
+    assert db.prune_old_ticks(keep_latest_per_symbol=10) == 0
     assert db.get_tick_count() == 10
 
     # Prune down to 3 ticks
@@ -639,7 +639,7 @@ def test_redesigned_labels_and_depth_slippage(tmp_path):
     assert row[1] == pytest.approx(closed_evt.slippage_bps)
     assert row[3] == 0  # is_profitable_retail
     assert row[5] == 0  # both depth-taking legs pay taker fees
-    assert row[6] == "v2.2"
+    assert row[6] == "v2.3"
     db.close()
 
 

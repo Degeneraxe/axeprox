@@ -70,7 +70,7 @@ class AutonomousPaperTrader:
         snap = self.normalizer.update_book(exchange, raw_symbol, bids, asks, exch_ts, loc_ts)
         if snap.symbol not in self.config.markets.supported_pairs:
             return
-        now_ms = clock_sync.get_corrected_time_ms()
+        now_ms = clock_sync.event_time_ms()
         for candidate in self.detector.scan_symbol(snap.symbol, now_ms, paper_usdt_only=True):
             route = (candidate.buy_exchange, candidate.sell_exchange, candidate.symbol)
             pair_key = "_".join(route)
@@ -93,11 +93,11 @@ class AutonomousPaperTrader:
                 self.rejected_count += 1
                 continue
             self.last_trade_time[pair_key] = now_sec
-            self.pending[route] = asyncio.create_task(self._paper_fill(route, quantity, clock_sync.get_corrected_time_ms()))
+            self.pending[route] = asyncio.create_task(self._paper_fill(route, quantity, clock_sync.event_time_ms()))
 
     def _fresh_books(self, route):
         buy_exchange, sell_exchange, symbol = route
-        now_ms = clock_sync.get_corrected_time_ms()
+        now_ms = clock_sync.event_time_ms()
         buy = self.normalizer.get_snapshot(buy_exchange, symbol, now_ms)
         sell = self.normalizer.get_snapshot(sell_exchange, symbol, now_ms)
         if buy is None or sell is None or buy.best_ask is None or sell.best_bid is None:

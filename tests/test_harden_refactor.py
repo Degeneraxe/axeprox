@@ -286,10 +286,11 @@ def test_dashboard_read_only_mode(tmp_path):
 def test_config_parameters_and_version():
     """Item 6 & 10: Config contains v2.1 and non-hardcoded values."""
     cfg = AppConfig.load()
-    assert cfg.raw["dataset"]["version"] == "v2.2"
+    assert cfg.raw["dataset"]["version"] == "v2.3"
     assert "execution_latency_assumption_ms" not in cfg.raw.get("labeling", {})
     assert cfg.raw["dataset"]["viability_latency_threshold_ms"] == 85.0
-    assert cfg.raw["storage"]["tick_prune_keep_count"] == 0
+    assert cfg.raw["storage"]["replay_window_hours"] == 6
+    assert cfg.detection.depth_snapshot_throttle_ms == 100
     assert cfg.raw["tracking"]["max_staleness_ms"] == 1500.0
     assert cfg.raw["training"]["held_out_ratio"] == 0.15
     assert len(cfg.raw["training"]["fold_fractions"]) >= 3

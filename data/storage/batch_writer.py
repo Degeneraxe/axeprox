@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from data.normalizer import OrderBookSnapshot
 from data.storage.db_manager import DatabaseManager
@@ -26,7 +26,7 @@ class BatchWriter:
         db_manager: DatabaseManager,
         batch_size: int = 50,
         flush_interval_sec: float = 0.5,
-        depth_throttle_ms: int = 0,
+        depth_throttle_ms: int = 100,
     ):
         self.db = db_manager
         self.batch_size = batch_size
@@ -44,7 +44,7 @@ class BatchWriter:
         if not self._running:
             return
 
-        now_ms = time.time() * 1000.0
+        now_ms = time.monotonic() * 1000.0
         pair_key = (snap.exchange, snap.symbol)
 
         # Depth throttling (Amendment 6): include full depth levels only every depth_throttle_ms
@@ -109,12 +109,12 @@ class BatchWriter:
 
     async def _flush_worker(self) -> None:
         batch = self._staged
-        last_flush_time = time.time()
+        last_flush_time = time.monotonic()
 
         while self._running:
             try:
                 # Calculate remaining wait time before forced interval flush
-                timeout = max(0.01, self.flush_interval_sec - (time.time() - last_flush_time))
+                timeout = max(0.01, self.flush_interval_sec - (time.monotonic() - last_flush_time))
                 try:
                     item = await asyncio.wait_for(self.queue.get(), timeout=timeout)
                     batch.append(item)
@@ -123,10 +123,10 @@ class BatchWriter:
                     pass
 
                 # Check flush condition
-                if len(batch) >= self.batch_size or ((time.time() - last_flush_time) >= self.flush_interval_sec and batch):
+                if len(batch) >= self.batch_size or ((time.monotonic() - last_flush_time) >= self.flush_interval_sec and batch):
                     self.db.insert_ticks_batch(batch)
                     batch.clear()
-                    last_flush_time = time.time()
+                    last_flush_time = time.monotonic()
 
             except asyncio.CancelledError:
                 break

@@ -7,6 +7,7 @@ Runs as an independent background service to accumulate real tick data.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import signal
@@ -18,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import AppConfig
+from config.settings import AppConfig, check_run_provenance
 from data.feeds import BinanceFeed, CoinbaseFeed, KrakenFeed
 from data.normalizer import OrderBookNormalizer
 from data.ntp_sync import clock_sync
@@ -48,6 +49,7 @@ class MarketDataCollector:
             batch_size=50,
             flush_interval_sec=0.5,
             depth_throttle_ms=self.config.detection.depth_snapshot_throttle_ms,
+            depth_throttle_ms=self.config.detection.depth_snapshot_throttle_ms,
         )
         self.tick_counts = {"binance": 0, "coinbase": 0, "kraken": 0}
         self.feeds = []
@@ -58,7 +60,8 @@ class MarketDataCollector:
         self.tick_counts[exchange] = self.tick_counts.get(exchange, 0) + 1
         self.batch_writer.enqueue_snapshot(snap)
 
-    async def start(self):
+    async def start(self, allow_dirty=False):
+        dirty = check_run_provenance(None, allow_dirty)
         logger.info("=" * 70)
         logger.info("Starting ArbSense Continuous Live Data Collector Service")
         logger.info("=" * 70)
@@ -70,6 +73,8 @@ class MarketDataCollector:
         # 2. Init Storage
         backend = self.db.initialize(sqlite_only=True)
         logger.info("Database initialized with backend: %s (%s)", backend, self.db.connection_diagnostic)
+
+        self.db.record_capture_start(self.config, dirty, clock_sync)
 
         # 3. Start Batch Writer
         await self.batch_writer.start()
@@ -96,18 +101,18 @@ class MarketDataCollector:
         self._running = True
         logger.info("All feeds online. Collector streaming live market depth to %s...", backend)
 
-        start_time = time.time()
-        last_prune_time = time.time()
+        start_time = time.monotonic()
+        last_prune_time = time.monotonic()
         # Monitoring loop
         try:
             while self._running:
                 await asyncio.sleep(10.0)
-                uptime_sec = int(time.time() - start_time)
+                uptime_sec = int(time.monotonic() - start_time)
 
                 # Periodic rolling tick pruner: keep recent ticks per symbol from config
-                if (time.time() - last_prune_time) >= 60.0:
-                    self.db.prune_old_ticks()
-                    last_prune_time = time.time()
+                if (time.monotonic() - last_prune_time) >= 60.0:
+                    self.db.prune_old_ticks(replay_window_hours=self.config.raw["storage"].get("replay_window_hours", 6))
+                    last_prune_time = time.monotonic()
 
                 db_count = self.db.get_tick_count()
                 q_size = self.batch_writer.queue.qsize()
@@ -133,12 +138,15 @@ class MarketDataCollector:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--allow-dirty", action="store_true")
+    args = parser.parse_args()
     collector = MarketDataCollector()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
-        loop.run_until_complete(collector.start())
+        loop.run_until_complete(collector.start(args.allow_dirty))
     except KeyboardInterrupt:
         logger.info("Received interrupt. Exiting...")
     finally:

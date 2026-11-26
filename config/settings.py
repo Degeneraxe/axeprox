@@ -98,7 +98,7 @@ class MarketsConfig:
 class DetectionConfig:
     gross_spread_threshold_bps: float = 1.0
     min_order_book_depth_levels: int = 10
-    depth_snapshot_throttle_ms: int = 0
+    depth_snapshot_throttle_ms: int = 100
 
 
 @dataclass
@@ -157,7 +157,7 @@ class AppConfig:
         detection = DetectionConfig(
             gross_spread_threshold_bps=float(dt_raw.get("gross_spread_threshold_bps", 1.0)),
             min_order_book_depth_levels=int(dt_raw.get("min_order_book_depth_levels", 10)),
-            depth_snapshot_throttle_ms=int(dt_raw.get("depth_snapshot_throttle_ms", 0)),
+            depth_snapshot_throttle_ms=int(dt_raw.get("depth_snapshot_throttle_ms", 100)),
         )
 
         return cls(
@@ -182,6 +182,21 @@ class AppConfig:
         import json
         dump = json.dumps(self.raw, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+
+def git_dirty() -> bool:
+    import subprocess
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=Path(__file__).resolve().parents[1], text=True
+    )
+    return bool(status.strip())
+
+
+def check_run_provenance(duration_sec, allow_dirty=False):
+    dirty = git_dirty()
+    if dirty and (duration_sec is None or duration_sec > 600) and not allow_dirty:
+        raise ValueError("Long runs require a clean checkout or --allow-dirty")
+    return dirty
 
 
 def get_git_commit() -> str:

@@ -143,15 +143,20 @@ class BaseExchangeFeed(ABC):
                     async for raw_msg in ws:
                         if not self._running:
                             break
-                        local_ts_ms = clock_sync.get_corrected_time_ms()
+                        local_ts_ms = clock_sync.event_time_ms()
                         self._last_msg_local_ts = time.time()
 
                         try:
                             parsed = self.parse_message(raw_msg, local_ts_ms)
                             if parsed:
                                 raw_symbol, bids, asks, exchange_ts_ms = parsed
-                                latency = max(0.0, local_ts_ms - exchange_ts_ms)
+                                latency = clock_sync.transit_ms(local_ts_ms, exchange_ts_ms)
                                 self._record_latency(latency)
+                                if (self.exchange_name == "coinbase" and exchange_ts_ms != local_ts_ms
+                                        and latency > 500 and getattr(self, "_slow_samples", 0) < 8):
+                                    self._slow_samples = getattr(self, "_slow_samples", 0) + 1
+                                    logger.info("Slow Coinbase receipt epoch_ms=%.3f latency_ms=%.3f clock=%s raw=%s",
+                                                local_ts_ms, latency, clock_sync.measurement(), raw_msg)
 
                                 if self.on_book_update:
                                     self.on_book_update(

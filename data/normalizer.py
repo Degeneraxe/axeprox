@@ -31,8 +31,8 @@ class OrderBookSnapshot:
     symbol: str                     # Normalized symbol: e.g. "BTC/USDT", "ETH/USDT"
     quote_currency: str             # "USDT" or "USD"
     exchange_ts_ms: float           # Server event timestamp from exchange payload
-    local_ts_ms: float              # Local UTC timestamp (corrected via NTP/offset)
-    transit_latency_ms: float       # local_ts_ms - exchange_ts_ms
+    local_ts_ms: float              # Epoch-anchored monotonic receipt time
+    transit_latency_ms: float       # Clock-adjusted receipt time minus venue timestamp
     bids: List[OrderBookLevel] = field(default_factory=list)  # Sorted descending by price
     asks: List[OrderBookLevel] = field(default_factory=list)  # Sorted ascending by price
     is_stale: bool = False
@@ -217,7 +217,7 @@ class OrderBookNormalizer:
         if ts_source is None:
             if exchange.lower() == "binance":
                 ts_source = "estimated"
-            elif exchange.lower() == "coinbase" and exchange_ts_ms == local_ts_ms:
+            elif exchange_ts_ms == local_ts_ms or exchange_ts_ms <= 0:
                 ts_source = "estimated"
             else:
                 ts_source = "exchange"
@@ -233,7 +233,8 @@ class OrderBookNormalizer:
             logger.warning("[BookIntegrity] Crossed book on %s %s: bid=%.4f >= ask=%.4f", exchange, norm_symbol, sorted_bids[0].price, sorted_asks[0].price)
 
         # Transit latency honesty (Fix B): maintain true measurement without artificial flooring
-        transit_latency = local_ts_ms - exchange_ts_ms
+        from data.ntp_sync import clock_sync
+        transit_latency = clock_sync.transit_ms(local_ts_ms, exchange_ts_ms) if ts_source == "exchange" else local_ts_ms - exchange_ts_ms
 
         snapshot = OrderBookSnapshot(
             exchange=exchange.lower(),

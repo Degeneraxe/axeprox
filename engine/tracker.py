@@ -258,6 +258,8 @@ class SpreadTracker:
                 qty = self.config.raw["simulation"]["trade_sizes"].get(event.symbol, 0)
                 b, _, buy_full = buy.compute_vwap("buy", qty)
                 s, _, sell_full = sell.compute_vwap("sell", qty)
+                evidence["buy_asks"] = [(level.price, level.amount) for level in buy.asks]
+                evidence["sell_bids"] = [(level.price, level.amount) for level in sell.bids]
                 evidence.update(buy_book_ms=buy.local_ts_ms, sell_book_ms=sell.local_ts_ms, quantity=qty)
                 event.execution_status = "insufficient_depth"
                 if qty > 0 and buy_full and sell_full and b > 0 and s > 0:

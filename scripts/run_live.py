@@ -9,13 +9,14 @@ Task 2: One unified, robust long-running service that:
 5. Persists detected spread events at open with complete 20-step feature windows,
    rolling volatility, and fixed dataset latency thresholds.
 6. Periodically checks event timeouts and right-censoring.
-7. Periodically prunes old raw ticks (keeping latest 1500 per symbol) while permanently
+7. Periodically prunes old raw ticks outside the replay window while permanently
    retaining all spread events and feature windows.
 8. Logs a clean, comprehensive status line every 60 seconds.
 9. Operates with auto-reconnect and graceful shutdown (SIGINT / SIGTERM).
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -29,7 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import AppConfig, get_git_commit
+from config.settings import AppConfig, check_run_provenance
 from data.feeds import BinanceFeed, CoinbaseFeed, KrakenFeed
 from data.normalizer import OrderBookNormalizer, OrderBookSnapshot
 from data.ntp_sync import clock_sync
@@ -76,6 +77,7 @@ class UnifiedLiveService:
             normalizer=self.normalizer,
         )
 
+        self.accepting_updates = True
         self.cumulative_ticks = 0
         self.events_opened_session = 0
         self.events_closed_session = 0
@@ -94,6 +96,8 @@ class UnifiedLiveService:
         loc_ts: float,
     ) -> None:
         """Callback executed on every incoming order book depth update."""
+        if not self.accepting_updates:
+            return
         snap = self.normalizer.update_book(exchange, raw_symbol, bids, asks, exch_ts, loc_ts)
         self.cumulative_ticks += 1
         self.tick_counts[exchange] = self.tick_counts.get(exchange, 0) + 1
@@ -172,7 +176,8 @@ class UnifiedLiveService:
                 logger.warning("[BasisUpdater] Unexpected poll cycle exception: %s (total failures: %d)", e, self.basis_poll_failures)
             await asyncio.sleep(60.0)
 
-    async def start(self, duration_sec: Optional[int] = None) -> None:
+    async def start(self, duration_sec: Optional[int] = None, allow_dirty: bool = False) -> None:
+        dirty = check_run_provenance(duration_sec, allow_dirty)
         logger.info("=" * 80)
         logger.info("ArbSense Unified Live Ingestion, Detection & Spread Tracking Engine")
         if duration_sec:
@@ -182,7 +187,7 @@ class UnifiedLiveService:
         # 1. Sync Clock via NTP / REST fallback (non-blocking in thread)
         await asyncio.to_thread(clock_sync.sync)
         logger.info(
-            "Clock sync verified: offset=%.2fms via %s (transit latency correction active)",
+            "Clock reference: offset=%.2fms via %s",
             clock_sync.offset_ms,
             clock_sync.method_used,
         )
@@ -191,31 +196,21 @@ class UnifiedLiveService:
         backend = self.db.initialize(sqlite_only=True)
         logger.info("Database initialized: backend=%s (%s)", backend, self.db.connection_diagnostic)
 
-        # Store initial NTP offset sample
-        self.db.record_clock_offset(clock_sync.offset_ms)
-
-        # 3. Governance: Freeze Validation & Run Metadata Registration (Item 2)
-        dataset_ver = self.config.raw.get("dataset", {}).get("version", "v2.1")
-        latency_thresh_ms = float(self.config.raw.get("dataset", {}).get("viability_latency_threshold_ms", 85.0))
-        cfg_hash = self.config.get_config_hash()
-        git_hash = get_git_commit()
-        cfg_json = json.dumps(self.config.raw, sort_keys=True)
-        self.db.check_and_record_run_metadata(
-            dataset_version=dataset_ver,
-            config_hash=cfg_hash,
-            git_commit=git_hash,
-            latency_threshold_ms=latency_thresh_ms,
-            config_json=cfg_json,
-            clock_offset_ms=clock_sync.offset_ms,
-        )
+        dataset_ver = self.config.raw["dataset"]["version"]
+        self.db.record_capture_start(self.config, dirty, clock_sync)
 
         # 4. Start High-Throughput Batch Writer
         await self.batch_writer.start()
 
-        # 5. Initialize Multi-Exchange Feeds (restricted strictly to verified pairs BTC/ETH + USDT/USD basis)
-        binance_symbols = ["btcusdt", "ethusdt"]
-        coinbase_symbols = ["BTC-USD", "ETH-USD", "USDT-USD"]
-        kraken_symbols = ["XBT/USDT", "ETH/USDT", "XBT/USD", "ETH/USD", "USDT/USD"]
+        mapping = self.config.raw["markets"]["exchange_symbols"]
+        pairs = self.config.markets.supported_pairs
+        def subscriptions(venue, extras=()):
+            symbols = [mapping[venue][pair] for pair in pairs if pair in mapping[venue]]
+            return list(dict.fromkeys([*symbols, *extras]))
+
+        binance_symbols = subscriptions("binance")
+        coinbase_symbols = subscriptions("coinbase", ["USDT-USD"])
+        kraken_symbols = subscriptions("kraken", ["XBT/USD", "ETH/USD", "USDT/USD"])
 
         self.feeds = [
             BinanceFeed(symbols=binance_symbols, on_book_update=self.on_book_update),
@@ -232,36 +227,36 @@ class UnifiedLiveService:
         self._running = True
         logger.info("All feeds streaming live. Real-time arbitrage detection & tracking online.")
 
-        start_time = time.time()
-        last_log_time = time.time()
-        last_prune_time = time.time()
-        last_ntp_sync_time = time.time()
+        start_time = time.monotonic()
+        last_log_time = time.monotonic()
+        last_prune_time = time.monotonic()
+        last_ntp_sync_time = time.monotonic()
 
         try:
             while self._running:
-                if duration_sec is not None and (time.time() - start_time) >= duration_sec:
+                if duration_sec is not None and (time.monotonic() - start_time) >= duration_sec:
                     logger.info("Target duration of %ds reached. Stopping live session cleanly...", duration_sec)
                     break
 
                 await asyncio.sleep(0.5)
-                now_ms = clock_sync.get_corrected_time_ms()
+                now_ms = clock_sync.event_time_ms()
 
                 # Periodically check timeouts for active spread windows (inactivity / right-censoring)
                 closed_events = self.tracker.check_timeouts(now_ms)
                 if closed_events:
                     self.events_closed_session += len(closed_events)
 
-                now_sec = time.time()
+                now_sec = time.monotonic()
 
                 # 5-Minute (300s) Periodic NTP Re-sync & Offset Recording (Item 4 & Non-blocking)
                 if (now_sec - last_ntp_sync_time) >= 300.0:
                     await asyncio.to_thread(clock_sync.sync)
-                    self.db.record_clock_offset(clock_sync.offset_ms)
+                    self.db.record_clock_offset(**clock_sync.measurement())
                     last_ntp_sync_time = now_sec
 
                 # 60-Second Periodic Tick Pruning (raw ticks only; events/windows permanently preserved)
                 if (now_sec - last_prune_time) >= 60.0:
-                    pruned = self.db.prune_old_ticks()
+                    self.db.prune_old_ticks(replay_window_hours=self.config.raw["storage"].get("replay_window_hours", 6))
                     last_prune_time = now_sec
 
                 # 60-Second Periodic Status Line Logging (Task 2 & 10 Requirement)
@@ -364,26 +359,22 @@ class UnifiedLiveService:
     async def stop(self) -> None:
         self._running = False
         logger.info("Initiating graceful shutdown of feeds and storage queues...")
+        self.accepting_updates = False
+        self.tracker.finish(clock_sync.event_time_ms())
         for feed in self.feeds:
             await feed.stop()
-        self.tracker.finish(clock_sync.get_corrected_time_ms())
         await self.batch_writer.stop()
         self.db.close()
         logger.info("Unified Live Service stopped cleanly.")
 
 
 def main():
-    duration = None
-    db_path = "data/arbsense.db"
-    if len(sys.argv) > 1:
-        try:
-            duration = int(sys.argv[1])
-        except ValueError:
-            pass
-    if len(sys.argv) > 2:
-        db_path = sys.argv[2]
-
-    service = UnifiedLiveService(sqlite_path=db_path)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("duration", type=int, nargs="?")
+    parser.add_argument("database", nargs="?", default="data/arbsense.db")
+    parser.add_argument("--allow-dirty", action="store_true")
+    args = parser.parse_args()
+    service = UnifiedLiveService(sqlite_path=args.database)
 
     def _handle_signal(*_):
         logger.info("Signal received. Triggering graceful shutdown...")
@@ -395,7 +386,7 @@ def main():
     except Exception:
         pass
 
-    asyncio.run(service.start(duration_sec=duration))
+    asyncio.run(service.start(duration_sec=args.duration, allow_dirty=args.allow_dirty))
 
 
 if __name__ == "__main__":

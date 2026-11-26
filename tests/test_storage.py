@@ -180,7 +180,7 @@ def test_depth_archive_survives_backpressure_and_stop():
         saved = []
         db = Mock()
         db.insert_ticks_batch.side_effect = lambda batch: saved.extend(batch)
-        writer = BatchWriter(db, batch_size=100, flush_interval_sec=60)
+        writer = BatchWriter(db, batch_size=100, flush_interval_sec=60, depth_throttle_ms=0)
         writer.queue = asyncio.Queue(maxsize=2)
         await writer.start()
         for stamp in range(8):

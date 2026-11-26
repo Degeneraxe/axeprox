@@ -284,6 +284,15 @@ class DatabaseManager:
         except Exception:
             pass
 
+        for table, fields in (
+            ("clock_offsets", {"rtt_ms": "REAL", "method": "TEXT", "error_bound_ms": "REAL"}),
+            ("run_metadata", {"git_dirty": "INTEGER"}),
+        ):
+            existing = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
+            for name, kind in fields.items():
+                if name not in existing:
+                    cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ticks_local_time ON orderbook_ticks(local_ts_ms)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ticks_exch_sym ON orderbook_ticks (exchange, symbol, id DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_spreads_time ON spread_events (open_time DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_run_metadata_version ON run_metadata (dataset_version);")
@@ -640,31 +649,47 @@ class DatabaseManager:
         except Exception:
             return {"exchange": 0, "estimated": 0}
 
-    def record_clock_offset(self, offset_ms: float, time_str: Optional[str] = None) -> None:
+    def record_clock_offset(self, offset_ms: float, time_str: Optional[str] = None, *, rtt_ms=None, method=None, error_bound_ms=None) -> None:
         """Records an NTP / reference clock offset sample in clock_offsets table (Item 4)."""
         if self._sqlite_conn:
             t_str = time_str or datetime.now(timezone.utc).isoformat()
             cur = self._sqlite_conn.cursor()
             cur.execute("""
-                INSERT INTO clock_offsets (time, offset_ms) VALUES (?, ?)
-            """, (t_str, float(offset_ms)))
+                INSERT INTO clock_offsets (time, offset_ms, rtt_ms, method, error_bound_ms) VALUES (?, ?, ?, ?, ?)
+            """, (t_str, float(offset_ms), rtt_ms, method, error_bound_ms))
             self._sqlite_conn.commit()
 
-    def prune_old_ticks(self, keep_latest_per_symbol: Optional[int] = None) -> int:
+    def prune_old_ticks(self, keep_latest_per_symbol: Optional[int] = None, *, replay_window_hours=None) -> int:
         """Prunes old ticks from orderbook_ticks ONLY to prevent disk bloat (Requirement 1 & Item 6).
         
-        Reads tick_prune_keep_count from config if keep_latest_per_symbol is None.
+        Uses the configured replay window unless an explicit row count is supplied.
         Spread events and their persisted 20-step point-in-time feature windows are permanently
         retained and never pruned, guaranteeing permanent training dataset integrity.
         """
         if self.read_only:
             raise RuntimeError("Database is in read-only mode")
         if keep_latest_per_symbol is None:
-            try:
-                from config.settings import AppConfig
-                keep_latest_per_symbol = int(AppConfig.load().raw.get("storage", {}).get("tick_prune_keep_count", 0))
-            except Exception:
-                keep_latest_per_symbol = 0
+            from config.settings import AppConfig
+            from data.ntp_sync import clock_sync
+            if replay_window_hours is None:
+                replay_window_hours = AppConfig.load().raw["storage"].get("replay_window_hours", 6)
+            hours = float(replay_window_hours)
+            if not 0 < hours < float("inf"):
+                raise ValueError("replay_window_hours must be positive and finite")
+            cutoff = clock_sync.event_time_ms() - hours * 3600000
+            if self._sqlite_conn is None:
+                return 0
+            deleted = 0
+            while True:
+                with self._sqlite_conn:
+                    count = self._sqlite_conn.execute(
+                        "DELETE FROM orderbook_ticks WHERE id IN "
+                        "(SELECT id FROM orderbook_ticks WHERE local_ts_ms < ? LIMIT 5000)",
+                        (cutoff,),
+                    ).rowcount
+                deleted += count
+                if count < 5000:
+                    return deleted
 
         if keep_latest_per_symbol <= 0:
             return 0
@@ -685,6 +710,16 @@ class DatabaseManager:
             return deleted
         return 0
 
+    def record_capture_start(self, config, dirty, clock):
+        from config.settings import get_git_commit
+        dataset = config.raw["dataset"]
+        self.check_and_record_run_metadata(
+            dataset["version"], config.get_config_hash(), get_git_commit(),
+            dataset["viability_latency_threshold_ms"], json.dumps(config.raw, sort_keys=True),
+            clock.offset_ms, dirty,
+        )
+        self.record_clock_offset(**clock.measurement())
+
     def check_and_record_run_metadata(
         self,
         dataset_version: str,
@@ -693,6 +728,7 @@ class DatabaseManager:
         latency_threshold_ms: float,
         config_json: str = "",
         clock_offset_ms: Optional[float] = None,
+        git_dirty: Optional[bool] = None,
     ) -> None:
         """Validates configuration freeze against historical runs and records run metadata (Requirement 2 & Item 4).
         
@@ -717,9 +753,9 @@ class DatabaseManager:
             
             cur.execute("""
                 INSERT INTO run_metadata (
-                    dataset_version, config_hash, git_commit, latency_threshold_ms, config_json, clock_offset_ms
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """, (dataset_version, config_hash, git_commit, latency_threshold_ms, config_json, clock_offset_ms))
+                    dataset_version, config_hash, git_commit, latency_threshold_ms, config_json, clock_offset_ms, git_dirty
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (dataset_version, config_hash, git_commit, latency_threshold_ms, config_json, clock_offset_ms, git_dirty))
             self._sqlite_conn.commit()
             logger.info(
                 "[RunMetadata] Run metadata verified and recorded: dataset_version=%s, config_hash=%s, git=%s, latency_threshold=%.1fms",
