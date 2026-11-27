@@ -1,0 +1,39 @@
+{
+  "retrieved_utc": "2026-11-27T15:16:04.5908213Z",
+  "sources": [
+    "https://api.binance.com/api/v3/exchangeInfo",
+    "https://api.kraken.com/0/public/AssetPairs"
+  ],
+  "pairs": {
+    "BTC/USDT": {
+      "binance": {
+        "step": "0.00001000",
+        "min_qty": "0.00001000",
+        "max_qty": "132.44813644",
+        "min_cost": "5.00000000",
+        "tick": "0.01000000"
+      },
+      "kraken": {
+        "step": "1e-08",
+        "min_qty": "0.00006",
+        "min_cost": "0.5",
+        "tick": "0.1"
+      }
+    },
+    "ETH/USDT": {
+      "binance": {
+        "step": "0.00010000",
+        "min_qty": "0.00010000",
+        "max_qty": "4451.49724560",
+        "min_cost": "5.00000000",
+        "tick": "0.01000000"
+      },
+      "kraken": {
+        "step": "1e-08",
+        "min_qty": "0.002",
+        "min_cost": "0.5",
+        "tick": "0.01"
+      }
+    }
+  }
+}
