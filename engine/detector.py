@@ -38,6 +38,8 @@ class SpreadCandidate:
     quote_age_buy_ms: float
     quote_age_sell_ms: float
     native_usdt_route: bool = True
+    buy_symbol: str = ""
+    sell_symbol: str = ""
 
 
 class CrossExchangeDetector:
@@ -181,6 +183,7 @@ class CrossExchangeDetector:
                     timestamp_ms=current_time_ms,
                     quote_age_buy_ms=snap_buy.quote_age_ms,
                     quote_age_sell_ms=snap_sell.quote_age_ms,
+                    buy_symbol=snap_buy.symbol, sell_symbol=snap_sell.symbol,
                     native_usdt_route=(snap_buy.quote_currency == snap_sell.quote_currency == "USDT"),
                 )
 

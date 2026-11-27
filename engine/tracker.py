@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Deque
 
 from config.settings import AppConfig
 from data.storage.db_manager import DatabaseManager
-from engine.simulator import arrival_books
+from engine.simulator import inspect_arrival
 from engine.cost_model import CostModel
 from engine.detector import SpreadCandidate
 from models.features import asof_join_ticks, compute_rolling_volatility_bps, extract_step_features, build_feature_step
@@ -74,6 +74,8 @@ class ActiveSpreadEvent:
     lifetime_ticks: List[Dict[str, Any]] = field(default_factory=list)
     dataset_version: str = "v1.0"
     native_usdt_route: bool = True
+    buy_symbol: str = ""
+    sell_symbol: str = ""
     execution_status: str = "pending"
     slippage_bps: Optional[float] = None
     is_executable: bool = False
@@ -100,10 +102,12 @@ class SpreadTracker:
         on_event_closed: Optional[Callable[[ActiveSpreadEvent], None]] = None,
         normalizer: Optional[Any] = None,
         on_arrival: Optional[Callable] = None,
+        ready_at: Optional[Callable] = None,
     ):
         self.db = db_manager
         self.config = config or AppConfig.load()
         self.on_event_closed = on_event_closed
+        self.ready_at = ready_at
         self.pending_arrivals = {}
         self.on_arrival = on_arrival
         self.normalizer = normalizer
@@ -249,10 +253,18 @@ class SpreadTracker:
             arrival = event.open_time_ms + event.latency_threshold_ms
             if now_ms < arrival:
                 continue
-            books = arrival_books(self.ring_buffers, event.symbol, event.buy_exchange,
-                                  event.sell_exchange, arrival) if event.native_usdt_route else None
-            evidence = {"arrival_ms": arrival}
-            event.execution_status = "missing_books" if event.native_usdt_route else "conversion_required"
+            books, diagnostics = inspect_arrival(
+                self.ring_buffers, event.buy_symbol or event.symbol, event.sell_symbol or event.symbol,
+                event.buy_exchange, event.sell_exchange, arrival,
+            )
+            evidence = {"arrival_ms": arrival, **diagnostics}
+            event.execution_status = "missing_books"
+            if self.ready_at is not None and not self.ready_at(arrival):
+                evidence["missing_cause"] = "connection_warmup"
+                books = None
+            elif not event.native_usdt_route or (books and any(b.quote_currency != "USDT" for b in books)):
+                event.execution_status = "conversion_required"
+                books = None
             if books:
                 buy, sell = books
                 qty = self.config.raw["simulation"]["trade_sizes"].get(event.symbol, 0)
@@ -331,7 +343,7 @@ class SpreadTracker:
             return event
 
         # 2. No ongoing event -> open a new one if candidate meets detection criteria
-        elif candidate.is_gross_candidate:
+        elif candidate.is_gross_candidate and (self.ready_at is None or self.ready_at(now_ms)):
             seq_len = int(self.config.raw.get("dataset", {}).get("sequence_length", 20))
 
             # Ring buffer check: wait until ring buffers hold at least seq_len ticks per leg
@@ -392,6 +404,7 @@ class SpreadTracker:
                 is_suspect=is_suspect,
                 lifetime_ticks=[tick_record],
                 native_usdt_route=candidate.native_usdt_route,
+                buy_symbol=candidate.buy_symbol, sell_symbol=candidate.sell_symbol,
                 dataset_version=self.dataset_version,
             )
             self.active_events[key] = new_event

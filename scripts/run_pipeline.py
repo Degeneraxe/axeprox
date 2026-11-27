@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import AppConfig, check_run_provenance
+from data.feeds.base_feed import feeds_ready
 from data.feeds import BinanceFeed, CoinbaseFeed, KrakenFeed
 from data.normalizer import OrderBookNormalizer
 from data.ntp_sync import clock_sync
@@ -70,14 +71,22 @@ async def run_pipeline(collection_duration_sec: int = 15, allow_dirty=False):
                                              arrival_latency_ms=evt.latency_threshold_ms)
         executed_trades.append(result)
 
-    tracker = SpreadTracker(db_manager=db, config=config, normalizer=normalizer, on_arrival=on_arrival)
+    def ready(at_ms):
+        return feeds_ready(feeds, at_ms, config.warmup_seconds)
+
+    tracker = SpreadTracker(ready_at=ready, db_manager=db, config=config, normalizer=normalizer, on_arrival=on_arrival)
     batch_writer = BatchWriter(db_manager=db, batch_size=50, flush_interval_sec=0.5,
                                depth_throttle_ms=config.detection.depth_snapshot_throttle_ms)
     await batch_writer.start()
 
+    accepting_updates = True
+
     # 4. Ingestion Callbacks
     def on_book_update(exchange: str, raw_symbol: str, bids: list, asks: list, exch_ts: float, loc_ts: float):
+        if not accepting_updates:
+            return
         snap = normalizer.update_book(exchange, raw_symbol, bids, asks, exch_ts, loc_ts)
+        snap.warmup_complete = ready(loc_ts)
         batch_writer.enqueue_snapshot(snap)
 
         now_ms = clock_sync.event_time_ms()
@@ -107,10 +116,11 @@ async def run_pipeline(collection_duration_sec: int = 15, allow_dirty=False):
             last_prune = time.monotonic()
         print(f"    - Elapsed {int(time.monotonic() - start_time)}s | Stored Ticks: {db.get_tick_count()} | Completed Events: {len(tracker.completed_events)} | Trades: {len(executed_trades)}")
 
-    # Stop Feeds
+    # End the capture before the first disconnection closes the warm-up gate.
+    accepting_updates = False
+    tracker.finish(clock_sync.event_time_ms())
     for f in feeds:
         await f.stop()
-    tracker.finish(clock_sync.event_time_ms())
     await batch_writer.stop()
 
     print("\n" + "=" * 80)

@@ -26,19 +26,41 @@ from engine.cost_model import CostModel
 logger = logging.getLogger(__name__)
 
 
-def arrival_books(buffers, symbol, buy_exchange, sell_exchange, arrival_ms):
-    """Find each venue's most recent received book at or before simulated arrival."""
+def inspect_arrival(buffers, buy_symbol, sell_symbol, buy_exchange, sell_exchange, arrival_ms):
     books = []
-    for venue in (buy_exchange, sell_exchange):
+    evidence = {}
+    for side, venue, symbol in (("buy", buy_exchange, buy_symbol), ("sell", sell_exchange, sell_symbol)):
         history = buffers.get((venue.lower(), symbol), ())
         book = next((b for b in reversed(history) if b.local_ts_ms <= arrival_ms), None)
-        if (book is None or book.quote_currency != "USDT" or book.is_crossed
-                or arrival_ms - book.local_ts_ms > 250 or not book.best_bid or not book.best_ask):
-            return None
         books.append(book)
-    if abs(books[0].local_ts_ms - books[1].local_ts_ms) > 100:
-        return None
-    return tuple(books)
+        if book is None:
+            evidence[side] = {"symbol": symbol, "book_ms": None}
+            continue
+        local_age = arrival_ms - book.local_ts_ms
+        measured = book.ts_source == "exchange"
+        exchange_age = local_age + book.transit_latency_ms if measured else None
+        evidence[side] = dict(symbol=symbol, book_ms=book.local_ts_ms, local_age_ms=local_age,
+                              exchange_ts_ms=book.exchange_ts_ms if measured else None,
+                              corrected_receipt_delay_ms=book.transit_latency_ms if measured else None,
+                              exchange_age_ms=exchange_age,
+                              exchange_age_over_500ms=exchange_age > 500 if measured else None)
+    if any(b is None for b in books):
+        cause = "no_book"
+    elif any(arrival_ms - b.local_ts_ms > 250 for b in books):
+        cause = "older_than_250ms"
+    elif any(b.is_crossed or not b.best_bid or not b.best_ask for b in books):
+        cause = "crossed_or_empty"
+    elif abs(books[0].local_ts_ms - books[1].local_ts_ms) > 100:
+        cause = "more_than_100ms_apart"
+    else:
+        return tuple(books), evidence
+    evidence["missing_cause"] = cause
+    return None, evidence
+
+
+def arrival_books(buffers, symbol, buy_exchange, sell_exchange, arrival_ms):
+    books, _ = inspect_arrival(buffers, symbol, symbol, buy_exchange, sell_exchange, arrival_ms)
+    return books if books and all(b.quote_currency == "USDT" for b in books) else None
 
 
 @dataclass

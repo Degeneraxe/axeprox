@@ -100,7 +100,7 @@ Slippage is naturally embedded in realized VWAP without double-counting.
 ### 3.5 Ground-Truth Labeling & Multi-Task Loss
 - **Duration:** $\tau = t_{\text{close}} - t_{\text{open}}$, with regression target $y_{\text{reg}} = \ln(1 + \tau)$ evaluated strictly on uncensored samples.
 - **Microstructural executability.** For current captures, `is_executable=1` means both native USDT legs can fill the configured quantity by walking their books at simulated arrival (open + 85 ms). Each book must have been received by arrival, be at most 250 ms old, be uncrossed, and be within 100 ms of the other book. A priced event can lose money.
-- **Priced routes.** Binance ↔ Kraken for BTC, ETH and SOL against USDT. USD-quoted legs, including Coinbase, are monitored for spreads and recorded as `conversion_required` when their arrival is observed. Their USD books never enter the USDT P&L distribution.
+- **Priced routes.** Binance ↔ Kraken for BTC and ETH against USDT. SOL is excluded from v2.4 after its REST comparison. USD-quoted legs, including Coinbase, are monitored for spreads and recorded as `conversion_required` when their arrival is observed. Their USD books never enter the USDT P&L distribution.
 - **Scenario profitability.** Both legs incur the configured taker fee. The legacy `net_peak_<scenario>` field stores the net return in basis points at arrival for priced events. Report profitability conditional on `execution_evidence_json.status = priced`.
 - **Multi-Task Objective:**
   $$\mathcal{L} = \mathcal{L}_{\text{WeightedBCE}}(\hat{y}_{\text{cls}}, y_{\text{cls}}) + 0.5 \cdot \mathcal{L}_{\text{SmoothL1}}(\hat{y}_{\text{reg}}, y_{\text{reg}})$$
@@ -140,7 +140,7 @@ cd C:\Users\SIDDHU\.gemini\antigravity\scratch\arbsense
 python -m pip install -r requirements.txt
 ```
 
-### Step 2: Run Automated Test Suite (66 tests)
+### Step 2: Run Automated Test Suite (73 tests)
 ```powershell
 python -m pytest tests -q
 ```
@@ -189,8 +189,10 @@ Network round-trip latency to exchange WebSocket matching engines directly deter
 - **vCPU:** 2 to 4 cores (e.g. AWS `t3.large` or `c6i.large`).
 - **RAM:** 4 GB to 8 GB.
 - **Storage.** The collector records top-of-book updates and samples depth (up to ten levels per side) per venue and pair every 100 ms. Once per minute it deletes raw ticks older than `storage.replay_window_hours` (default 6). SQLite reuses freed pages. Events, lifecycle ticks, feature windows and arrival evidence remain permanent. Arrival evidence stores the actual buy asks and sell bids independently of snapshot sampling. Raw replay between samples is approximate.
-- **Clock and provenance.** The collector timestamps market observations with an epoch-anchored monotonic clock. Reference offsets adjust exchange transit estimates. Long captures (over 600 seconds or unlimited) require a clean Git checkout unless launched with `--allow-dirty`. Capture metadata records the commit, dirty flag and configuration. Dataset v2.3 distinguishes this storage and timing configuration from frozen v2.2 runs.
-- **Smoke audit.** After shutdown, run `python scripts/audit_capture.py data/smoke.db --seconds 600` for route outcomes, priced paper P&L, transit percentiles, and disk projections. The five-day projection covers one active database at observed traffic. Include space for WAL, other existing data and any backups kept on the same disk.
+- **Clock and provenance.** The collector timestamps market observations with an epoch-anchored monotonic clock. Reference offsets adjust exchange transit estimates. Long captures (over 600 seconds or unlimited) require a clean Git checkout unless launched with `--allow-dirty`. Capture metadata records the commit, dirty flag and configuration. Dataset v2.4 records all-feed warm-up state with each raw tick. The first event can open after every feed has been continuously connected for `tracking.warmup_seconds` (default 60). A reconnect starts that feed's warm-up again. If a pending arrival falls inside a warm-up it records `missing_books` with cause `connection_warmup`.
+- **Book freshness.** Arrival evidence records each leg's native pair, local book age, corrected receipt delay and exchange-time age when the venue supplies a timestamp. Exchange age equals receipt delay plus time elapsed locally to arrival. Values over 500 ms are flagged for analysis. Estimated timestamps have null exchange-age fields.
+- **VM latency analysis.** Run `python scripts/propose_latency_threshold.py --db data/arbsense.db`. The report uses retained, exchange-timestamped ticks with a recorded warm-up pass and prints the clock calibration bounds. The 85 ms simulated execution threshold remains a separate setting. For the older uninterrupted smoke capture only, `--legacy-single-session` conservatively excludes 60 seconds after the last venue's first receipt.
+- **Smoke audit.** After shutdown, run `python scripts/audit_capture.py data/smoke.db --seconds 600` for route outcomes, missing-book causes, exchange-age flags, net paper P&L, exact binomial and clustered bootstrap intervals, transit percentiles and disk projections. The five-day projection covers one active database at observed traffic. Include space for WAL, other existing data and any backups kept on the same disk.
 - **OS:** Ubuntu 22.04 LTS / Debian 12.
 
 ### 6.3 Step-by-Step Production Setup

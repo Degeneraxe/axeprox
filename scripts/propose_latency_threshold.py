@@ -1,95 +1,70 @@
-"""Propose Viability Latency Threshold from Measured Exchange Latencies (Item 5).
-
-Reads orderbook_ticks with ts_source='exchange' from the database,
-computes empirical percentiles (p50, p90, p95, p99, mean, std) overall and per exchange,
-and proposes a frozen viability_latency_threshold_ms to set in config.yaml.
-"""
+"""Summarize post-warm-up exchange-timestamped receipt delays from a SQLite capture."""
 from __future__ import annotations
 
 import argparse
-import os
+from array import array
+from collections import defaultdict
+from contextlib import closing
+from pathlib import Path
 import sqlite3
 import sys
-from pathlib import Path
-from typing import Dict, List, Optional
+
 import numpy as np
 
-# Ensure project root is in sys.path
-BASE_DIR = Path(__file__).resolve().parent.parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
 
-from config.settings import AppConfig
+def latency_stats(a):
+    p50, p75, p90, p95, p99 = np.percentile(a, [50, 75, 90, 95, 99])
+    return dict(count=len(a), min=a.min(), p50=p50, p75=p75, p90=p90,
+                p95=p95, p99=p99, max=a.max(), mean=a.mean(), std=a.std())
 
 
-def analyze_latencies(db_path: str, min_hours: Optional[float] = None) -> Dict[str, any]:
-    """Analyzes transit latency from orderbook_ticks for exchange-timestamped ticks."""
-    p = Path(db_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Database file not found: {db_path}")
-
-    uri = f"file:{p.resolve().as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    cur = conn.cursor()
-
-    # 1. Tick count by ts_source
-    cur.execute("SELECT ts_source, COUNT(*) FROM orderbook_ticks GROUP BY ts_source")
-    counts_by_source = {row[0]: row[1] for row in cur.fetchall()}
-
-    # 2. Query latencies
-    query = """
-        SELECT exchange, transit_latency_ms, time
-        FROM orderbook_ticks
-        WHERE ts_source = 'exchange'
-          AND transit_latency_ms IS NOT NULL
-          AND transit_latency_ms > 0
-    """
-    cur.execute(query)
-    rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        return {
-            "counts_by_source": counts_by_source,
-            "overall": None,
-            "per_exchange": {},
-        }
-
-    # Group latencies per exchange and overall
-    latencies_all = [r[1] for r in rows]
-    by_exchange: Dict[str, List[float]] = {}
-    for exch, lat, _ in rows:
-        by_exchange.setdefault(exch.lower(), []).append(lat)
-
-    def _calc_stats(arr: List[float]) -> Dict[str, float]:
-        a = np.array(arr, dtype=np.float64)
-        return {
-            "count": len(a),
-            "min": float(np.min(a)),
-            "p50": float(np.percentile(a, 50)),
-            "p75": float(np.percentile(a, 75)),
-            "p90": float(np.percentile(a, 90)),
-            "p95": float(np.percentile(a, 95)),
-            "p99": float(np.percentile(a, 99)),
-            "max": float(np.max(a)),
-            "mean": float(np.mean(a)),
-            "std": float(np.std(a)),
-        }
-
-    overall_stats = _calc_stats(latencies_all)
-    per_exchange_stats = {exch: _calc_stats(lats) for exch, lats in by_exchange.items()}
-
-    return {
-        "counts_by_source": counts_by_source,
-        "overall": overall_stats,
-        "per_exchange": per_exchange_stats,
-    }
+def analyze_latencies(db_path, min_hours=None, legacy_single_session=False):
+    path = Path(db_path).resolve()
+    if min_hours is not None and not 0 < min_hours < float("inf"):
+        raise ValueError("--hours must be positive and finite")
+    with closing(sqlite3.connect(path.as_uri()+"?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
+        counts = dict(db.execute("SELECT ts_source, COUNT(*) FROM orderbook_ticks GROUP BY ts_source"))
+        columns = {r[1] for r in db.execute("PRAGMA table_info(orderbook_ticks)")}
+        if legacy_single_session:
+            if "warmup_complete" in columns and db.execute(
+                "SELECT 1 FROM orderbook_ticks WHERE warmup_complete IS NOT NULL LIMIT 1"
+            ).fetchone():
+                raise ValueError("Legacy override requires entirely unmarked ticks")
+            runs = db.execute("SELECT COUNT(*) FROM run_metadata").fetchone()[0]
+            count, last = db.execute("SELECT COUNT(*), MAX(id) FROM orderbook_ticks").fetchone()
+            if runs != 1 or count != last:
+                raise ValueError("Legacy override requires one complete unpruned capture")
+            warm = """local_ts_ms >= (SELECT MAX(first_ms) + 60000 FROM
+                      (SELECT MIN(local_ts_ms) AS first_ms FROM orderbook_ticks GROUP BY exchange))"""
+        elif "warmup_complete" in columns:
+            warm = "warmup_complete = 1"
+        else:
+            raise ValueError("No warm-up markers. For a verified uninterrupted capture use --legacy-single-session")
+        query = f"""SELECT exchange, transit_latency_ms FROM orderbook_ticks
+                    WHERE ts_source='exchange' AND transit_latency_ms IS NOT NULL AND {warm}"""
+        params = []
+        if min_hours is not None:
+            query += " AND local_ts_ms >= (SELECT MAX(local_ts_ms) FROM orderbook_ticks) - ?"
+            params.append(min_hours * 3600000)
+        by_exchange = defaultdict(lambda: array("d"))
+        for venue, delay in db.execute(query, params):
+            by_exchange[venue].append(delay)
+        fields = {r[1] for r in db.execute("PRAGMA table_info(clock_offsets)")}
+        bounds = []
+        if "error_bound_ms" in fields:
+            bounds = list(db.execute("SELECT time,method,error_bound_ms FROM clock_offsets ORDER BY id"))
+    arrays = {venue: np.frombuffer(values, dtype=np.float64) for venue, values in by_exchange.items()}
+    return dict(counts_by_source=counts, bounds=bounds,
+                per_exchange={venue: latency_stats(values) for venue, values in arrays.items()},
+                overall=latency_stats(np.concatenate(list(arrays.values()))) if arrays else None)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Propose viability latency threshold from measured exchange latencies.")
     parser.add_argument("--db", type=str, default="data/arbsense.db", help="Path to SQLite database")
     parser.add_argument("--hours", type=float, default=None, help="Filter for last N hours of data")
+    parser.add_argument("--legacy-single-session", action="store_true", help="Use latest venue first tick plus 60 s for an uninterrupted unpruned legacy capture")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -98,11 +73,16 @@ def main():
     print("=" * 80)
 
     try:
-        results = analyze_latencies(args.db, min_hours=args.hours)
+        results = analyze_latencies(args.db, min_hours=args.hours, legacy_single_session=args.legacy_single_session)
     except Exception as e:
         print(f"Error reading database: {e}")
         sys.exit(1)
 
+    print("Warm-up filter:", "legacy latest first receipt + 60 s" if args.legacy_single_session else "recorded all-feed readiness")
+    for stamp, method, bound in results["bounds"]:
+        print("clock_error_bound_ms", stamp, method, bound)
+    if not results["bounds"]:
+        print("clock_error_bound_ms unavailable")
     counts = results["counts_by_source"]
     print("\n[Tick Source Breakdown]")
     total_ticks = sum(counts.values())
@@ -129,15 +109,7 @@ def main():
     print(f"{'OVERALL':<15} {overall['count']:>8d} {overall['min']:>8.1f} {overall['p50']:>8.1f} {overall['p75']:>8.1f} {overall['p90']:>8.1f} {overall['p95']:>8.1f} {overall['p99']:>8.1f} {overall['mean']:>8.1f} {overall['std']:>8.1f}")
     print("-" * 92)
 
-    p50 = overall["p50"]
-    p90 = overall["p90"]
-    print("\n[Threshold Recommendation]")
-    print(f"  Aggressive (p50): {p50:.1f} ms")
-    print(f"  Conservative (p90): {p90:.1f} ms")
-    print("\nTo freeze this threshold in config.yaml, set:")
-    print("dataset:")
-    print(f"  viability_latency_threshold_ms: {p90:.1f}")
-    print("=" * 80)
+    print("These are inbound market-data delays. The VM execution threshold is set separately.")
 
 
 if __name__ == "__main__":

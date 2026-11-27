@@ -72,6 +72,7 @@ class BatchWriter:
             "local_ts_ms": snap.local_ts_ms,
             "transit_latency_ms": snap.transit_latency_ms,
             "is_stale": snap.is_stale,
+            "warmup_complete": snap.warmup_complete,
             "ts_source": getattr(snap, "ts_source", "exchange"),
         }
 

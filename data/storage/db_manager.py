@@ -285,6 +285,7 @@ class DatabaseManager:
             pass
 
         for table, fields in (
+            ("orderbook_ticks", {"warmup_complete": "INTEGER"}),
             ("clock_offsets", {"rtt_ms": "REAL", "method": "TEXT", "error_bound_ms": "REAL"}),
             ("run_metadata", {"git_dirty": "INTEGER"}),
         ):
@@ -327,6 +328,7 @@ class DatabaseManager:
                         float(t.get("transit_latency_ms", 0.0)),
                         1 if t.get("is_stale", False) else 0,
                         str(t.get("ts_source", "exchange")),
+                        t.get("warmup_complete"),
                     ))
                 else:
                     rows.append((
@@ -346,6 +348,7 @@ class DatabaseManager:
                         float(t.transit_latency_ms),
                         1 if t.is_stale else 0,
                         str(getattr(t, "ts_source", "exchange")),
+                        t.warmup_complete,
                     ))
 
             cur = self._sqlite_conn.cursor()
@@ -353,8 +356,8 @@ class DatabaseManager:
                 INSERT INTO orderbook_ticks (
                     time, exchange, symbol, quote_currency, best_bid, best_ask, mid_price,
                     top_spread, imbalance, bid_depth, ask_depth, exchange_ts_ms, local_ts_ms,
-                    transit_latency_ms, is_stale, ts_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    transit_latency_ms, is_stale, ts_source, warmup_complete
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
             self._sqlite_conn.commit()
             return len(rows)

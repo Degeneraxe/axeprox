@@ -31,6 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import AppConfig, check_run_provenance
+from data.feeds.base_feed import feeds_ready
 from data.feeds import BinanceFeed, CoinbaseFeed, KrakenFeed
 from data.normalizer import OrderBookNormalizer, OrderBookSnapshot
 from data.ntp_sync import clock_sync
@@ -72,6 +73,7 @@ class UnifiedLiveService:
             config=self.config,
         )
         self.tracker = SpreadTracker(
+            ready_at=self.ready,
             db_manager=self.db,
             config=self.config,
             normalizer=self.normalizer,
@@ -85,6 +87,9 @@ class UnifiedLiveService:
         self.tick_counts = {"binance": 0, "coinbase": 0, "kraken": 0}
         self.feeds: List[Any] = []
         self._running = False
+
+    def ready(self, at_ms):
+        return feeds_ready(self.feeds, at_ms, self.config.warmup_seconds)
 
     def on_book_update(
         self,
@@ -101,6 +106,7 @@ class UnifiedLiveService:
         snap = self.normalizer.update_book(exchange, raw_symbol, bids, asks, exch_ts, loc_ts)
         self.cumulative_ticks += 1
         self.tick_counts[exchange] = self.tick_counts.get(exchange, 0) + 1
+        snap.warmup_complete = self.ready(loc_ts)
         self.batch_writer.enqueue_snapshot(snap)
         self.tracker.observe_arrivals(loc_ts)
 

@@ -29,7 +29,6 @@ markets:
   supported_pairs:
     - "BTC/USDT"
     - "ETH/USDT"
-    - "SOL/USDT"
   exchange_symbols:
     binance:
       "BTC/USDT": "btcusdt"
@@ -113,6 +112,7 @@ dynamic_hurdle:
 
 # Event Tracking & Staleness Parameters (Item 6)
 tracking:
+  warmup_seconds: 60                    # Continuous connection time required from every feed
   max_staleness_ms: 1500.0          # Max staleness for as-of join quote matching (1.5s)
   inactivity_timeout_ms: 1500.0     # Spread event close on quote inactivity (1.5s)
 
@@ -123,7 +123,7 @@ labeling:
   persistence_horizons_ms: [500, 2000, 5000] # Persistence targets: duration_ms >= h
 
 dataset:
-  version: "v2.3"
+  version: "v2.4"
   viability_latency_threshold_ms: 85.0  # ONE fixed viability latency threshold per dataset version (Item 5)
   sequence_length: 20                   # LSTM lookback window
 

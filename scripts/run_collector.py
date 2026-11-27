@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import AppConfig, check_run_provenance
+from data.feeds.base_feed import feeds_ready
 from data.feeds import BinanceFeed, CoinbaseFeed, KrakenFeed
 from data.normalizer import OrderBookNormalizer
 from data.ntp_sync import clock_sync
@@ -55,9 +56,13 @@ class MarketDataCollector:
         self.feeds = []
         self._running = False
 
+    def ready(self, at_ms):
+        return feeds_ready(self.feeds, at_ms, self.config.warmup_seconds)
+
     def on_book_update(self, exchange: str, raw_symbol: str, bids: list, asks: list, exch_ts: float, loc_ts: float):
         snap = self.normalizer.update_book(exchange, raw_symbol, bids, asks, exch_ts, loc_ts)
         self.tick_counts[exchange] = self.tick_counts.get(exchange, 0) + 1
+        snap.warmup_complete = self.ready(loc_ts)
         self.batch_writer.enqueue_snapshot(snap)
 
     async def start(self, allow_dirty=False):

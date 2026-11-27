@@ -107,6 +107,7 @@ class AppConfig:
     time_sync: TimeSyncConfig
     markets: MarketsConfig
     detection: DetectionConfig
+    warmup_seconds: float = 60.0
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> AppConfig:
@@ -160,7 +161,11 @@ class AppConfig:
             depth_snapshot_throttle_ms=int(dt_raw.get("depth_snapshot_throttle_ms", 100)),
         )
 
+        warmup = float(raw.get("tracking", {}).get("warmup_seconds", 60))
+        if not 0 <= warmup < float("inf"):
+            raise ValueError("tracking.warmup_seconds must be finite and nonnegative")
         return cls(
+            warmup_seconds=warmup,
             raw=raw,
             time_sync=time_sync,
             markets=markets,

@@ -39,6 +39,7 @@ class OrderBookSnapshot:
     quote_age_ms: float = 0.0
     is_crossed: bool = False
     ts_source: str = "exchange"
+    warmup_complete: Optional[bool] = None
 
     @property
     def best_bid(self) -> Optional[OrderBookLevel]:

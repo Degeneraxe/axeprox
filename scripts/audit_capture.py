@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import binomtest
 
 
 def storage(db, path, seconds, hours):
@@ -29,10 +30,69 @@ def storage(db, path, seconds, hours):
           f"projected_5day_DB_GB={retained:.3f} replay_hours={hours:g}")
 
 
+def legacy_books(db, row, evidence, exact=False):
+    """Recover top-of-book and timestamp provenance from retained raw ticks."""
+    legs = []
+    for side in ("buy", "sell"):
+        ts = evidence.get(side + "_book_ms") if exact else evidence["arrival_ms"]
+        op = "=" if exact else "<="
+        leg = db.execute(f"""SELECT best_bid,best_ask,local_ts_ms,ts_source,transit_latency_ms
+            FROM orderbook_ticks WHERE exchange=? AND symbol=? AND local_ts_ms {op} ?
+            ORDER BY local_ts_ms DESC, id DESC LIMIT 1""",
+            (row[side + "_exchange"], row["symbol"], ts)).fetchone()
+        legs.append(leg)
+    return legs
+
+
+def diagnose(db, rows):
+    causes = ("no_book", "older_than_250ms", "more_than_100ms_apart", "crossed_or_empty",
+              "connection_warmup", "unknown")
+    grouped = {}
+    dropped = priced = unknown = 0
+    first = db.execute("SELECT MIN(local_ts_ms) FROM orderbook_ticks").fetchone()[0]
+    # An unpruned legacy smoke DB retains every receipt (including unsampled top-of-book).
+    count, max_id = db.execute("SELECT COUNT(*),MAX(id) FROM orderbook_ticks").fetchone()
+    complete = count == max_id and first is not None
+    for row in rows:
+        ev = json.loads(row["execution_evidence_json"] or "{}")
+        if ev.get("status") == "missing_books":
+            route = row["symbol"], row["buy_exchange"], row["sell_exchange"]
+            cause = ev.get("missing_cause")
+            if cause is None and complete:
+                legs = legacy_books(db, row, ev)
+                if any(b is None for b in legs):
+                    cause = "no_book"
+                elif any(ev["arrival_ms"] - b["local_ts_ms"] > 250 for b in legs):
+                    cause = "older_than_250ms"
+                elif any(b["best_bid"] <= 0 or b["best_ask"] <= b["best_bid"] for b in legs):
+                    cause = "crossed_or_empty"
+                elif abs(legs[0]["local_ts_ms"] - legs[1]["local_ts_ms"]) > 100:
+                    cause = "more_than_100ms_apart"
+            grouped.setdefault(route, Counter())[cause or "unknown"] += 1
+        elif ev.get("status") == "priced":
+            priced += 1
+            if "buy" in ev and "sell" in ev:
+                dropped += any(ev[s].get("exchange_age_over_500ms") for s in ("buy", "sell"))
+            else:
+                legs = legacy_books(db, row, ev, exact=True)
+                if any(b is None for b in legs):
+                    unknown += 1
+                else:
+                    dropped += any(b["ts_source"] == "exchange" and
+                                   ev["arrival_ms"]-b["local_ts_ms"]+b["transit_latency_ms"] > 500
+                                   for b in legs)
+    print("missing_books primary cause (only affected routes)")
+    print("symbol buy sell", *causes)
+    for route, counts in sorted(grouped.items()):
+        print(*route, *(counts[c] for c in causes))
+    print(f"exchange age >500ms: would drop {dropped} of {priced} priced events; unknown={unknown}")
+
+
 def outcomes(db, cfg):
     states = ["priced", "missing_books", "insufficient_depth", "conversion_required", "capture_ended"]
     counts = Counter()
     rows = list(db.execute("SELECT * FROM spread_events ORDER BY open_time"))
+    diagnose(db, rows)
     priced = []
     for row in rows:
         evidence = json.loads(row["execution_evidence_json"] or "{}")
@@ -51,10 +111,13 @@ def outcomes(db, cfg):
     for tier in cfg["fee_scenarios"]["scenarios"]:
         pnl = [row[f"net_peak_{tier}"] * ev["buy_vwap"] * ev["quantity"] / 1e4 for row, ev in priced]
         if not pnl:
-            print(tier, "0 (no priced events)")
+            print(tier, "0 of 0 priced events; exact CI unavailable")
             continue
         values = np.asarray(pnl)
-        share = np.mean(values > 0)
+        wins = int(np.count_nonzero(values > 0))
+        exact = binomtest(wins, len(values)).proportion_ci(method="exact")
+        print(f"{tier}: {wins} of {len(values)} priced events; exact 95% CI [{exact.low:.5f}, {exact.high:.5f}]")
+        share = wins / len(values)
         # Resample one-minute clusters to preserve within-burst dependence.
         by_minute = {}
         for (row, ev), v in zip(priced, values):

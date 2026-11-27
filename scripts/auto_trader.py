@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import AppConfig
+from data.feeds.base_feed import feeds_ready
 from data.feeds import BinanceFeed, CoinbaseFeed, KrakenFeed
 from data.normalizer import OrderBookNormalizer
 from data.ntp_sync import clock_sync
@@ -66,9 +67,12 @@ class AutonomousPaperTrader:
         self.feeds = []
         self._running = False
 
+    def ready(self, at_ms):
+        return feeds_ready(self.feeds, at_ms, self.config.warmup_seconds)
+
     def on_book_update(self, exchange: str, raw_symbol: str, bids: list, asks: list, exch_ts: float, loc_ts: float):
         snap = self.normalizer.update_book(exchange, raw_symbol, bids, asks, exch_ts, loc_ts)
-        if snap.symbol not in self.config.markets.supported_pairs:
+        if not self.ready(loc_ts) or snap.symbol not in self.config.markets.supported_pairs:
             return
         now_ms = clock_sync.event_time_ms()
         for candidate in self.detector.scan_symbol(snap.symbol, now_ms, paper_usdt_only=True):
@@ -114,6 +118,9 @@ class AutonomousPaperTrader:
             # Explicit stress assumption. Public feed transit measures a different path.
             delay_ms = self.simulator.viability_latency_threshold_ms
             await asyncio.sleep(delay_ms / 1000)
+            if not self.ready(decision_ms + delay_ms):
+                self.rejected_count += 1
+                return
             books = arrival_books(self.normalizer.ring_buffers, route[2], route[0], route[1],
                                   decision_ms + delay_ms)
             if books is None:

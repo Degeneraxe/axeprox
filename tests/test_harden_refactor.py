@@ -168,6 +168,7 @@ def test_propose_latency_threshold_script(tmp_path):
             "transit_latency_ms": float((i + 1) * 10),
             "is_stale": 0,
             "ts_source": "exchange",
+            "warmup_complete": True,
         })
     db.insert_ticks_batch(ticks)
     db.close()
@@ -286,7 +287,7 @@ def test_dashboard_read_only_mode(tmp_path):
 def test_config_parameters_and_version():
     """Item 6 & 10: Config contains v2.1 and non-hardcoded values."""
     cfg = AppConfig.load()
-    assert cfg.raw["dataset"]["version"] == "v2.3"
+    assert cfg.raw["dataset"]["version"] == "v2.4"
     assert "execution_latency_assumption_ms" not in cfg.raw.get("labeling", {})
     assert cfg.raw["dataset"]["viability_latency_threshold_ms"] == 85.0
     assert cfg.raw["storage"]["replay_window_hours"] == 6

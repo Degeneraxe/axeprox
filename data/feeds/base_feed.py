@@ -33,6 +33,15 @@ class ConnectionState(Enum):
     STOPPED = "STOPPED"
 
 
+def feeds_ready(feeds, at_ms, warmup_seconds):
+    """Every connection must cover the complete warm-up interval ending at at_ms."""
+    return bool(feeds) and all(
+        feed.state == ConnectionState.CONNECTED and feed.connected_since_ms is not None
+        and at_ms >= feed.connected_since_ms + 1000 * warmup_seconds
+        for feed in feeds
+    )
+
+
 class BaseExchangeFeed(ABC):
     """Abstract resilient WebSocket feed client."""
 
@@ -61,6 +70,7 @@ class BaseExchangeFeed(ABC):
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self.connected_since_ms = None
         self._last_msg_local_ts = 0.0
         self.reconnect_count = 0
 
@@ -121,6 +131,7 @@ class BaseExchangeFeed(ABC):
                     close_timeout=5.0,
                 ) as ws:
                     self._ws = ws
+                    self.connected_since_ms = clock_sync.event_time_ms()
                     self.state = ConnectionState.CONNECTED
                     backoff = self.initial_backoff_sec
                     self._last_msg_local_ts = time.time()
@@ -181,6 +192,7 @@ class BaseExchangeFeed(ABC):
                 await asyncio.sleep(sleep_sec)
                 backoff = min(backoff * self.backoff_multiplier, self.max_backoff_sec)
             finally:
+                self.connected_since_ms = None
                 if self._heartbeat_task and not self._heartbeat_task.done():
                     self._heartbeat_task.cancel()
 
